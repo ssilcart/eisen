@@ -10,8 +10,8 @@ export interface GridSizes {
 export const STATUS_HEIGHT = 1;
 
 /**
- * Column widths and row heights of the 2×2 grid above the status bar and,
- * while a search is active, the Inbox strip (`strip` rows, S19).
+ * Column widths and row heights of the 2×2 grid above the status bar and
+ * the Inbox strip (`strip` rows, S24).
  */
 export function gridSizes(width: number, height: number, strip = 0): GridSizes {
   const w = Math.max(0, width);
@@ -21,15 +21,26 @@ export function gridSizes(width: number, height: number, strip = 0): GridSizes {
   return { left, right: w - left, top, bottom: h - top };
 }
 
+/** Rows the grid keeps before the strip gives up its border: two pane rows of border + one task. */
+export const GRID_MIN_ROWS = 6;
+
+/** Bounds of the bordered Inbox strip, in rows (S24). */
+export const STRIP_MIN = 3;
+export const STRIP_MAX = 8;
+
 /**
- * Rows of the Inbox strip shown under the grid while searching (S19), border
- * included: a quarter of the rows above the status line, 3 to 6, and never
- * more than a third of them.
+ * Rows of the Inbox strip under the grid (S24), border included: a quarter of
+ * the rows above the status line, 3 to 8. When that would leave the grid
+ * fewer than GRID_MIN_ROWS, it shrinks (never below 3); when even 3 do not
+ * fit, it is a single title line and only then does the grid lose rows. Never
+ * 2 (a border with nothing inside), 0 only when no row is left at all.
  */
 export function stripHeight(height: number): number {
   const rows = Math.max(0, height - STATUS_HEIGHT);
-  const wanted = Math.min(6, Math.max(3, Math.floor(rows / 4)));
-  return Math.min(wanted, Math.floor(rows / 3));
+  if (rows === 0) return 0;
+  const wanted = Math.min(STRIP_MAX, Math.max(STRIP_MIN, Math.floor(rows / 4)));
+  const spare = rows - GRID_MIN_ROWS;
+  return spare >= STRIP_MIN ? Math.min(wanted, spare) : 1;
 }
 
 /** First row to show so `selected` is visible in `height` rows (roughly centred). */

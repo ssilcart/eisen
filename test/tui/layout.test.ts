@@ -80,17 +80,39 @@ describe("gridSizes", () => {
   });
 });
 
-describe("stripHeight (S19)", () => {
-  test("a quarter of the rows above the status line, 3 to 6 rows with its border", () => {
-    expect(stripHeight(30)).toBe(6);
-    expect(stripHeight(100)).toBe(6);
+describe("stripHeight (S24)", () => {
+  test("a quarter of the rows above the status line, 3 to 8 rows with its border", () => {
+    expect(stripHeight(30)).toBe(7); // 120×30
+    expect(stripHeight(16)).toBe(3); // 60×16
+    expect(stripHeight(10)).toBe(3); // 30×10: the grid keeps 3 + 3 rows
     expect(stripHeight(17)).toBe(4);
-    expect(stripHeight(10)).toBe(3);
+    expect(stripHeight(41)).toBe(8);
+    expect(stripHeight(100)).toBe(8);
+    expect(stripHeight(10_000)).toBe(8);
   });
 
-  test("never more than a third of the screen above the status line", () => {
-    expect(stripHeight(7)).toBe(2);
-    expect(stripHeight(2)).toBe(0);
+  test("on a tiny screen it shrinks to one line (title only) before the grid loses rows", () => {
+    expect(stripHeight(9)).toBe(1); // 3 rows would leave the grid 5
+    expect(stripHeight(8)).toBe(1);
+    expect(stripHeight(3)).toBe(1);
+    expect(stripHeight(2)).toBe(1);
+    expect(stripHeight(1)).toBe(0); // only the status line
     expect(stripHeight(0)).toBe(0);
+    expect(stripHeight(-5)).toBe(0);
+  });
+
+  test("at every height: never 2 rows, the grid keeps 6 rows while the strip has a border", () => {
+    for (let h = 0; h <= 300; h++) {
+      const strip = stripHeight(h);
+      const rows = Math.max(0, h - 1);
+      expect(strip).toBeGreaterThanOrEqual(0);
+      expect(strip).toBeLessThanOrEqual(8);
+      expect(strip).not.toBe(2);
+      expect(strip).toBeLessThanOrEqual(rows);
+      if (rows >= 1) expect(strip).toBeGreaterThanOrEqual(1); // always visible
+      if (strip >= 3) expect(rows - strip).toBeGreaterThanOrEqual(6);
+      const g = gridSizes(300, h, strip);
+      expect(g.top + g.bottom + strip).toBe(rows);
+    }
   });
 });

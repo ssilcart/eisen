@@ -74,17 +74,33 @@ backup written with one preset imports into the same quadrants with any other.
 A config file that cannot be read or names an unknown preset is ignored with
 a warning (the status line in the matrix, stderr in the CLI).
 
+## Layout
+
+The four quadrants fill a 2×2 grid (Q1 top left, Q2 top right, Q3 bottom
+left, Q4 bottom right), each titled with its name and open-task count. Under
+the grid the **Inbox strip**, titled `📥 Inbox (n)`, lists the tasks you have
+not sorted yet. It is always there and takes about a quarter of the screen
+(3 to 8 rows, scrolling when the Inbox is longer); on a very small terminal
+it shrinks to its title line before the grid gives up any rows. The status
+line at the bottom shows the key hints and messages.
+
+The strip is a fifth pane: `j` at the bottom of Q3 or Q4 moves into it, `k`
+at its top goes back to the quadrant you came from, and `h`/`l` do nothing
+there. Every key below works on its selected task: `1`–`4` sort it into a
+quadrant (it leaves the strip and the count drops), `x`, `d`, `e`, `J`/`K`
+(order inside the Inbox), and `a` adds a new task to the Inbox.
+
 ## Keybindings
 
 | Key            | Action                                             |
 | -------------- | -------------------------------------------------- |
-| `h j k l`, arrows | Move between quadrants and tasks                |
+| `h j k l`, arrows | Move between quadrants, the Inbox strip and tasks |
 | `1`–`4`        | Move the selected task to that quadrant            |
-| `a`            | Add a task in the focused quadrant (`#tags` work)  |
+| `a`            | Add a task in the focused quadrant, or to the Inbox from its strip (`#tags` work) |
 | `e`            | Edit the task in `$EDITOR`                         |
 | `x`            | Toggle done                                        |
 | `d`            | Delete (asks for confirmation)                     |
-| `J` / `K`      | Reorder inside the quadrant                        |
+| `J` / `K`      | Reorder inside the quadrant or the Inbox           |
 | `/`            | Global search (quadrants, Inbox and done tasks)    |
 | `i`            | Triage the Inbox                                   |
 | `.`            | Show / hide done tasks                             |
@@ -101,9 +117,10 @@ Vim) discards the edit.
 
 ### Triage
 
-New and imported tasks land in the Inbox. When it is not empty at start the
+New and imported tasks land in the Inbox. You can sort them straight from
+the Inbox strip, or triage them: when the Inbox is not empty at start the
 status line says `press i to triage`; `i` shows its tasks one card at a time
-(title, description, tags, due date):
+(title, description, tags, due date), over the grid and the strip:
 
 | Key            | Action                                             |
 | -------------- | -------------------------------------------------- |
@@ -131,8 +148,9 @@ shown dimmed with `✓` even when `.` hides them).
   before prefixes, before parts of words, before typos; open before done.
 
 The matrix stays on screen: each pane keeps only its matches and shows
-`matches/total` in its title, and an **Inbox** strip appears under the grid
-with the Inbox matches (`j` from the bottom panes moves into it).
+`matches/total` in its title, and so does the Inbox strip, which lists only
+the Inbox matches. `Esc` brings back the full lists; the focus stays where it
+was, the strip included.
 
 | Key            | Action                                             |
 | -------------- | -------------------------------------------------- |

@@ -78,6 +78,11 @@ function grid(f: string): string {
   return f.trimEnd().split("\n").slice(0, -1).join("\n");
 }
 
+/** The status line (the last row) of a frame. */
+function statusOf(f: string): string {
+  return f.trimEnd().split("\n").at(-1)!;
+}
+
 /** Row and column of the first occurrence of `text` in the frame. */
 function where(f: string, text: string): { row: number; col: number } {
   const rows = f.split("\n");
@@ -104,13 +109,14 @@ afterEach(async () => {
 });
 
 describe("matrix view (S9)", () => {
-  test("shows the four panes with open counts in a 2×2 grid and the Inbox count", async () => {
+  test("shows the four panes with open counts in a 2×2 grid and the Inbox strip with its count", async () => {
     const f = await start();
     expect(f).toContain("Q1 · ✅ Do (3)");
     expect(f).toContain("Q2 · 📅 Schedule (1)");
     expect(f).toContain("Q3 · 🤝 Delegate (1)");
     expect(f).toContain("Q4 · 🧹 Delete (1)");
-    expect(f).toContain("Inbox: 2");
+    expect(f).toContain("📥 Inbox (2)"); // S24: the strip, not the status line
+    expect(statusOf(f)).not.toContain("Inbox");
     const q1 = where(f, "Q1 · ✅ Do");
     const q2 = where(f, "Q2 · 📅 Schedule");
     const q3 = where(f, "Q3 · 🤝 Delegate");
@@ -120,8 +126,11 @@ describe("matrix view (S9)", () => {
     expect(q3.row).toBeGreaterThan(q1.row);
     expect(q2.col).toBeGreaterThan(q1.col);
     expect(q4.col).toBeGreaterThan(q3.col);
-    // Inbox tasks are not in the grid.
-    expect(f).not.toContain("Unsorted idea");
+    // Inbox tasks are not in the grid: they are in the strip under it (S24).
+    const strip = where(f, "📥 Inbox (2)");
+    expect(strip.row).toBeGreaterThan(q3.row);
+    expect(where(f, "Unsorted idea").row).toBeGreaterThan(strip.row);
+    expect(where(f, "Another idea").row).toBeGreaterThan(strip.row);
   });
 
   test("an escalated task sits in Q1 with a ! mark and its due date", async () => {
@@ -168,7 +177,7 @@ describe("matrix view (S9)", () => {
     setup.resize(30, 10);
     const f = await frame();
     for (const title of ["Q1 (3)", "Q2 (1)", "Q3 (1)", "Q4 (1)"]) expect(f).toContain(title);
-    expect(f).toContain("Inbox: 2");
+    expect(f).toContain("📥 Inbox (2)");
   });
 });
 
@@ -541,8 +550,9 @@ describe("triage (S12) on the user's fixture", () => {
 
   test("on start a non-empty Inbox is offered for triage, without entering it", async () => {
     const f = await start();
-    expect(f).toContain("Inbox: 8");
-    expect(f).toContain("press i to triage");
+    expect(f).toContain("📥 Inbox (8)");
+    expect(statusOf(f)).toContain("press i to triage");
+    expect(statusOf(f)).not.toContain("Inbox:");
     expect(app.state.mode).toBe("normal");
     expect(f).toContain("Q1 · ✅ Do (0)");
   });
@@ -563,8 +573,9 @@ describe("triage (S12) on the user's fixture", () => {
     expect(f).toContain("poder organizar los subitems");
     expect(f).toContain("#todo");
     expect(f).toContain("1 ✅ Do · 2 📅 Schedule · 3 🤝 Delegate · 4 🧹 Delete · s skip · e edit · d delete · Esc exit");
-    // The card replaces the grid.
+    // The card replaces the grid and the Inbox strip.
     expect(f).not.toContain("Q2 · 📅 Schedule");
+    expect(f).not.toContain("📥 Inbox (");
   });
 
   test("2 moves the task to Q2 with a moved event and shows the next one", async () => {
@@ -604,7 +615,8 @@ describe("triage (S12) on the user's fixture", () => {
     expect(events(first.id, "deleted")).toBe(1);
     expect(app.state.mode).toBe("triage");
     expect(f).toContain("Triage 2/8");
-    expect(f).toContain("Inbox: 7");
+    expect(repo.list({ bucket: "inbox" })).toHaveLength(7);
+    expect(statusOf(f)).not.toContain("Inbox:");
   });
 
   test("Esc in the delete confirmation goes back to the card", async () => {
@@ -652,7 +664,7 @@ describe("triage (S12) on the user's fixture", () => {
     f = await keys("1");
     expect(app.state.mode).toBe("normal");
     expect(f).toContain("Inbox triaged: 6 sorted, 2 skipped");
-    expect(f).toContain("Inbox: 2");
+    expect(f).toContain("📥 Inbox (2)");
     expect(f).toContain("Q1 · ✅ Do (2)");
     expect(f).toContain("Q2 · 📅 Schedule (2)");
     expect(f).not.toContain("Triage 8/8");
@@ -695,7 +707,7 @@ describe("triage (S12) on the user's fixture", () => {
     setup.resize(30, 10);
     let f = await frame();
     expect(f).toContain("Triage 1/8");
-    expect(f).toContain("Inbox: 8");
+    expect(f).not.toContain("📥 Inbox ("); // the card still covers the strip
     for (const row of f.split("\n")) expect(Bun.stringWidth(row)).toBeLessThanOrEqual(30);
     f = await keys("3");
     expect(bucketOf(repo.get(inbox[0]!.id)!)).toBe(3);
@@ -803,7 +815,7 @@ describe("search (S19) on the user's fixture", () => {
 
   test("/ opens the input in the status line and filters the panes and the Inbox strip on every keystroke", async () => {
     let f = await start(120, 30);
-    expect(f).not.toContain("Inbox (");
+    expect(f).toContain("📥 Inbox (4)"); // S24: the strip is there before any search
     f = await keys("/");
     expect(app.state.mode).toBe("search");
     expect(f).toContain("📥 Inbox (4)"); // the strip, unfiltered until something is typed
@@ -942,7 +954,7 @@ describe("search (S19) on the user's fixture", () => {
     f = await escape();
     expect(app.state.mode).toBe("normal");
     expect(app.state.query).toBe("");
-    expect(f).not.toContain("Inbox (");
+    expect(f).toContain("📥 Inbox (4)"); // S24: unfiltered again, still shown
     expect(f).toContain("Q1 · ✅ Do (1)");
     expect(f).toContain("Q2 · 📅 Schedule (1)");
     expect(f).toContain("Q4 · 🧹 Delete (0)");
@@ -1337,5 +1349,353 @@ describe("quadrant colours (S23)", () => {
     expect(isBold(strip.span)).toBe(true);
     expect(hex(strip.before!.fg)).toBe(lower(BUCKET_COLOR.inbox));
     expect(hex(spanOf("Unsorted idea").span.bg)).toBe(lower(paneStyle("inbox", true).selectBg));
+  });
+
+  test("the Inbox strip without a search: grey title, dim border; focused it is grey, bold, with a tinted row (S24)", async () => {
+    await start(100, 30);
+    let strip = spanOf("📥 Inbox (2)");
+    expect(hex(strip.span.fg)).toBe(lower(BUCKET_COLOR.inbox));
+    expect(isBold(strip.span)).toBe(false);
+    expect(hex(strip.before!.fg)).toBe(lower(COLOR.border));
+    await keys("j", "j", "j", "j"); // Q1 has 3 tasks, Q3 one: the fourth j enters the strip
+    expect(app.state.focus).toBe("inbox");
+    strip = spanOf("📥 Inbox (2)");
+    expect(hex(strip.span.fg)).toBe(lower(BUCKET_COLOR.inbox));
+    expect(isBold(strip.span)).toBe(true);
+    expect(hex(strip.before!.fg)).toBe(lower(BUCKET_COLOR.inbox));
+    expect(hex(spanOf("Unsorted idea").span.bg)).toBe(lower(paneStyle("inbox", true).selectBg));
+    // Q3 is not focused any more.
+    expect(isBold(spanOf("Q3 · 🤝 Delegate (1)").span)).toBe(false);
+  });
+});
+
+describe("Inbox strip always visible (S24) on the user's fixture", () => {
+  const fixture = readFileSync(join(import.meta.dir, "../../fixtures/import/user-tasks.md"), "utf8");
+  let inbox: { id: number; title: string }[];
+
+  beforeEach(() => {
+    // Only the fixture: 8 open tasks, all in the Inbox (S15).
+    db.close();
+    db = openDb(":memory:");
+    repo = new TaskRepository(db);
+    importMarkdown(repo, fixture);
+    inbox = repo.list({ bucket: "inbox" });
+    expect(inbox).toHaveLength(8);
+  });
+
+  function events(taskId: number, type: string): number {
+    const row = db.query("SELECT COUNT(*) AS n FROM events WHERE type = $type AND task_id = $id").get({ id: taskId, type }) as {
+      n: number;
+    };
+    return row.n;
+  }
+
+  /** Short prefix of the i-th Inbox task's title, safe from truncation. */
+  const title = (i: number) => inbox[i]!.title.slice(0, 30);
+
+  /** Focus the strip from the start: Q1 and Q3 are empty, so j j. */
+  async function enterStrip(): Promise<string> {
+    const f = await keys("j", "j");
+    expect(app.state.focus).toBe("inbox");
+    return f;
+  }
+
+  async function escape(): Promise<string> {
+    setup.mockInput.pressEscape();
+    await Bun.sleep(30);
+    return frame();
+  }
+
+  test("at 120×30 the strip lists the Inbox under the grid: 7 rows, titled with the open count, scrolling", async () => {
+    const f = await start(120, 30);
+    const strip = where(f, "📥 Inbox (8)");
+    expect(strip.row).toBe(30 - 1 - 7);
+    expect(strip.row).toBeGreaterThan(where(f, "Q3 · 🤝 Delegate (0)").row);
+    // 5 rows inside the border; the rest scrolls.
+    for (let i = 0; i < 5; i++) expect(where(f, title(i)).row).toBe(strip.row + 1 + i);
+    expect(f).not.toContain(title(5));
+    expect(f).toContain("1-5 of 8");
+    expect(statusOf(f)).toContain("press i to triage");
+    expect(statusOf(f)).not.toContain("Inbox");
+    await enterStrip();
+    for (let i = 0; i < 7; i++) setup.mockInput.pressKey("j");
+    const g = await frame();
+    expect(app.state.selected.inbox).toBe(7);
+    expect(g).toContain(title(7));
+    expect(g).toContain("4-8 of 8");
+  });
+
+  test("at 60×16 and 30×10 the strip keeps 3 rows and the grid its four panes", async () => {
+    let f = await start(60, 16);
+    expect(where(f, "📥 Inbox (8)").row).toBe(16 - 1 - 3);
+    expect(where(f, title(0)).row).toBe(16 - 1 - 3 + 1);
+    expect(f).toContain("1-1 of 8");
+    for (const t of ["Q1 · ✅ Do (0)", "Q2 · 📅 Schedule (0)", "Q3 · 🤝 Delegate (0)", "Q4 · 🧹 Delete (0)"]) {
+      expect(f).toContain(t);
+    }
+    setup.resize(30, 10);
+    f = await frame();
+    expect(where(f, "📥 Inbox (8)").row).toBe(10 - 1 - 3);
+    for (const t of ["Q1 (0)", "Q2 (0)", "Q3 (0)", "Q4 (0)"]) expect(f).toContain(t);
+    for (const row of f.split("\n")) expect(Bun.stringWidth(row)).toBeLessThanOrEqual(30);
+  });
+
+  test("on a tiny screen the strip is one title line and the grid keeps its rows; nothing throws from 1×1 to 300×100", async () => {
+    let f = await start(30, 8);
+    const rows = f.split("\n");
+    expect(rows[8 - 1 - 1]).toContain("📥 Inbox (8)");
+    expect(f).not.toContain(title(0));
+    for (const t of ["Q1 (0)", "Q3 (0)"]) expect(f).toContain(t);
+    for (const [w, h] of [
+      [1, 1],
+      [2, 2],
+      [1, 30],
+      [300, 1],
+      [12, 3],
+      [20, 9],
+      [300, 100],
+      [30, 8],
+    ] as const) {
+      setup.resize(w, h);
+      f = await frame();
+      for (const row of f.split("\n")) expect(Bun.stringWidth(row)).toBeLessThanOrEqual(w);
+    }
+    // With no rows left for the grid, its borders do not spill over the strip's line.
+    setup.resize(50, 2);
+    f = await frame();
+    expect(f.split("\n")[0]!.trim()).toBe("📥 Inbox (8)");
+    setup.resize(30, 8);
+    await frame();
+    // Focused, the one-line strip still takes the keys.
+    await enterStrip();
+    f = await keys("x");
+    expect(repo.get(inbox[0]!.id)!.status).toBe("done");
+    expect(f.split("\n")[8 - 1 - 1]).toContain("📥 Inbox (7)");
+    setup.resize(300, 100);
+    f = await frame();
+    const strip = where(f, "📥 Inbox (7)");
+    expect(strip.row).toBe(100 - 1 - 8);
+    for (let i = 1; i < 7; i++) expect(f).toContain(title(i));
+  });
+
+  test("j j reaches the strip; 2 sorts the selected task into Q2 with one moved event and the count drops", async () => {
+    await start(120, 30);
+    await enterStrip();
+    expect(app.state.selected.inbox).toBe(0);
+    const f = await keys("2");
+    const first = repo.get(inbox[0]!.id)!;
+    expect(bucketOf(first)).toBe(2);
+    expect(events(first.id, "moved")).toBe(1);
+    expect(f).toContain("Moved to Q2 · 📅 Schedule");
+    expect(f).toContain("📥 Inbox (7)");
+    expect(f).toContain("Q2 · 📅 Schedule (1)");
+    expect(where(f, title(0)).row).toBeLessThan(where(f, "📥 Inbox (7)").row); // now in the grid
+    // The focus stays on the strip, on the next task.
+    expect(app.state.focus).toBe("inbox");
+    expect(app.state.selected.inbox).toBe(0);
+    await keys("3");
+    expect(bucketOf(repo.get(inbox[1]!.id)!)).toBe(3);
+  });
+
+  test("sorting the last row of the strip clamps the selection to the new last row", async () => {
+    await start(120, 30);
+    await enterStrip();
+    for (let i = 0; i < 7; i++) setup.mockInput.pressKey("j");
+    await keys("4");
+    expect(bucketOf(repo.get(inbox[7]!.id)!)).toBe(4);
+    expect(app.state.selected.inbox).toBe(6);
+    await keys("1");
+    expect(bucketOf(repo.get(inbox[6]!.id)!)).toBe(1);
+  });
+
+  test("x marks the selected Inbox task done; . shows it dimmed with ✓ in the strip; x reopens it", async () => {
+    await start(120, 30);
+    await enterStrip();
+    for (let i = 0; i < 7; i++) setup.mockInput.pressKey("j");
+    let f = await keys("x");
+    const last = inbox[7]!;
+    expect(repo.get(last.id)!.status).toBe("done");
+    expect(f).toContain(`Done: ${last.title.slice(0, 30)}`);
+    expect(f).toContain("📥 Inbox (7)");
+    expect(grid(f)).not.toContain(title(7));
+    f = await keys(".");
+    const row = f.split("\n").find((line) => line.includes(title(7)))!;
+    expect(row).toContain("✓");
+    expect(f).toContain("📥 Inbox (7)"); // the count is of open tasks
+    const span = setup.captureSpans().lines.flatMap((l) => l.spans).find((s) => s.text.includes(title(7)))!;
+    expect(span.attributes & TextAttributes.DIM).toBeTruthy();
+    await keys("j");
+    expect(app.state.selected.inbox).toBe(7);
+    f = await keys("x");
+    expect(repo.get(last.id)!.status).toBe("open");
+    expect(f).toContain("📥 Inbox (8)");
+  });
+
+  test("d asks; y deletes the selected Inbox task", async () => {
+    await start(120, 30);
+    await enterStrip();
+    let f = await keys("j", "d");
+    expect(statusOf(f)).toContain(`Delete "${inbox[1]!.title.slice(0, 60)}`);
+    f = await keys("y");
+    expect(repo.get(inbox[1]!.id)).toBeNull();
+    expect(events(inbox[1]!.id, "deleted")).toBe(1);
+    expect(f).toContain("📥 Inbox (7)");
+    expect(app.state.focus).toBe("inbox");
+  });
+
+  test("a with the strip focused adds to the Inbox and selects the new task; a in a quadrant still adds there", async () => {
+    await start(120, 30);
+    await enterStrip();
+    let f = await keys("a");
+    expect(f).toContain("Add to 📥 Inbox:");
+    await setup.mockInput.typeText("Book the dentist #health");
+    setup.mockInput.pressEnter();
+    f = await frame();
+    const added = byTitle("Book the dentist #health")!;
+    expect(bucketOf(added)).toBe("inbox");
+    expect(added.tags).toEqual(["health"]);
+    expect(f).toContain("Added to 📥 Inbox");
+    expect(f).toContain("📥 Inbox (9)");
+    expect(f).toContain("Book the dentist #health");
+    expect(app.state.focus).toBe("inbox");
+    expect(app.state.selected.inbox).toBe(8);
+    // From Q4 it goes to Q4: 8 k walk up the strip, the 9th leaves it for Q3.
+    for (let i = 0; i < 9; i++) setup.mockInput.pressKey("k");
+    await keys("l", "a");
+    expect(app.state.focus).toBe(4);
+    await setup.mockInput.typeText("Clean the desk");
+    setup.mockInput.pressEnter();
+    await frame();
+    expect(bucketOf(byTitle("Clean the desk")!)).toBe(4);
+  });
+
+  test("e edits the selected Inbox task, which stays in the Inbox", async () => {
+    await start(120, 30, {
+      runEditor: async (path) => {
+        await Bun.write(path, "# Organise subitems in Delivra\n\nGroup them by epic\n");
+        return 0;
+      },
+    });
+    setup.renderer.suspend = async () => {};
+    setup.renderer.resume = async () => {};
+    await enterStrip();
+    setup.mockInput.pressKey("e");
+    await app.idle();
+    const f = await frame();
+    const task = repo.get(inbox[0]!.id)!;
+    expect(task.title).toBe("Organise subitems in Delivra");
+    expect(bucketOf(task)).toBe("inbox");
+    expect(events(task.id, "edited")).toBe(1);
+    expect(f).toContain("Saved");
+    expect(f).toContain("Organise subitems in Delivra");
+    expect(app.state.focus).toBe("inbox");
+  });
+
+  test("J/K reorder inside the Inbox and the selection follows the task", async () => {
+    await start(120, 30);
+    await enterStrip();
+    setup.mockInput.pressKey("J", { shift: true });
+    let f = await frame();
+    expect(repo.list({ bucket: "inbox" }).map((t) => t.id).slice(0, 2)).toEqual([inbox[1]!.id, inbox[0]!.id]);
+    expect(app.state.selected.inbox).toBe(1);
+    expect(where(f, title(1)).row).toBeLessThan(where(f, title(0)).row);
+    setup.mockInput.pressKey("K", { shift: true });
+    f = await frame();
+    expect(repo.list({ bucket: "inbox" }).map((t) => t.id).slice(0, 2)).toEqual([inbox[0]!.id, inbox[1]!.id]);
+    expect(app.state.selected.inbox).toBe(0);
+  });
+
+  test("k at the top goes back to the pane the strip was entered from; h/l keep the strip", async () => {
+    await start(120, 30);
+    await keys("j", "l", "j"); // Q1 → Q3 → Q4 → strip
+    expect(app.state.focus).toBe("inbox");
+    await keys("h", "l");
+    expect(app.state.focus).toBe("inbox");
+    await keys("k");
+    expect(app.state.focus).toBe(4);
+    await keys("h", "j", "k");
+    expect(app.state.focus).toBe(3);
+  });
+
+  test("a resize keeps the strip, its focus and its selection", async () => {
+    await start(120, 30);
+    await enterStrip();
+    await keys("j");
+    setup.resize(60, 16);
+    let f = await frame();
+    expect(app.state.focus).toBe("inbox");
+    expect(app.state.selected.inbox).toBe(1);
+    expect(f).toContain("📥 Inbox (8)");
+    expect(f).toContain(inbox[1]!.title.slice(0, 20));
+    setup.resize(120, 30);
+    f = await keys("2");
+    expect(bucketOf(repo.get(inbox[1]!.id)!)).toBe(2);
+    expect(f).toContain("📥 Inbox (7)");
+  });
+
+  test("search still filters the strip; Esc restores it with the focus and the match kept", async () => {
+    await start(120, 30);
+    await keys("/");
+    await setup.mockInput.typeText("cloudbeds");
+    let f = await frame();
+    expect(f).toContain("📥 Inbox (1/8)");
+    expect(app.state.focus).toBe("inbox");
+    setup.mockInput.pressEnter();
+    await frame();
+    f = await escape();
+    expect(app.state.query).toBe("");
+    expect(f).toContain("📥 Inbox (8)");
+    expect(app.state.focus).toBe("inbox");
+    const cloudbeds = inbox.findIndex((t) => t.title.includes("cloudbeds"));
+    expect(app.state.selected.inbox).toBe(cloudbeds);
+  });
+
+  test("triage covers the grid and the strip and still sorts; Esc shows the strip with the new count", async () => {
+    await start(120, 30);
+    await enterStrip();
+    let f = await keys("i");
+    expect(f).toContain("Triage 1/8");
+    expect(f).not.toContain("📥 Inbox (");
+    expect(statusOf(f)).not.toContain("Inbox:");
+    await keys("2");
+    expect(bucketOf(repo.get(inbox[0]!.id)!)).toBe(2);
+    expect(events(inbox[0]!.id, "moved")).toBe(1);
+    f = await escape();
+    expect(app.state.mode).toBe("normal");
+    expect(f).toContain("📥 Inbox (7)");
+    expect(f).toContain("Triage stopped");
+  });
+
+  test("the help names the strip, and closing it leaves no Inbox count in the status line", async () => {
+    await start(120, 30);
+    let f = await keys("?");
+    expect(f).toContain("Inbox strip");
+    expect(statusOf(f)).not.toContain("Inbox:");
+    f = await escape();
+    expect(f).not.toContain("Inbox strip");
+  });
+
+  test("q quits from the focused strip even when every reload fails", async () => {
+    await start(120, 30);
+    await enterStrip();
+    breakList(repo).failAlways();
+    try {
+      setup.mockInput.pressKey("q");
+    } catch {
+      // See "repository failures".
+    }
+    expect(await settles(app.done)).toBe("done");
+  });
+
+  test("Ctrl+C quits from the focused strip even when every reload fails", async () => {
+    await start(120, 30);
+    await enterStrip();
+    breakList(repo).failAlways();
+    try {
+      setup.mockInput.pressKey("c", { ctrl: true });
+    } catch {
+      // See above.
+    }
+    expect(await settles(app.done)).toBe("done");
   });
 });

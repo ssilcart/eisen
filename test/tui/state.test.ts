@@ -497,12 +497,12 @@ describe("search (S19)", () => {
     expect(keyToAction(s, key("x"))).toEqual({ type: "toggleDone" });
   });
 
-  test("Enter on a blank query ends the search", () => {
-    const s = press(state({ mode: "search", query: "   ", focus: "inbox" }), enter, panes([1]));
+  test("Enter on a blank query ends the search; the always-visible strip keeps its focus (S24)", () => {
+    const s = press(state({ mode: "search", query: "   ", focus: "inbox" }), enter, searchPanes([1], [], [], [], []));
     expect(s.mode).toBe("normal");
     expect(s.query).toBe("");
     expect(searchActive(s)).toBe(false);
-    expect(s.focus).toBe(1);
+    expect(s.focus).toBe("inbox");
   });
 
   test("Esc clears the filter, from the input or from normal navigation", () => {
@@ -512,7 +512,8 @@ describe("search (S19)", () => {
     s = state({ query: "zoho", focus: "inbox" });
     expect(keyToAction(s, esc)).toEqual({ type: "clearSearch" });
     s = press(s, esc, p);
-    expect(s).toMatchObject({ mode: "normal", query: "", focus: 1 });
+    // S24: the strip stays after the search, and so does its focus.
+    expect(s).toMatchObject({ mode: "normal", query: "", focus: "inbox" });
     // Without a filter Esc stays a plain cancel.
     expect(keyToAction(state(), esc)).toEqual({ type: "cancel" });
   });
@@ -551,7 +552,7 @@ describe("search (S19)", () => {
     expect(press(s, key("l"), p).focus).toBe("inbox");
   });
 
-  test("without the strip (no search) j at the bottom stays put", () => {
+  test("without an Inbox list j at the bottom stays put", () => {
     const s = press(state({ focus: 3 }), key("j"), panes([1], [2], [3], []));
     expect(s.focus).toBe(3);
   });
@@ -572,6 +573,97 @@ describe("search (S19)", () => {
     expect(focusMatches(state({ query: "x", focus: 2 }), searchPanes([], [], [], [], [5])).focus).toBe("inbox");
     // Nothing matches anywhere: the focus stays.
     expect(focusMatches(state({ query: "x", focus: 2 }), searchPanes([], [], [], [], [])).focus).toBe(2);
+  });
+});
+
+describe("Inbox strip as a fifth pane, without a search (S24)", () => {
+  // The app always passes the strip's list: the open Inbox in display order.
+  function strip(q1: number[], q2: number[], q3: number[], q4: number[], inbox: number[]): PaneItems {
+    return { ...panes(q1, q2, q3, q4), inbox: items(...inbox) };
+  }
+
+  test("j at the bottom of Q3 enters the strip at its first task; j walks it; k at its top goes back to Q3", () => {
+    const p = strip([1], [2], [3, 4], [7], [5, 6]);
+    let s = press(state({ focus: 3, selected: { 1: 0, 2: 0, 3: 1, 4: 0 } }), key("j"), p);
+    expect(searchActive(s)).toBe(false);
+    expect(s.focus).toBe("inbox");
+    expect(selectedId(s, p)).toBe(5);
+    s = press(s, key("j"), p);
+    expect(selectedId(s, p)).toBe(6);
+    s = press(s, key("j"), p);
+    expect(selectedId(s, p)).toBe(6); // the strip is the bottom edge
+    s = press(s, key("k"), p);
+    expect(selectedId(s, p)).toBe(5);
+    s = press(s, key("k"), p);
+    expect(s.focus).toBe(3);
+    expect(s.selected[3]).toBe(1); // the last task of Q3
+  });
+
+  test("k at the top of the strip goes back to Q4 when the strip was entered from Q4", () => {
+    const p = strip([1], [2], [3], [7, 8], [5]);
+    let s = press(state({ focus: 4, selected: { 1: 0, 2: 0, 3: 0, 4: 1 } }), key("j"), p);
+    expect(s.focus).toBe("inbox");
+    s = press(s, key("k"), p);
+    expect(s.focus).toBe(4);
+    expect(s.selected[4]).toBe(1);
+    // Entering from Q3 afterwards goes back to Q3 again.
+    s = press(state({ focus: 3 }), key("j"), p);
+    s = press(s, key("k"), p);
+    expect(s.focus).toBe(3);
+  });
+
+  test("empty panes cross at once: Q1 → Q3 → strip with j j, and the strip's arrows work too", () => {
+    const p = strip([], [], [], [], [5, 6, 7]);
+    let s = press(state(), key("j"), p);
+    expect(s.focus).toBe(3);
+    s = press(s, key("down", { sequence: "\u001b[B" }), p);
+    expect(s.focus).toBe("inbox");
+    expect(selectedId(s, p)).toBe(5);
+    s = press(s, key("up", { sequence: "\u001b[A" }), p);
+    expect(s.focus).toBe(3);
+  });
+
+  test("h/l do nothing inside the strip", () => {
+    const p = strip([1], [2], [3], [4], [5, 6]);
+    const s = state({ focus: "inbox", selected: { 1: 0, 2: 0, 3: 0, 4: 0, inbox: 1 } });
+    for (const k of [key("h"), key("l"), key("left", { sequence: "\u001b[D" }), key("right", { sequence: "\u001b[C" })]) {
+      const next = press(s, k, p);
+      expect(next.focus).toBe("inbox");
+      expect(next.selected.inbox).toBe(1);
+    }
+  });
+
+  test("every matrix action applies to the selected Inbox task", () => {
+    const p = strip([1], [], [], [], [5, 6]);
+    const s = state({ focus: "inbox", selected: { 1: 0, 2: 0, 3: 0, 4: 0, inbox: 1 } });
+    expect(currentId(s, p)).toBe(6);
+    for (const [k, type] of [
+      [key("2"), "moveTo"],
+      [key("x"), "toggleDone"],
+      [key("e"), "edit"],
+      [upper("J"), "reorder"],
+      [upper("K"), "reorder"],
+      [key("a"), "startAdd"],
+    ] as const) {
+      expect(keyToAction(s, k).type).toBe(type);
+    }
+    expect(press(s, key("d"), p).mode).toBe("confirmDelete");
+    expect(press(s, key("a"), p)).toMatchObject({ mode: "add", focus: "inbox" });
+  });
+
+  test("after the selected Inbox task leaves, the selection clamps and the focus stays on the strip", () => {
+    const s = state({ focus: "inbox", selected: { 1: 0, 2: 0, 3: 0, 4: 0, inbox: 1 } });
+    let next = clamp(s, strip([], [6], [], [], [5]));
+    expect(next.focus).toBe("inbox");
+    expect(next.selected.inbox).toBe(0);
+    next = clamp(next, strip([5], [6], [], [], []));
+    expect(next.focus).toBe("inbox");
+    expect(selectedId(next, strip([5], [6], [], [], []))).toBeNull();
+  });
+
+  test("follow selects an added Inbox task in the strip", () => {
+    const s = state({ focus: "inbox" });
+    expect(follow(s, strip([], [], [], [], [5, 6, 9]), 9).selected.inbox).toBe(2);
   });
 });
 

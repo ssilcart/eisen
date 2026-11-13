@@ -6,7 +6,7 @@ import type { Quadrant } from "../domain/task.ts";
 
 export type Mode = "normal" | "add" | "confirmDelete" | "help" | "triage" | "search" | "settings";
 
-/** A pane: a quadrant, or the Inbox strip shown while a search is active (S19). */
+/** A pane: a quadrant, or the Inbox strip always shown under the grid (S24). */
 export type Focus = Quadrant | "inbox";
 
 /**
@@ -32,8 +32,13 @@ export interface Key {
 
 export interface ViewState {
   focus: Focus;
-  /** Selected row per pane; `inbox` only matters while the strip is shown. */
+  /** Selected row per pane; `inbox` is the Inbox strip's (S24). */
   selected: Record<Quadrant, number> & { inbox?: number };
+  /**
+   * The bottom pane the Inbox strip was entered from with `j`: `k` at the
+   * strip's top goes back there (S24). Q3 until the strip is entered from Q4.
+   */
+  aboveStrip: 3 | 4;
   mode: Mode;
   showDone: boolean;
   /** Text typed in the add input. */
@@ -55,8 +60,9 @@ export interface ViewState {
 }
 
 /**
- * What the panes show, in display order; only the ids matter here. `inbox`
- * is present only while the Inbox strip is shown (an active search).
+ * What the panes show, in display order; only the ids matter here. The app
+ * always passes `inbox`, the Inbox strip's list (S24); without it the strip
+ * cannot be entered and its focus falls back to Q1.
  */
 export type PaneItems = Record<Quadrant, readonly { id: number }[]> & { inbox?: readonly { id: number }[] };
 
@@ -101,6 +107,7 @@ export function initialState(preset: PresetId = DEFAULT_PRESET): ViewState {
   return {
     focus: 1,
     selected: { 1: 0, 2: 0, 3: 0, 4: 0 },
+    aboveStrip: 3,
     mode: "normal",
     showDone: false,
     input: "",
@@ -342,16 +349,23 @@ export function reduce(
   }
 }
 
-/** Back to the unfiltered matrix; the Inbox strip goes away, so does its focus. */
+/** Back to the unfiltered matrix; the Inbox strip stays (S24), and so does its focus. */
 function endSearch(s: ViewState): ViewState {
-  return { ...s, mode: "normal", query: "", focus: s.focus === "inbox" ? 1 : s.focus };
+  return { ...s, mode: "normal", query: "" };
 }
 
 const RIGHT_OF: Partial<Record<Focus, Quadrant>> = { 1: 2, 3: 4 };
 const LEFT_OF: Partial<Record<Focus, Quadrant>> = { 2: 1, 4: 3 };
-const ABOVE: Partial<Record<Focus, Quadrant>> = { 3: 1, 4: 2, inbox: 3 };
 
-/** The pane below `focus`: the Inbox strip sits under Q3 and Q4 while it is shown. */
+/** The pane above `focus`: the strip goes back to the pane it was entered from (S24). */
+function above(s: ViewState): Quadrant | undefined {
+  if (s.focus === 3) return 1;
+  if (s.focus === 4) return 2;
+  if (s.focus === "inbox") return s.aboveStrip;
+  return undefined;
+}
+
+/** The pane below `focus`: the Inbox strip sits under Q3 and Q4 (S24). */
 function below(focus: Focus, panes: PaneItems): Focus | undefined {
   if (focus === 1) return 3;
   if (focus === 2) return 4;
@@ -379,11 +393,13 @@ function navigate(s: ViewState, dir: Direction, panes: PaneItems): ViewState {
     case "down": {
       if (index < count - 1) return { ...s, selected: { ...s.selected, [s.focus]: index + 1 } };
       const target = below(s.focus, panes);
-      return target ? { ...s, focus: target, selected: { ...s.selected, [target]: 0 } } : s;
+      if (!target) return s;
+      const next = { ...s, focus: target, selected: { ...s.selected, [target]: 0 } };
+      return target === "inbox" && (s.focus === 3 || s.focus === 4) ? { ...next, aboveStrip: s.focus } : next;
     }
     case "up": {
       if (index > 0 && count > 0) return { ...s, selected: { ...s.selected, [s.focus]: index - 1 } };
-      const target = ABOVE[s.focus];
+      const target = above(s);
       if (!target) return s;
       return { ...s, focus: target, selected: { ...s.selected, [target]: Math.max(0, panes[target].length - 1) } };
     }
@@ -397,7 +413,7 @@ export function clamp(state: ViewState, panes: PaneItems): ViewState {
     selected[q] = Math.max(0, Math.min(selected[q], panes[q].length - 1));
   }
   if (panes.inbox) selected.inbox = Math.max(0, Math.min(selected.inbox ?? 0, panes.inbox.length - 1));
-  // The strip is gone (no search): its focus moves back to the grid.
+  // No strip list was given: its focus moves back to the grid.
   const focus = state.focus === "inbox" && !panes.inbox ? 1 : state.focus;
   return { ...state, focus, selected };
 }

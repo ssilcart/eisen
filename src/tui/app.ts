@@ -3,10 +3,12 @@
 // and the panes are reloaded from it after each effect. `e` hands the terminal
 // to $EDITOR (S11); the edit file format lives in edit-file.ts. `i` triages
 // the Inbox one card at a time (S12); the card's layout is in triage-card.ts.
-// `/` filters every pane live with the domain's search (S19); while it is
-// active an Inbox strip under the grid lists the Inbox matches. Pane titles
-// and messages use the active quadrant preset (S20), which `,` changes and
-// saves (S21); each pane has its colour (S23, theme.ts).
+// `/` filters every pane live with the domain's search (S19), the Inbox
+// strip included. The strip is always under the grid (S24): a fifth pane,
+// entered with `j` from Q3/Q4, where every matrix action works on its
+// selected task. Pane titles and messages use the active quadrant preset
+// (S20), which `,` changes and saves (S21); each pane has its colour (S23,
+// theme.ts).
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -43,7 +45,6 @@ import {
   keyToAction,
   offerTriage,
   reduce,
-  searchActive,
   syncTriage,
   type Action,
   type Focus,
@@ -92,17 +93,17 @@ const HINTS =
 /** The help's rows; `1`–`4` name the quadrants with the active preset (S20). */
 function helpRows(preset: PresetId): [string, string][] {
   return [
-    ["h j k l / arrows", "Move between quadrants and tasks"],
+    ["h j k l / arrows", "Move between quadrants, the Inbox strip and tasks"],
     ...QUADRANTS.map((q): [string, string] => [String(q), `Send to ${labelFor(preset, q)}`]),
     ...HELP_REST,
   ];
 }
 
 const HELP_REST: [string, string][] = [
-  ["a", "Add a task here (#tags work)"],
+  ["a", "Add a task here, or to the Inbox from its strip (#tags work)"],
   ["x", "Toggle done"],
   ["d", "Delete (y/n)"],
-  ["J / K", "Reorder inside the quadrant"],
+  ["J / K", "Reorder inside the quadrant or the Inbox"],
   [".", "Show / hide done tasks"],
   ["e", "Edit in $EDITOR"],
   ["i", "Triage the Inbox: 1-4 sort, s skip, Esc exit"],
@@ -122,6 +123,17 @@ const plain = (text: string): TextChunk => ({ __isChunk: true, text });
 function paneTitle(preset: PresetId, q: Quadrant, count: string, paneWidth = Infinity): string {
   const full = ` ${headingFor(preset, q)} (${count}) `;
   return Bun.stringWidth(full) + 4 <= paneWidth ? full : ` Q${q} (${count}) `;
+}
+
+/**
+ * `📥 Inbox (n)` (S24), `📥 Inbox (matches/total)` while searching; ` Inbox (n) `
+ * without the emoji, then ` (n) `, as the screen narrows.
+ */
+function stripTitle(preset: PresetId, count: string, width: number): string {
+  for (const title of [` ${labelFor(preset, "inbox")} (${count}) `, ` Inbox (${count}) `]) {
+    if (Bun.stringWidth(title) + 4 <= width) return title;
+  }
+  return ` (${count}) `;
 }
 
 /** `Q1 · ✅ Do` or `📥 Inbox`, for messages. */
@@ -154,8 +166,8 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
   let inboxCount = 0;
   /** Open Inbox tasks in display order: the triage queue's source (S12). */
   let inbox: Task[] = [];
-  /** What the Inbox strip lists while searching (S19); null when it is hidden. */
-  let strip: Task[] | null = null;
+  /** What the Inbox strip lists (S24): the open Inbox, done ones with `.`, or the Inbox matches (S19). */
+  let strip: Task[] = [];
   /** Set while a non-blank query filters: matches and totals per pane. */
   let filter: { matches: number; total: Record<Focus, number> } | null = null;
   let currentDay = today();
@@ -292,7 +304,6 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
 
   /** Splits `all` into the panes (and the Inbox strip) for view state `s`. */
   function build(s: ViewState): void {
-    const searching = searchActive(s);
     let rank: Map<number, number> | null = null;
     if (s.query.trim() !== "") {
       searchIndex ??= prepareSearch(all);
@@ -310,11 +321,10 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
       if (bucket === "inbox" && open) nextInbox.push(task);
       if (bucket !== "inbox" && open) counts[bucket]++;
       // A query shows its matches, done ones included; otherwise `.` decides.
-      const shown = rank ? rank.has(task.id) : open || (s.showDone && bucket !== "inbox");
+      const shown = rank ? rank.has(task.id) : open || s.showDone;
       if (!shown) continue;
-      if (bucket === "inbox") {
-        if (searching) nextStrip.push(task);
-      } else next[bucket].push(task);
+      if (bucket === "inbox") nextStrip.push(task);
+      else next[bucket].push(task);
     }
     const order = rank
       ? (a: Task, b: Task) => rank.get(a.id)! - rank.get(b.id)!
@@ -326,7 +336,7 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     openCounts = counts;
     inbox = nextInbox;
     inboxCount = nextInbox.length;
-    strip = searching ? nextStrip : null;
+    strip = nextStrip;
     filter = rank ? { matches: rank.size, total } : null;
   }
 
@@ -335,7 +345,7 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     build(state);
   }
 
-  const items = (): PaneItems => (strip ? { ...tasks, inbox: strip } : tasks);
+  const items = (): PaneItems => ({ ...tasks, inbox: strip });
 
   function taskById(id: number | null): Task | undefined {
     if (id === null) return undefined;
@@ -358,9 +368,9 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
   }
 
   // ── Drawing ──────────────────────────────────────────────────────────────
-  /** Grid sizes and the Inbox strip's height (0 when it is hidden). */
+  /** Grid sizes and the Inbox strip's height (1: a title line without a border; S24). */
   function sizes() {
-    const stripRows = strip ? stripHeight(renderer.height) : 0;
+    const stripRows = stripHeight(renderer.height);
     return { g: gridSizes(renderer.width, renderer.height, stripRows), stripRows };
   }
 
@@ -371,10 +381,15 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     rows[0]!.height = g.top;
     rows[1]!.height = g.bottom;
     for (const q of QUADRANTS) {
+      const paneHeight = q <= 2 ? g.top : g.bottom;
       panes[q].box.width = q % 2 === 1 ? g.left : g.right;
-      panes[q].box.height = q <= 2 ? g.top : g.bottom;
+      panes[q].box.height = paneHeight;
+      // A bordered box takes 2 rows whatever its height: on a tiny screen it
+      // would spill over the Inbox strip's line (S24).
+      panes[q].box.visible = paneHeight >= 2;
     }
     stripBox.visible = stripRows > 0;
+    stripBox.border = stripRows > 1;
     stripBox.width = width;
     stripBox.height = stripRows;
     status.width = width;
@@ -457,10 +472,11 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
       const count = filter ? `${tasks[q].length}/${filter.total[q]}` : `${openCounts[q]}`;
       drawList(pane.box, pane.text, tasks[q], q, inner, paneTitle(state.preset, q, count, inner.width + 2));
     }
-    if (strip && stripRows > 0) {
+    const stripCount = filter ? `${strip.length}/${filter.total.inbox}` : `${inboxCount}`;
+    if (stripRows === 1) drawStripLine(stripCount);
+    else if (stripRows > 1) {
       const inner = { width: Math.max(0, renderer.width - 2), height: Math.max(0, stripRows - 2) };
-      const count = filter ? `${strip.length}/${filter.total.inbox}` : `${strip.length}`;
-      drawList(stripBox, stripText, strip, "inbox", inner, ` ${labelFor(state.preset, "inbox")} (${count}) `);
+      drawList(stripBox, stripText, strip, "inbox", inner, stripTitle(state.preset, stripCount, renderer.width));
     }
     status.content = statusContent(renderer.width);
     drawCard();
@@ -468,6 +484,20 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     if (help.visible) helpText.content = helpContent(helpRows(state.preset));
     drawSettings();
     renderer.requestRender();
+  }
+
+  /**
+   * A tiny screen's strip (S24): only its title, on one line without a
+   * border, in the Inbox colour (bold while focused); the keys still act on
+   * its selected task.
+   */
+  function drawStripLine(count: string): void {
+    const style = paneStyle("inbox", state.focus === "inbox");
+    stripBox.title = undefined;
+    stripBox.bottomTitle = undefined;
+    boldTitles.delete(stripBox);
+    const title = fg(style.title)(` ${labelFor(state.preset, "inbox")} (${count})`);
+    stripText.content = line(renderer.width, [style.bold ? bold(title) : title]);
   }
 
   /** One pane: title, focus colour, the window of rows around its selection. */
@@ -563,21 +593,17 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
         const t = state.triage;
         const where = t ? `Triage ${t.index + 1}/${t.queue.length}` : "Triage";
         return line(width, [
-          bold(` Inbox: ${inboxCount}`),
-          fg(COLOR.muted)("  │ "),
+          plain(" "),
           state.status ? fg(COLOR.due)(state.status) : fg(COLOR.muted)(`${where} · ? help`),
         ]);
       }
       case "help":
-        return line(width, [bold(` Inbox: ${inboxCount}`), fg(COLOR.muted)("  │ Esc close help")]);
+        return line(width, [fg(COLOR.muted)(" Esc close help")]);
       case "normal": {
+        // S24: the Inbox count lives in the strip's title, not here.
         const result = matchesText();
         const hint = result === null ? fg(COLOR.muted)(HINTS) : fg(COLOR.due)(`${result} · / edit · Esc clear · ${HINTS}`);
-        return line(width, [
-          bold(` Inbox: ${inboxCount}`),
-          fg(COLOR.muted)("  │ "),
-          state.status ? fg(COLOR.due)(state.status) : hint,
-        ]);
+        return line(width, [plain(" "), state.status ? fg(COLOR.due)(state.status) : hint]);
       }
     }
   }
