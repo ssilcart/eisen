@@ -3,6 +3,8 @@
 // and the panes are reloaded from it after each effect. `e` hands the terminal
 // to $EDITOR (S11); the edit file format lives in edit-file.ts. `i` triages
 // the Inbox one card at a time (S12); the card's layout is in triage-card.ts.
+// `/` filters every pane live with the domain's search (S19); while it is
+// active an Inbox strip under the grid lists the Inbox matches.
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -20,21 +22,25 @@ import {
   type TextChunk,
 } from "@opentui/core";
 import { displayBucket, isEscalated, localToday, DEFAULT_URGENT_WITHIN_DAYS } from "../domain/escalation.ts";
+import { prepareSearch, search, type SearchIndex } from "../domain/search.ts";
 import { parseTags } from "../domain/tags.ts";
 import { QUADRANTS, QUADRANT_LABELS, bucketOf, type Quadrant, type Task } from "../domain/task.ts";
 import type { TaskRepository } from "../store/repository.ts";
 import { editChanges, editorCommand, parseTaskFile, serializeTask } from "./edit-file.ts";
-import { fit, gridSizes, windowStart } from "./layout.ts";
+import { fit, gridSizes, stripHeight, windowStart } from "./layout.ts";
 import {
   clamp,
   currentId,
+  focusMatches,
   follow,
   initialState,
   keyToAction,
   offerTriage,
   reduce,
+  searchActive,
   syncTriage,
   type Action,
+  type Focus,
   type PaneItems,
   type ViewState,
 } from "./state.ts";
@@ -78,7 +84,8 @@ const COLOR = {
   panel: "#16161e",
 };
 
-const HINTS = "h/j/k/l move · 1-4 send · a add · e edit · x done · d delete · J/K order · . done · ? help · q quit";
+const HINTS =
+  "h/j/k/l move · 1-4 send · a add · e edit · x done · d delete · / search · J/K order · . done · ? help · q quit";
 
 const HELP: [string, string][] = [
   ["h j k l / arrows", "Move between quadrants and tasks"],
@@ -90,17 +97,24 @@ const HELP: [string, string][] = [
   [".", "Show / hide done tasks"],
   ["e", "Edit in $EDITOR"],
   ["i", "Triage the Inbox: 1-4 sort, s skip, Esc exit"],
-  ["/", "Search (coming soon)"],
+  ["/", "Search every task: type to filter, Enter keep, Esc clear"],
   ["?", "Help"],
   ["q", "Quit"],
 ];
 
 const plain = (text: string): TextChunk => ({ __isChunk: true, text });
 
-/** `Q1 · Do (n)`, or `Q1 (n)` when the pane is too narrow for the label. */
-function paneTitle(q: Quadrant, open: number, paneWidth = Infinity): string {
-  const full = ` Q${q} · ${QUADRANT_LABELS[q]} (${open}) `;
-  return Bun.stringWidth(full) + 4 <= paneWidth ? full : ` Q${q} (${open}) `;
+/**
+ * `Q1 · Do (n)`, or `Q1 (n)` when the pane is too narrow for the label;
+ * `count` is the open count, or `matches/total` while searching (S19).
+ */
+function paneTitle(q: Quadrant, count: string, paneWidth = Infinity): string {
+  const full = ` Q${q} · ${QUADRANT_LABELS[q]} (${count}) `;
+  return Bun.stringWidth(full) + 4 <= paneWidth ? full : ` Q${q} (${count}) `;
+}
+
+function focusLabel(focus: Focus): string {
+  return focus === "inbox" ? "Inbox" : `Q${focus} · ${QUADRANT_LABELS[focus]}`;
 }
 
 interface Pane {
@@ -118,11 +132,19 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
   let destroyed = false;
 
   let state = initialState();
+  /** Every task, open and done, as last read from the repository. */
+  let all: Task[] = [];
+  /** Folded fields of `all` for search (S19), built on the first query after a read. */
+  let searchIndex: SearchIndex<Task> | null = null;
   let tasks: Record<Quadrant, Task[]> = { 1: [], 2: [], 3: [], 4: [] };
   let openCounts: Record<Quadrant, number> = { 1: 0, 2: 0, 3: 0, 4: 0 };
   let inboxCount = 0;
   /** Open Inbox tasks in display order: the triage queue's source (S12). */
   let inbox: Task[] = [];
+  /** What the Inbox strip lists while searching (S19); null when it is hidden. */
+  let strip: Task[] | null = null;
+  /** Set while a non-blank query filters: matches and totals per pane. */
+  let filter: { matches: number; total: Record<Focus, number> } | null = null;
   let currentDay = today();
   let resolveDone!: () => void;
   const done = new Promise<void>((resolve) => (resolveDone = resolve));
@@ -140,7 +162,7 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
       borderStyle: "rounded",
       borderColor: COLOR.border,
       titleColor: COLOR.title,
-      title: paneTitle(q, 0),
+      title: paneTitle(q, "0"),
       flexShrink: 0,
       overflow: "hidden",
     });
@@ -149,6 +171,18 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     rows[q <= 2 ? 0 : 1]!.add(box);
     panes[q] = { box, text };
   }
+  const stripBox = new BoxRenderable(renderer, {
+    id: "eisen-inbox",
+    border: true,
+    borderStyle: "rounded",
+    borderColor: COLOR.border,
+    titleColor: COLOR.title,
+    flexShrink: 0,
+    overflow: "hidden",
+    visible: false,
+  });
+  const stripText = new TextRenderable(renderer, { id: "eisen-inbox-list", content: "", wrapMode: "none", fg: COLOR.text });
+  stripBox.add(stripText);
   const status = new TextRenderable(renderer, {
     id: "eisen-status",
     content: "",
@@ -192,64 +226,107 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
   const cardText = new TextRenderable(renderer, { id: "eisen-triage-text", content: "", wrapMode: "none" });
   card.add(cardText);
   for (const row of rows) container.add(row);
+  container.add(stripBox);
   container.add(status);
   container.add(card);
   container.add(help);
   renderer.root.add(container);
 
   // ── Data ─────────────────────────────────────────────────────────────────
-  function load(): void {
+  /** Reads every task; done ones are needed by `.` and by search (S19). */
+  function fetch(): void {
     currentDay = today();
-    const all = repo.list({ status: state.showDone ? "all" : "open" });
+    all = repo.list({ status: "all" });
+    searchIndex = null;
+  }
+
+  /** Splits `all` into the panes (and the Inbox strip) for view state `s`. */
+  function build(s: ViewState): void {
+    const searching = searchActive(s);
+    let rank: Map<number, number> | null = null;
+    if (s.query.trim() !== "") {
+      searchIndex ??= prepareSearch(all);
+      rank = new Map(search(searchIndex, s.query).map((m, i) => [m.task.id, i]));
+    }
     const next: Record<Quadrant, Task[]> = { 1: [], 2: [], 3: [], 4: [] };
     const counts: Record<Quadrant, number> = { 1: 0, 2: 0, 3: 0, 4: 0 };
+    const total: Record<Focus, number> = { 1: 0, 2: 0, 3: 0, 4: 0, inbox: 0 };
     const nextInbox: Task[] = [];
+    const nextStrip: Task[] = [];
     for (const task of all) {
       const bucket = displayBucket(task, currentDay, within);
+      const open = task.status === "open";
+      total[bucket]++;
+      if (bucket === "inbox" && open) nextInbox.push(task);
+      if (bucket !== "inbox" && open) counts[bucket]++;
+      // A query shows its matches, done ones included; otherwise `.` decides.
+      const shown = rank ? rank.has(task.id) : open || (s.showDone && bucket !== "inbox");
+      if (!shown) continue;
       if (bucket === "inbox") {
-        if (task.status === "open") nextInbox.push(task);
-        continue;
-      }
-      next[bucket].push(task);
-      if (task.status === "open") counts[bucket]++;
+        if (searching) nextStrip.push(task);
+      } else next[bucket].push(task);
     }
-    // Open tasks first, done ones after (stable: keeps the repository order).
-    for (const q of QUADRANTS) next[q].sort((a, b) => Number(a.status === "done") - Number(b.status === "done"));
+    const order = rank
+      ? (a: Task, b: Task) => rank.get(a.id)! - rank.get(b.id)!
+      : // Open tasks first, done ones after (stable: keeps the repository order).
+        (a: Task, b: Task) => Number(a.status === "done") - Number(b.status === "done");
+    for (const q of QUADRANTS) next[q].sort(order);
+    nextStrip.sort(order);
     tasks = next;
     openCounts = counts;
     inbox = nextInbox;
     inboxCount = nextInbox.length;
+    strip = searching ? nextStrip : null;
+    filter = rank ? { matches: rank.size, total } : null;
   }
 
-  const items = (): PaneItems => tasks;
+  function load(): void {
+    fetch();
+    build(state);
+  }
+
+  const items = (): PaneItems => (strip ? { ...tasks, inbox: strip } : tasks);
 
   function taskById(id: number | null): Task | undefined {
     if (id === null) return undefined;
-    return inbox.find((t) => t.id === id) ?? QUADRANTS.map((q) => tasks[q].find((t) => t.id === id)).find(Boolean);
+    return all.find((t) => t.id === id);
   }
 
-  /** Reload, then drop triage cards whose task left the Inbox meanwhile. */
-  function reload(next: ViewState): ViewState {
+  /**
+   * Reload (or, for `fresh: false`, only re-filter what was read last), then
+   * drop triage cards whose task left the Inbox meanwhile.
+   */
+  function reload(next: ViewState, fresh = true): ViewState {
     try {
-      load();
+      if (fresh) fetch();
     } catch (error) {
       // Keep the last loaded tasks on screen and say why they may be stale.
       next = { ...next, status: errorMessage(error) };
     }
+    build(next);
     return syncTriage(next, inbox);
   }
 
   // ── Drawing ──────────────────────────────────────────────────────────────
+  /** Grid sizes and the Inbox strip's height (0 when it is hidden). */
+  function sizes() {
+    const stripRows = strip ? stripHeight(renderer.height) : 0;
+    return { g: gridSizes(renderer.width, renderer.height, stripRows), stripRows };
+  }
+
   function layout(): void {
     const width = renderer.width;
     const height = renderer.height;
-    const g = gridSizes(width, height);
+    const { g, stripRows } = sizes();
     rows[0]!.height = g.top;
     rows[1]!.height = g.bottom;
     for (const q of QUADRANTS) {
       panes[q].box.width = q % 2 === 1 ? g.left : g.right;
       panes[q].box.height = q <= 2 ? g.top : g.bottom;
     }
+    stripBox.visible = stripRows > 0;
+    stripBox.width = width;
+    stripBox.height = stripRows;
     status.width = width;
     const helpWidth = Math.min(helpContentWidth() + 4, Math.max(0, width - 4));
     const helpHeight = Math.min(HELP.length + 2, Math.max(0, height - 2));
@@ -289,26 +366,22 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
   }
 
   function draw(): void {
-    const g = gridSizes(renderer.width, renderer.height);
+    // The Inbox strip comes and goes with the search: size the grid first.
+    layout();
+    const { g, stripRows } = sizes();
     for (const q of QUADRANTS) {
       const pane = panes[q];
-      const focused = state.focus === q;
       const inner = {
         width: Math.max(0, (q % 2 === 1 ? g.left : g.right) - 2),
         height: Math.max(0, (q <= 2 ? g.top : g.bottom) - 2),
       };
-      pane.box.title = paneTitle(q, openCounts[q], inner.width + 2);
-      pane.box.borderColor = focused ? COLOR.focus : COLOR.border;
-      pane.box.titleColor = focused ? COLOR.focus : COLOR.title;
-      const list = tasks[q];
-      const start = windowStart(state.selected[q], list.length, inner.height);
-      const visible = list.slice(start, start + inner.height);
-      pane.box.bottomTitle =
-        list.length > inner.height && inner.height > 0
-          ? ` ${start + 1}-${start + visible.length} of ${list.length} `
-          : undefined;
-      pane.box.bottomTitleAlignment = "right";
-      pane.text.content = paneContent(visible, start, inner.width, focused ? state.selected[q] : -1);
+      const count = filter ? `${tasks[q].length}/${filter.total[q]}` : `${openCounts[q]}`;
+      drawList(pane.box, pane.text, tasks[q], q, inner, paneTitle(q, count, inner.width + 2));
+    }
+    if (strip && stripRows > 0) {
+      const inner = { width: Math.max(0, renderer.width - 2), height: Math.max(0, stripRows - 2) };
+      const count = filter ? `${strip.length}/${filter.total.inbox}` : `${strip.length}`;
+      drawList(stripBox, stripText, strip, "inbox", inner, ` Inbox (${count}) `);
     }
     status.content = statusContent(renderer.width);
     drawCard();
@@ -316,8 +389,30 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     renderer.requestRender();
   }
 
+  /** One pane: title, focus colour, the window of rows around its selection. */
+  function drawList(
+    box: BoxRenderable,
+    text: TextRenderable,
+    list: Task[],
+    id: Focus,
+    inner: { width: number; height: number },
+    title: string,
+  ): void {
+    const focused = state.focus === id;
+    const selected = state.selected[id] ?? 0;
+    box.title = title;
+    box.borderColor = focused ? COLOR.focus : COLOR.border;
+    box.titleColor = focused ? COLOR.focus : COLOR.title;
+    const start = windowStart(selected, list.length, inner.height);
+    const visible = list.slice(start, start + inner.height);
+    box.bottomTitle =
+      list.length > inner.height && inner.height > 0 ? ` ${start + 1}-${start + visible.length} of ${list.length} ` : undefined;
+    box.bottomTitleAlignment = "right";
+    text.content = paneContent(visible, start, inner.width, focused ? selected : -1);
+  }
+
   function paneContent(visible: Task[], start: number, width: number, selected: number): StyledText {
-    if (visible.length === 0) return new StyledText([fg(COLOR.muted)(fit("  No tasks", width))]);
+    if (visible.length === 0) return new StyledText([fg(COLOR.muted)(fit(filter ? "  No matches" : "  No tasks", width))]);
     const chunks: TextChunk[] = [];
     visible.forEach((task, i) => {
       if (i > 0) chunks.push(plain("\n"));
@@ -340,9 +435,28 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     return selected ? parts.map((chunk) => bg(COLOR.selectBg)(chunk)) : parts;
   }
 
+  /** `2 matches`, `No matches for "q"`, or null when no query filters. */
+  function matchesText(): string | null {
+    if (!filter) return null;
+    if (filter.matches === 0) return `No matches for "${state.query.trim()}"`;
+    return `${filter.matches} ${filter.matches === 1 ? "match" : "matches"}`;
+  }
+
   function statusContent(width: number): StyledText {
-    const quadrant = `Q${state.focus} · ${QUADRANT_LABELS[state.focus]}`;
+    const quadrant = focusLabel(state.focus);
     switch (state.mode) {
+      case "search": {
+        const prefix = " / ";
+        const after = `  ${matchesText() ?? "type to search"} · Enter keep · Esc clear`;
+        // Keep room for the result after the query; the query scrolls left.
+        const room = Math.max(1, width - Bun.stringWidth(prefix) - Math.min(Bun.stringWidth(after), 40) - 1);
+        return line(width, [
+          fg(COLOR.focus)(bold(prefix)),
+          plain(tail(state.query, room)),
+          fg(COLOR.focus)("█"),
+          (filter?.matches === 0 ? fg(COLOR.due) : fg(COLOR.muted))(after),
+        ]);
+      }
       case "add": {
         const prefix = ` Add to ${quadrant}: `;
         const hint = "  Enter save · Esc cancel";
@@ -369,12 +483,15 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
       }
       case "help":
         return line(width, [bold(` Inbox: ${inboxCount}`), fg(COLOR.muted)("  │ Esc close help")]);
-      case "normal":
+      case "normal": {
+        const result = matchesText();
+        const hint = result === null ? fg(COLOR.muted)(HINTS) : fg(COLOR.due)(`${result} · / edit · Esc clear · ${HINTS}`);
         return line(width, [
           bold(` Inbox: ${inboxCount}`),
           fg(COLOR.muted)("  │ "),
-          state.status ? fg(COLOR.due)(state.status) : fg(COLOR.muted)(HINTS),
+          state.status ? fg(COLOR.due)(state.status) : hint,
         ]);
+      }
     }
   }
 
@@ -453,9 +570,10 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
             message = "Empty title: nothing added";
             break;
           }
-          const task = repo.create({ title, quadrant: before.focus, tags: parseTags(title) });
+          const quadrant = before.focus === "inbox" ? null : before.focus;
+          const task = repo.create({ title, quadrant, tags: parseTags(title) });
           followId = task.id;
-          message = `Added to Q${before.focus} · ${QUADRANT_LABELS[before.focus]}`;
+          message = `Added to ${focusLabel(before.focus)}`;
           break;
         }
         default:
@@ -476,8 +594,13 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
       resolveDone();
       return;
     }
-    next = reload(next);
+    // Search keys only re-filter what is loaded: no read per keystroke.
+    const typing = action.type === "search" || action.type === "searchInput" || action.type === "searchBackspace";
+    // Leaving the search keeps the selected match selected in the full view.
+    if (action.type === "clearSearch" || action.type === "submitSearch") followId = id;
+    next = reload(next, !typing);
     state = followId === null ? clamp(next, items()) : follow(next, items(), followId);
+    if (typing) state = focusMatches(state, items());
     draw();
   }
 

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { fit, gridSizes, windowStart, wrap } from "../../src/tui/layout.ts";
+import { fit, gridSizes, stripHeight, windowStart, wrap } from "../../src/tui/layout.ts";
 
 describe("wrap", () => {
   test("breaks on spaces to fit the width", () => {
@@ -71,5 +71,26 @@ describe("gridSizes", () => {
   test("never negative on a tiny screen", () => {
     const g = gridSizes(1, 1);
     for (const v of Object.values(g)) expect(v).toBeGreaterThanOrEqual(0);
+  });
+
+  test("leaves room for the Inbox strip under the grid (S19)", () => {
+    expect(gridSizes(100, 31, 6)).toEqual({ left: 50, right: 50, top: 12, bottom: 12 });
+    const g = gridSizes(10, 3, 6);
+    for (const v of Object.values(g)) expect(v).toBeGreaterThanOrEqual(0);
+  });
+});
+
+describe("stripHeight (S19)", () => {
+  test("a quarter of the rows above the status line, 3 to 6 rows with its border", () => {
+    expect(stripHeight(30)).toBe(6);
+    expect(stripHeight(100)).toBe(6);
+    expect(stripHeight(17)).toBe(4);
+    expect(stripHeight(10)).toBe(3);
+  });
+
+  test("never more than a third of the screen above the status line", () => {
+    expect(stripHeight(7)).toBe(2);
+    expect(stripHeight(2)).toBe(0);
+    expect(stripHeight(0)).toBe(0);
   });
 });

@@ -3,6 +3,7 @@ import { basename } from "node:path";
 import { parseArgs } from "node:util";
 import { displayBucket, isEscalated, localToday } from "../domain/escalation.ts";
 import { bucketOf, isValidDate, QUADRANT_LABELS, QUADRANTS, type Bucket, type Quadrant, type Task } from "../domain/task.ts";
+import { search } from "../domain/search.ts";
 import { parseTags } from "../domain/tags.ts";
 import { exportMarkdown } from "../import/export.ts";
 import { importMarkdown } from "../import/importer.ts";
@@ -47,12 +48,15 @@ Adds a task. Without a quadrant it goes to the Inbox. #words in the title become
   --q3  Delegate (urgent, not important)  --q4  Delete (neither)
   --due YYYY-MM-DD  Due date; tasks due within 2 days are shown as urgent
 `,
-  ls: `Usage: eisen ls [--q1|--q2|--q3|--q4|--inbox] [--all] [--json]
+  ls: `Usage: eisen ls [--q1|--q2|--q3|--q4|--inbox] [--search "<query>"] [--all] [--json]
 
 Lists open tasks grouped by where they are shown (due-soon tasks escalate, marked "!").
   --q1..--q4, --inbox  Only that quadrant or the Inbox
+  --search "<query>"   Only tasks matching every word of the query in the title,
+                       description or tags, best first; done tasks included (marked ✓).
+                       Accents and case are ignored, typos tolerated; #word matches tags
   --all                Include done tasks
-  --json               JSON array instead of text
+  --json               JSON array instead of text (with score and matched fields when searching)
 `,
   import: `Usage: eisen import <file.md>
 
@@ -139,21 +143,36 @@ const COMMANDS: Record<"add" | "ls" | "import" | "export", (args: string[], io: 
   ls(args, io) {
     const { values } = parseArgs({
       args,
-      options: { ...QUADRANT_FLAGS, inbox: { type: "boolean" }, all: { type: "boolean" }, json: { type: "boolean" } },
+      options: {
+        ...QUADRANT_FLAGS,
+        inbox: { type: "boolean" },
+        search: { type: "string" },
+        all: { type: "boolean" },
+        json: { type: "boolean" },
+      },
       strict: true,
     });
     const quadrant = pickQuadrant(values);
     if (quadrant !== null && values.inbox) throw new UsageError("Pick one of --q1..--q4 or --inbox.");
     const filter: Bucket | null = values.inbox ? "inbox" : quadrant;
+    // S19: a blank query filters nothing; any other covers done tasks too.
+    const query = values.search?.trim() ? values.search.trim() : null;
     const today = io.today ?? localToday();
     const order: Bucket[] = [...QUADRANTS, "inbox"];
-    const rows = repository(io)
-      .list({ status: values.all ? "all" : "open" })
-      .map((task) => ({ ...task, bucket: bucketOf(task), shownIn: displayBucket(task, today), escalated: isEscalated(task, today) }))
+    const tasks = repository(io).list({ status: values.all || query ? "all" : "open" });
+    const matches = query === null ? null : new Map(search(tasks, query).map((m, rank) => [m.task.id, { ...m, rank }]));
+    const rows = tasks
+      .filter((task) => matches === null || matches.has(task.id))
+      .map((task) => {
+        const row = { ...task, bucket: bucketOf(task), shownIn: displayBucket(task, today), escalated: isEscalated(task, today) };
+        const match = matches?.get(task.id);
+        return match ? { ...row, score: match.score, matched: match.fields } : row;
+      })
       .filter((t) => filter === null || t.shownIn === filter)
       .sort(
         (a, b) =>
           order.indexOf(a.shownIn) - order.indexOf(b.shownIn) ||
+          (matches ? matches.get(a.id)!.rank - matches.get(b.id)!.rank : 0) ||
           Number(a.status === "done") - Number(b.status === "done") ||
           a.position - b.position ||
           a.id - b.id,
@@ -164,7 +183,7 @@ const COMMANDS: Record<"add" | "ls" | "import" | "export", (args: string[], io: 
       return EXIT_OK;
     }
     if (rows.length === 0) {
-      io.stdout("No tasks.\n");
+      io.stdout(query === null ? "No tasks.\n" : `No matches for "${query}".\n`);
       return EXIT_OK;
     }
     const lines: string[] = [];

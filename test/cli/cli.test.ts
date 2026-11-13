@@ -3,6 +3,8 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCli } from "../../src/cli/cli.ts";
+import { openDb } from "../../src/store/db.ts";
+import { TaskRepository } from "../../src/store/repository.ts";
 
 let dir: string;
 let env: Record<string, string>;
@@ -82,6 +84,78 @@ describe("ls", () => {
 
   test("empty", () => {
     expect(run("ls").stdout).toBe("No tasks.\n");
+  });
+});
+
+describe("ls --search (S19)", () => {
+  beforeEach(() => {
+    run("import", fixture);
+    const done = run("add", "Renew the zoho certificate", "--q3");
+    expect(done.code).toBe(0);
+  });
+
+  function json(...argv: string[]) {
+    const r = run("ls", ...argv, "--json");
+    expect(r.code).toBe(0);
+    return JSON.parse(r.stdout) as { id: number; title: string; status: string; shownIn: unknown; score: number; matched: string[] }[];
+  }
+
+  test("a typo finds the Delivra task in the Inbox, grouped like ls", () => {
+    const r = run("ls", "--search", "delvira");
+    expect(r.code).toBe(0);
+    expect(r.stdout).toMatch(/^Inbox\n {2}\d+ {2}en delivra montar los sigueintes features: {2}#todo\n$/);
+  });
+
+  test("--json lists the matches best first with their score and matched fields", () => {
+    const rows = json("--search", "rainer");
+    expect(rows.map((r) => r.title)).toEqual([
+      "provide new meta permissions integration description for sending messages #instagram and #messenger",
+      "Create epic for cloudbeds new integration",
+    ]);
+    expect(rows[0]!.matched).toEqual(["tags", "description"]);
+    expect(rows[1]!.matched).toEqual(["description"]);
+    expect(rows[0]!.score).toBeGreaterThan(rows[1]!.score);
+  });
+
+  test("combines with the bucket filters", () => {
+    expect(json("--search", "compañía", "--inbox")).toHaveLength(1);
+    expect(json("--search", "zoho", "--q3").map((r) => r.title)).toEqual(["Renew the zoho certificate"]);
+    expect(json("--search", "zoho", "--q1")).toEqual([]);
+    expect(json("--search", "zoho").map((r) => r.shownIn)).toEqual([3, "inbox"]);
+  });
+
+  test("done tasks are searched without --all and marked ✓ in text", () => {
+    const id = json("--search", "certificate")[0]!.id;
+    // The CLI has no "done" command: mark it through the repository.
+    const db = openDb(env.EISEN_DB!);
+    new TaskRepository(db).toggleDone(id);
+    db.close();
+    expect(run("ls").stdout).not.toContain("certificate");
+    const rows = json("--search", "certificate");
+    expect(rows.map((r) => r.status)).toEqual(["done"]);
+    expect(run("ls", "--search", "certificate").stdout).toContain(`  ${id}  ✓ Renew the zoho certificate`);
+  });
+
+  test("every token must match", () => {
+    expect(json("--search", "zoho prod")).toHaveLength(1);
+    expect(json("--search", "zoho stash")).toEqual([]);
+  });
+
+  test("no results says so and exits 0", () => {
+    const r = run("ls", "--search", "xyzzy");
+    expect(r.code).toBe(0);
+    expect(r.stdout).toBe('No matches for "xyzzy".\n');
+  });
+
+  test("a blank query is no filter: plain ls", () => {
+    expect(run("ls", "--search", "  ").stdout).toBe(run("ls").stdout);
+  });
+
+  test("--search without a value is a usage error; --help documents it", () => {
+    expect(run("ls", "--search").code).toBe(2);
+    const help = run("ls", "--help").stdout;
+    expect(help).toContain('--search "<query>"');
+    expect(help).toContain("done");
   });
 });
 

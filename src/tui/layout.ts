@@ -9,13 +9,27 @@ export interface GridSizes {
 
 export const STATUS_HEIGHT = 1;
 
-/** Column widths and row heights of the 2×2 grid above the status bar. */
-export function gridSizes(width: number, height: number): GridSizes {
+/**
+ * Column widths and row heights of the 2×2 grid above the status bar and,
+ * while a search is active, the Inbox strip (`strip` rows, S19).
+ */
+export function gridSizes(width: number, height: number, strip = 0): GridSizes {
   const w = Math.max(0, width);
-  const h = Math.max(0, height - STATUS_HEIGHT);
+  const h = Math.max(0, height - STATUS_HEIGHT - strip);
   const left = Math.floor(w / 2);
   const top = Math.floor(h / 2);
   return { left, right: w - left, top, bottom: h - top };
+}
+
+/**
+ * Rows of the Inbox strip shown under the grid while searching (S19), border
+ * included: a quarter of the rows above the status line, 3 to 6, and never
+ * more than a third of them.
+ */
+export function stripHeight(height: number): number {
+  const rows = Math.max(0, height - STATUS_HEIGHT);
+  const wanted = Math.min(6, Math.max(3, Math.floor(rows / 4)));
+  return Math.min(wanted, Math.floor(rows / 3));
 }
 
 /** First row to show so `selected` is visible in `height` rows (roughly centred). */

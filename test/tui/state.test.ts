@@ -2,11 +2,13 @@ import { describe, expect, test } from "bun:test";
 import {
   clamp,
   currentId,
+  focusMatches,
   follow,
   initialState,
   keyToAction,
   offerTriage,
   reduce,
+  searchActive,
   selectedId,
   syncTriage,
   type Action,
@@ -240,8 +242,10 @@ describe("reduce: modes", () => {
     expect(s.showDone).toBe(false);
   });
 
-  test("/ is a hook that says coming soon for now", () => {
-    expect(press(state(), key("/"), p).status).toMatch(/coming soon/);
+  test("/ opens the search input (S19)", () => {
+    const s = press(state(), key("/"), p);
+    expect(s.mode).toBe("search");
+    expect(s.status).toBeNull();
   });
 
   test("q sets quit", () => {
@@ -437,5 +441,136 @@ describe("triage (S12)", () => {
   test("offerTriage puts the offer in the status line only when the Inbox has tasks", () => {
     expect(offerTriage(state(), 8).status).toBe("press i to triage");
     expect(offerTriage(state(), 0).status).toBeNull();
+  });
+});
+
+describe("search (S19)", () => {
+  const esc = key("escape", { sequence: "\u001b" });
+  const enter = key("return", { sequence: "\r" });
+  const backspace = key("backspace", { sequence: "\u007f" });
+  // Panes while a search is active: the Inbox strip is a fifth pane.
+  function searchPanes(q1: number[], q2: number[], q3: number[], q4: number[], inbox: number[]): PaneItems {
+    return { ...panes(q1, q2, q3, q4), inbox: items(...inbox) };
+  }
+  function type(s: ViewState, text: string, p: PaneItems): ViewState {
+    for (const ch of text) s = press(s, key(ch === " " ? "space" : ch, { sequence: ch }), p);
+    return s;
+  }
+
+  test("in the search input every printable key types, global keys included", () => {
+    const s = state({ mode: "search" });
+    for (const ch of ["q", "x", "d", "1", "i", "/", ".", "?", "a", "e", "j", "#", "ñ"]) {
+      expect(keyToAction(s, key(ch, { sequence: ch }))).toEqual({ type: "searchInput", text: ch });
+    }
+    expect(keyToAction(s, upper("J"))).toEqual({ type: "searchInput", text: "J" });
+    expect(keyToAction(s, key("space", { sequence: " " }))).toEqual({ type: "searchInput", text: " " });
+    expect(keyToAction(s, backspace)).toEqual({ type: "searchBackspace" });
+    expect(keyToAction(s, enter)).toEqual({ type: "submitSearch" });
+    expect(keyToAction(s, esc)).toEqual({ type: "clearSearch" });
+    expect(keyToAction(s, key("up", { sequence: "\u001b[A" }))).toEqual({ type: "noop" });
+    expect(keyToAction(s, key("c", { ctrl: true, sequence: "\u0003" }))).toEqual({ type: "quit" });
+  });
+
+  test("typing edits the query live; Backspace removes a whole character", () => {
+    const p = panes([1]);
+    let s = press(state(), key("/"), p);
+    s = type(s, "zoho 🔥", p);
+    expect(s.query).toBe("zoho 🔥");
+    s = press(s, backspace, p);
+    expect(s.query).toBe("zoho ");
+    expect(s.mode).toBe("search");
+  });
+
+  test("typing resets every pane's selection to its best match", () => {
+    const p = searchPanes([1, 2, 3], [], [], [], [4, 5]);
+    const s = press(state({ mode: "search", query: "a", selected: { 1: 2, 2: 0, 3: 0, 4: 0, inbox: 1 } }), key("b"), p);
+    expect(s.selected).toEqual({ 1: 0, 2: 0, 3: 0, 4: 0, inbox: 0 });
+  });
+
+  test("Enter keeps the filter and returns to normal navigation", () => {
+    const s = press(state({ mode: "search", query: "zoho" }), enter, panes([1]));
+    expect(s.mode).toBe("normal");
+    expect(s.query).toBe("zoho");
+    expect(searchActive(s)).toBe(true);
+    // Global keys act again, on the filtered panes.
+    expect(keyToAction(s, key("2"))).toEqual({ type: "moveTo", quadrant: 2 });
+    expect(keyToAction(s, key("x"))).toEqual({ type: "toggleDone" });
+  });
+
+  test("Enter on a blank query ends the search", () => {
+    const s = press(state({ mode: "search", query: "   ", focus: "inbox" }), enter, panes([1]));
+    expect(s.mode).toBe("normal");
+    expect(s.query).toBe("");
+    expect(searchActive(s)).toBe(false);
+    expect(s.focus).toBe(1);
+  });
+
+  test("Esc clears the filter, from the input or from normal navigation", () => {
+    const p = panes([1]);
+    let s = press(state({ mode: "search", query: "zoho" }), esc, p);
+    expect(s).toMatchObject({ mode: "normal", query: "" });
+    s = state({ query: "zoho", focus: "inbox" });
+    expect(keyToAction(s, esc)).toEqual({ type: "clearSearch" });
+    s = press(s, esc, p);
+    expect(s).toMatchObject({ mode: "normal", query: "", focus: 1 });
+    // Without a filter Esc stays a plain cancel.
+    expect(keyToAction(state(), esc)).toEqual({ type: "cancel" });
+  });
+
+  test("/ again edits the query, prefilled", () => {
+    const s = press(state({ query: "zoho" }), key("/"), panes([1]));
+    expect(s).toMatchObject({ mode: "search", query: "zoho" });
+  });
+
+  test("searchActive: while typing, or while a non-blank query is kept", () => {
+    expect(searchActive(state())).toBe(false);
+    expect(searchActive(state({ mode: "search" }))).toBe(true);
+    expect(searchActive(state({ query: "x" }))).toBe(true);
+    expect(searchActive(state({ query: "  " }))).toBe(false);
+  });
+
+  test("j from the bottom panes goes into the Inbox strip; k at its top comes back to Q3", () => {
+    const p = searchPanes([1], [2], [3, 4], [], [5, 6]);
+    let s = press(state({ query: "x", focus: 3, selected: { 1: 0, 2: 0, 3: 1, 4: 0 } }), key("j"), p);
+    expect(s.focus).toBe("inbox");
+    expect(s.selected.inbox).toBe(0);
+    expect(selectedId(s, p)).toBe(5);
+    s = press(s, key("j"), p);
+    expect(selectedId(s, p)).toBe(6);
+    s = press(s, key("j"), p);
+    expect(selectedId(s, p)).toBe(6); // the strip is the bottom edge
+    s = press(s, key("k"), p);
+    s = press(s, key("k"), p);
+    expect(s.focus).toBe(3);
+    expect(s.selected[3]).toBe(1);
+    // An empty Q4 crosses at once.
+    s = press(state({ query: "x", focus: 4 }), key("j"), p);
+    expect(s.focus).toBe("inbox");
+    // h/l do nothing in the strip.
+    expect(press(s, key("h"), p).focus).toBe("inbox");
+    expect(press(s, key("l"), p).focus).toBe("inbox");
+  });
+
+  test("without the strip (no search) j at the bottom stays put", () => {
+    const s = press(state({ focus: 3 }), key("j"), panes([1], [2], [3], []));
+    expect(s.focus).toBe(3);
+  });
+
+  test("actions apply to the selected Inbox match", () => {
+    const p = searchPanes([], [], [], [], [5, 6]);
+    const s = state({ query: "x", focus: "inbox", selected: { 1: 0, 2: 0, 3: 0, 4: 0, inbox: 1 } });
+    expect(currentId(s, p)).toBe(6);
+    expect(press(s, key("d"), p).mode).toBe("confirmDelete");
+    expect(follow(s, p, 5).selected.inbox).toBe(0);
+    expect(clamp(state({ focus: "inbox", selected: { 1: 0, 2: 0, 3: 0, 4: 0, inbox: 9 } }), p).selected.inbox).toBe(1);
+  });
+
+  test("focusMatches moves the focus to the first pane with matches when the focused one has none", () => {
+    const p = searchPanes([], [], [3], [], [5]);
+    expect(focusMatches(state({ query: "x", focus: 1 }), p).focus).toBe(3);
+    expect(focusMatches(state({ query: "x", focus: 3 }), p).focus).toBe(3);
+    expect(focusMatches(state({ query: "x", focus: 2 }), searchPanes([], [], [], [], [5])).focus).toBe("inbox");
+    // Nothing matches anywhere: the focus stays.
+    expect(focusMatches(state({ query: "x", focus: 2 }), searchPanes([], [], [], [], [])).focus).toBe(2);
   });
 });

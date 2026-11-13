@@ -79,6 +79,45 @@ status line says `press i to triage`; `i` shows its tasks one card at a time
 A session visits each task once; when the last card is done you are back in
 the matrix with a summary such as `Inbox triaged: 6 sorted, 2 skipped`.
 
+### Search
+
+`/` opens a search input in the status line and filters on every keystroke,
+over every task: the four quadrants, the Inbox and done tasks (done ones are
+shown dimmed with `✓` even when `.` hides them).
+
+- Accents and case are ignored (`compañía` finds `compania`) and typos are
+  tolerated: one for words of 4–7 letters, two for 8 or more (`delvira`
+  finds `delivra`). Shorter words only match as written.
+- Every word must match the title, the description or a tag (`zoho prod`).
+  `#word` matches tags only, by prefix (`#zo` finds `#zoho`).
+- Best matches come first: title, then tag, then description; whole words
+  before prefixes, before parts of words, before typos; open before done.
+
+The matrix stays on screen: each pane keeps only its matches and shows
+`matches/total` in its title, and an **Inbox** strip appears under the grid
+with the Inbox matches (`j` from the bottom panes moves into it).
+
+| Key            | Action                                             |
+| -------------- | -------------------------------------------------- |
+| typing         | Filters live; no other key acts while you type     |
+| `Enter`        | Keep the filter and go back to the usual keys: `x`, `d`, `e`, `1`–`4`, `J`/`K` act on the selected match |
+| `Esc`          | Clear the filter and restore the full matrix       |
+| `/`            | Edit the kept query again                          |
+
+The filter is applied again after every change, so a match you mark done
+stays in view with its `✓`. With no results the status line says
+`No matches for "…"`. `i` still triages the whole Inbox, not only the
+matches, and returns to the filtered view.
+
+From the shell, `eisen ls --search "<query>"` uses the same search. It
+combines with `--q1`..`--q4`/`--inbox` and `--json` (each row then carries its
+`score` and `matched` fields), and includes done tasks, marked `✓`:
+
+```sh
+eisen ls --search "zoho prod"
+eisen ls --search "#rainer" --inbox --json
+```
+
 ## Development
 
 ```sh

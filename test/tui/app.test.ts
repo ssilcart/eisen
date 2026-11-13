@@ -3,6 +3,7 @@ import type { Database } from "bun:sqlite";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
+import { TextAttributes } from "@opentui/core";
 import { createTestRenderer, type TestRendererSetup } from "@opentui/core/testing";
 import { bucketOf } from "../../src/domain/task.ts";
 import { importMarkdown } from "../../src/import/importer.ts";
@@ -752,6 +753,308 @@ describe("triage (S12) on the user's fixture", () => {
       // See above.
     }
     expect(await settles(app.done)).toBe("done");
+  });
+});
+
+describe("search (S19) on the user's fixture", () => {
+  const fixture = readFileSync(join(import.meta.dir, "../../fixtures/import/user-tasks.md"), "utf8");
+  const ZOHO = "test prod new activities integration for #zoho";
+  const META = "provide new meta permissions";
+  const DELIVRA = "en delivra montar los sigueintes features:";
+  const API = "Create an epic to store the api calls";
+  const CLOUDBEDS = "Create epic for cloudbeds new integration";
+  const VACATIONS = "aporove #vacations request from #david";
+
+  function find(prefix: string) {
+    return repo.list({ status: "all" }).find((t) => t.title.startsWith(prefix))!;
+  }
+
+  beforeEach(() => {
+    // The fixture spread over the matrix: zoho in Q1, meta (#rainer) in Q2,
+    // delivra in Q3, the api-calls epic done in Q4; four stay in the Inbox,
+    // among them cloudbeds ("Rainer" in its description) and vacations.
+    db.close();
+    db = openDb(":memory:");
+    repo = new TaskRepository(db);
+    importMarkdown(repo, fixture);
+    repo.move(find(ZOHO).id, 1);
+    repo.move(find(META).id, 2);
+    repo.move(find(DELIVRA).id, 3);
+    repo.move(find(API).id, 4);
+    repo.toggleDone(find(API).id);
+  });
+
+  async function type(text: string): Promise<string> {
+    await setup.mockInput.typeText(text);
+    return frame();
+  }
+
+  async function escape(): Promise<string> {
+    setup.mockInput.pressEscape();
+    await Bun.sleep(30);
+    return frame();
+  }
+
+  function statusLine(f: string): string {
+    return f.trimEnd().split("\n").at(-1)!;
+  }
+
+  test("/ opens the input in the status line and filters the panes and the Inbox strip on every keystroke", async () => {
+    let f = await start(120, 30);
+    expect(f).not.toContain("Inbox (");
+    f = await keys("/");
+    expect(app.state.mode).toBe("search");
+    expect(f).toContain("Inbox (4)"); // the strip, unfiltered until something is typed
+    f = await type("rai");
+    expect(statusLine(f)).toContain("/ rai");
+    expect(f).toContain(META);
+    expect(f).toContain(CLOUDBEDS);
+    expect(f).not.toContain(ZOHO);
+    f = await type("ner");
+    expect(statusLine(f)).toContain("/ rainer");
+    expect(statusLine(f)).toContain("2 matches");
+    // Each pane shows matches/total; the strip lists the Inbox matches.
+    expect(f).toContain("Q1 · Do (0/1)");
+    expect(f).toContain("Q2 · Schedule (1/1)");
+    expect(f).toContain("Q3 · Delegate (0/1)");
+    expect(f).toContain("Q4 · Delete (0/1)");
+    expect(f).toContain("Inbox (1/4)");
+    expect(grid(f)).toContain(META);
+    expect(where(f, CLOUDBEDS).row).toBeGreaterThan(where(f, "Q4 · Delete").row);
+    expect(grid(f)).not.toContain(VACATIONS);
+    // Backspace widens it again, live.
+    setup.mockInput.pressBackspace();
+    setup.mockInput.pressBackspace();
+    setup.mockInput.pressBackspace();
+    f = await frame();
+    expect(app.state.query).toBe("rai");
+  });
+
+  test("global keys typed into the search input do nothing but type", async () => {
+    await start(120, 30);
+    const before = JSON.stringify(repo.list({ status: "all" }));
+    await keys("/");
+    const f = await type("qxd1i.?ae");
+    expect(app.state.query).toBe("qxd1i.?ae");
+    expect(app.state.mode).toBe("search");
+    expect(app.state.quit).toBe(false);
+    expect(JSON.stringify(repo.list({ status: "all" }))).toBe(before);
+    expect(f).not.toContain("Help");
+  });
+
+  test("a typo, an accent and an Inbox task are all found", async () => {
+    await start(120, 30);
+    await keys("/");
+    let f = await type("delvira");
+    expect(f).toContain("Q3 · Delegate (1/1)");
+    expect(grid(f)).toContain(DELIVRA);
+    setup.mockInput.pressKey("u", { ctrl: true }); // ignored, not typed
+    for (let i = 0; i < "delvira".length; i++) setup.mockInput.pressBackspace();
+    f = await type("compañía");
+    expect(grid(f)).toContain("cuando se elimina una compania");
+    expect(f).toContain("Inbox (1/4)");
+  });
+
+  test("Enter keeps the filter; 2 moves the selected Inbox match and the filter re-applies after the reload", async () => {
+    await start(120, 30);
+    await keys("/");
+    await type("cloudbeds");
+    // The only match is in the Inbox: the focus follows it there.
+    expect(app.state.focus).toBe("inbox");
+    setup.mockInput.pressEnter();
+    let f = await frame();
+    expect(app.state.mode).toBe("normal");
+    expect(app.state.query).toBe("cloudbeds");
+    f = await keys("2");
+    expect(bucketOf(find(CLOUDBEDS))).toBe(2);
+    expect(f).toContain("Moved to Q2 · Schedule");
+    expect(f).toContain("Q2 · Schedule (1/2)");
+    expect(f).toContain("Inbox (0/3)");
+    expect(grid(f)).not.toContain(META); // still filtered
+    expect(app.state.query).toBe("cloudbeds");
+  });
+
+  test("after Enter, x and J act on the selected match and it stays visible", async () => {
+    await start(120, 30);
+    await keys("/");
+    await type("zoho");
+    setup.mockInput.pressEnter();
+    await frame();
+    expect(app.state.focus).toBe(1);
+    let f = await keys("x");
+    expect(find(ZOHO).status).toBe("done");
+    expect(f).toContain("Done: ");
+    // Search covers done tasks: the match stays, now with a ✓.
+    const row = f.split("\n").find((line) => line.includes(ZOHO))!;
+    expect(row).toContain("✓");
+    f = await keys("x");
+    expect(find(ZOHO).status).toBe("open");
+  });
+
+  test("j from a bottom pane enters the Inbox strip and d deletes the selected match there", async () => {
+    await start(120, 30);
+    await keys("/");
+    await type("rainer");
+    setup.mockInput.pressEnter();
+    await frame();
+    expect(app.state.focus).toBe(2);
+    await keys("j", "j"); // Q2 → Q4 (no match) → Inbox strip
+    expect(app.state.focus).toBe("inbox");
+    let f = await keys("d");
+    expect(f).toContain(`Delete "${CLOUDBEDS}"? y/n`);
+    f = await keys("y");
+    expect(repo.list({ status: "all" }).some((t) => t.title === CLOUDBEDS)).toBe(false);
+    expect(f).toContain("Inbox (0/3)");
+  });
+
+  test("a in the focused Inbox strip adds to the Inbox, and the new match shows up there", async () => {
+    await start(120, 30);
+    await keys("/");
+    await type("cloudbeds");
+    setup.mockInput.pressEnter();
+    await frame();
+    expect(app.state.focus).toBe("inbox");
+    let f = await keys("a");
+    expect(f).toContain("Add to Inbox:");
+    await type("Ask cloudbeds for keys");
+    setup.mockInput.pressEnter();
+    f = await frame();
+    const added = repo.list({ status: "all" }).find((t) => t.title === "Ask cloudbeds for keys")!;
+    expect(bucketOf(added)).toBe("inbox");
+    expect(f).toContain("Added to Inbox");
+    expect(f).toContain("Inbox (2/5)");
+  });
+
+  test("Esc clears the filter and restores the view; / again edits the query, prefilled", async () => {
+    await start(120, 30);
+    await keys("/");
+    await type("zoho");
+    setup.mockInput.pressEnter();
+    let f = await frame();
+    f = await keys("/");
+    expect(statusLine(f)).toContain("/ zoho");
+    expect(app.state.query).toBe("zoho");
+    f = await type(" prod");
+    expect(app.state.query).toBe("zoho prod");
+    expect(f).toContain("Q1 · Do (1/1)");
+    f = await escape();
+    expect(app.state.mode).toBe("normal");
+    expect(app.state.query).toBe("");
+    expect(f).not.toContain("Inbox (");
+    expect(f).toContain("Q1 · Do (1)");
+    expect(f).toContain("Q2 · Schedule (1)");
+    expect(f).toContain("Q4 · Delete (0)");
+    expect(grid(f)).toContain(META);
+    expect(grid(f)).not.toContain(API); // done and hidden again
+    // Esc after Enter also clears it.
+    await keys("/");
+    await type("zoho");
+    setup.mockInput.pressEnter();
+    await frame();
+    f = await escape();
+    expect(app.state.query).toBe("");
+    expect(grid(f)).toContain(META);
+  });
+
+  test("done tasks appear dimmed with ✓ even while . hides them", async () => {
+    await start(120, 30);
+    expect(app.state.showDone).toBe(false);
+    await keys("/");
+    const f = await type("api calls");
+    expect(f).toContain("Q4 · Delete (1/1)");
+    const row = f.split("\n").find((line) => line.includes(API))!;
+    expect(row).toContain("✓");
+    const spans = setup.captureSpans().lines.flatMap((l) => l.spans);
+    const title = spans.find((s) => s.text.includes("Create an epic"))!;
+    expect(title.attributes & TextAttributes.DIM).toBeTruthy();
+  });
+
+  test("no results says so, in the input and after Enter", async () => {
+    await start(120, 30);
+    await keys("/");
+    let f = await type("xyzzy");
+    expect(statusLine(f)).toContain('No matches for "xyzzy"');
+    expect(f).toContain("Q1 · Do (0/1)");
+    expect(f).toContain("Inbox (0/4)");
+    setup.mockInput.pressEnter();
+    f = await frame();
+    expect(statusLine(f)).toContain('No matches for "xyzzy"');
+    expect(await keys("x")).toContain("Nothing selected");
+  });
+
+  test("the layout reflows on resize during a search, down to 30×10, and typing keeps working", async () => {
+    await start(120, 30);
+    await keys("/");
+    await type("rainer");
+    setup.resize(70, 18);
+    let f = await frame();
+    expect(f).toContain("Inbox (1/4)");
+    expect(statusLine(f)).toContain("rainer");
+    expect(f).toContain("(1/1)");
+    setup.resize(30, 10);
+    f = await frame();
+    expect(f.split("\n").every((line) => Bun.stringWidth(line) <= 30)).toBe(true);
+    setup.resize(120, 30);
+    setup.mockInput.pressBackspace();
+    f = await frame();
+    expect(app.state.query).toBe("raine");
+    expect(f).toContain("Inbox (1/4)");
+  });
+
+  test("q and Ctrl+C still quit while a search is kept and every reload fails", async () => {
+    await start(120, 30);
+    await keys("/");
+    await type("zoho");
+    setup.mockInput.pressEnter();
+    await frame();
+    breakList(repo).failAlways();
+    try {
+      setup.mockInput.pressKey("q");
+    } catch {
+      // See "repository failures".
+    }
+    expect(await settles(app.done)).toBe("done");
+  });
+
+  test("Ctrl+C quits from the search input even when every reload fails", async () => {
+    await start(120, 30);
+    await keys("/");
+    await type("zo");
+    breakList(repo).failAlways();
+    try {
+      setup.mockInput.pressKey("c", { ctrl: true });
+    } catch {
+      // See "repository failures".
+    }
+    expect(await settles(app.done)).toBe("done");
+  });
+
+  test("a failed reload while searching keeps the last results and shows the error", async () => {
+    await start(120, 30);
+    await keys("/");
+    await type("zoho");
+    setup.mockInput.pressEnter();
+    await frame();
+    breakList(repo).failNext();
+    const f = await keys("x");
+    expect(f).toContain("Error: database is locked");
+    expect(grid(f)).toContain(ZOHO);
+  });
+
+  test("i triages the whole Inbox and returns to the kept filter", async () => {
+    await start(120, 30);
+    await keys("/");
+    await type("rainer");
+    setup.mockInput.pressEnter();
+    await frame();
+    let f = await keys("i");
+    expect(app.state.mode).toBe("triage");
+    expect(f).toContain("Triage 1/4"); // every open Inbox task, not only the matches
+    f = await escape();
+    expect(app.state.mode).toBe("normal");
+    expect(app.state.query).toBe("rainer");
+    expect(f).toContain("Inbox (1/4)");
+    expect(f).toContain("Q2 · Schedule (1/1)");
   });
 });
 

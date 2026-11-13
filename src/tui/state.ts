@@ -3,7 +3,10 @@
 // app.ts runs the repository effects and reloads the panes.
 import type { Quadrant } from "../domain/task.ts";
 
-export type Mode = "normal" | "add" | "confirmDelete" | "help" | "triage";
+export type Mode = "normal" | "add" | "confirmDelete" | "help" | "triage" | "search";
+
+/** A pane: a quadrant, or the Inbox strip shown while a search is active (S19). */
+export type Focus = Quadrant | "inbox";
 
 /**
  * A triage session (S12): the Inbox ids taken when it started, in order, and
@@ -27,9 +30,9 @@ export interface Key {
 }
 
 export interface ViewState {
-  focus: Quadrant;
-  /** Selected row per pane. */
-  selected: Record<Quadrant, number>;
+  focus: Focus;
+  /** Selected row per pane; `inbox` only matters while the strip is shown. */
+  selected: Record<Quadrant, number> & { inbox?: number };
   mode: Mode;
   showDone: boolean;
   /** Text typed in the add input. */
@@ -39,10 +42,18 @@ export interface ViewState {
   quit: boolean;
   /** Set while triaging; `confirmDelete` and `help` return to it. */
   triage: TriageSession | null;
+  /**
+   * The search query (S19), edited live in `search` mode and kept after
+   * Enter; "" means no filter.
+   */
+  query: string;
 }
 
-/** What the panes show, in display order; only the ids matter here. */
-export type PaneItems = Record<Quadrant, readonly { id: number }[]>;
+/**
+ * What the panes show, in display order; only the ids matter here. `inbox`
+ * is present only while the Inbox strip is shown (an active search).
+ */
+export type PaneItems = Record<Quadrant, readonly { id: number }[]> & { inbox?: readonly { id: number }[] };
 
 export type Direction = "left" | "right" | "up" | "down";
 
@@ -67,8 +78,14 @@ export type Action =
   | { type: "triage" }
   | { type: "skip" }
   | { type: "exitTriage" }
-  // Hook for T11 (search).
+  /** Opens the search input, prefilled with the current query (S19). */
   | { type: "search" }
+  | { type: "searchInput"; text: string }
+  | { type: "searchBackspace" }
+  /** Enter: keep the filter, back to normal navigation. */
+  | { type: "submitSearch" }
+  /** Esc: drop the filter and restore the full view. */
+  | { type: "clearSearch" }
   | { type: "noop" };
 
 export function initialState(): ViewState {
@@ -81,7 +98,13 @@ export function initialState(): ViewState {
     status: null,
     quit: false,
     triage: null,
+    query: "",
   };
+}
+
+/** True while the search input is open or a non-blank query filters the panes. */
+export function searchActive(state: ViewState): boolean {
+  return state.mode === "search" || state.query.trim() !== "";
 }
 
 const NOOP: Action = { type: "noop" };
@@ -126,9 +149,20 @@ export function keyToAction(state: ViewState, key: Key): Action {
       return NOOP;
     case "triage":
       return triageKey(key);
+    case "search":
+      return searchKey(key);
     case "normal":
-      return normalKey(key);
+      return normalKey(key, searchActive(state));
   }
+}
+
+/** Every printable key types into the query: no global key fires (S19). */
+function searchKey(key: Key): Action {
+  if (key.name === "escape") return { type: "clearSearch" };
+  if (key.name === "return" || key.name === "enter") return { type: "submitSearch" };
+  if (key.name === "backspace") return { type: "searchBackspace" };
+  const text = printable(key);
+  return text === null ? NOOP : { type: "searchInput", text };
 }
 
 function triageKey(key: Key): Action {
@@ -166,11 +200,11 @@ function addKey(key: Key): Action {
   return text === null ? NOOP : { type: "inputChar", text };
 }
 
-function normalKey(key: Key): Action {
+function normalKey(key: Key, searching: boolean): Action {
   if (key.ctrl || key.meta) return NOOP;
   if (isShifted(key, "j")) return { type: "reorder", dir: 1 };
   if (isShifted(key, "k")) return { type: "reorder", dir: -1 };
-  if (key.name === "escape") return { type: "cancel" };
+  if (key.name === "escape") return searching ? { type: "clearSearch" } : { type: "cancel" };
   // Symbols arrive with name = the character.
   switch (key.name) {
     case "?":
@@ -250,7 +284,19 @@ export function reduce(
     case "exitTriage":
       return s.triage ? endTriage(s, s.triage) : s;
     case "search":
-      return { ...s, status: "Search: coming soon" };
+      return { ...s, mode: "search" };
+    case "searchInput":
+      return { ...s, query: s.query + action.text, selected: { 1: 0, 2: 0, 3: 0, 4: 0, inbox: 0 } };
+    case "searchBackspace":
+      return {
+        ...s,
+        query: Array.from(s.query).slice(0, -1).join(""),
+        selected: { 1: 0, 2: 0, 3: 0, 4: 0, inbox: 0 },
+      };
+    case "submitSearch":
+      return s.query.trim() === "" ? endSearch(s) : { ...s, mode: "normal" };
+    case "clearSearch":
+      return endSearch(s);
     case "noop":
       return { ...s, status: state.status };
     case "moveTo":
@@ -262,14 +308,34 @@ export function reduce(
   }
 }
 
-const RIGHT_OF: Partial<Record<Quadrant, Quadrant>> = { 1: 2, 3: 4 };
-const LEFT_OF: Partial<Record<Quadrant, Quadrant>> = { 2: 1, 4: 3 };
-const BELOW: Partial<Record<Quadrant, Quadrant>> = { 1: 3, 2: 4 };
-const ABOVE: Partial<Record<Quadrant, Quadrant>> = { 3: 1, 4: 2 };
+/** Back to the unfiltered matrix; the Inbox strip goes away, so does its focus. */
+function endSearch(s: ViewState): ViewState {
+  return { ...s, mode: "normal", query: "", focus: s.focus === "inbox" ? 1 : s.focus };
+}
+
+const RIGHT_OF: Partial<Record<Focus, Quadrant>> = { 1: 2, 3: 4 };
+const LEFT_OF: Partial<Record<Focus, Quadrant>> = { 2: 1, 4: 3 };
+const ABOVE: Partial<Record<Focus, Quadrant>> = { 3: 1, 4: 2, inbox: 3 };
+
+/** The pane below `focus`: the Inbox strip sits under Q3 and Q4 while it is shown. */
+function below(focus: Focus, panes: PaneItems): Focus | undefined {
+  if (focus === 1) return 3;
+  if (focus === 2) return 4;
+  if ((focus === 3 || focus === 4) && panes.inbox) return "inbox";
+  return undefined;
+}
+
+function paneList(panes: PaneItems, focus: Focus): readonly { id: number }[] {
+  return panes[focus] ?? [];
+}
+
+function selectedIn(state: ViewState, focus: Focus): number {
+  return state.selected[focus] ?? 0;
+}
 
 function navigate(s: ViewState, dir: Direction, panes: PaneItems): ViewState {
-  const count = panes[s.focus].length;
-  const index = s.selected[s.focus];
+  const count = paneList(panes, s.focus).length;
+  const index = selectedIn(s, s.focus);
   switch (dir) {
     case "left":
     case "right": {
@@ -278,7 +344,7 @@ function navigate(s: ViewState, dir: Direction, panes: PaneItems): ViewState {
     }
     case "down": {
       if (index < count - 1) return { ...s, selected: { ...s.selected, [s.focus]: index + 1 } };
-      const target = BELOW[s.focus];
+      const target = below(s.focus, panes);
       return target ? { ...s, focus: target, selected: { ...s.selected, [target]: 0 } } : s;
     }
     case "up": {
@@ -296,18 +362,33 @@ export function clamp(state: ViewState, panes: PaneItems): ViewState {
   for (const q of [1, 2, 3, 4] as const) {
     selected[q] = Math.max(0, Math.min(selected[q], panes[q].length - 1));
   }
-  return { ...state, selected };
+  if (panes.inbox) selected.inbox = Math.max(0, Math.min(selected.inbox ?? 0, panes.inbox.length - 1));
+  // The strip is gone (no search): its focus moves back to the grid.
+  const focus = state.focus === "inbox" && !panes.inbox ? 1 : state.focus;
+  return { ...state, focus, selected };
 }
 
 /** Selects task `id` in the focused pane if it is there, otherwise clamps. */
 export function follow(state: ViewState, panes: PaneItems, id: number): ViewState {
-  const index = panes[state.focus].findIndex((item) => item.id === id);
+  const index = paneList(panes, state.focus).findIndex((item) => item.id === id);
   const next = index < 0 ? state : { ...state, selected: { ...state.selected, [state.focus]: index } };
   return clamp(next, panes);
 }
 
 export function selectedId(state: ViewState, panes: PaneItems): number | null {
-  return panes[state.focus][state.selected[state.focus]]?.id ?? null;
+  return paneList(panes, state.focus)[selectedIn(state, state.focus)]?.id ?? null;
+}
+
+const SEARCH_ORDER: readonly Focus[] = [1, 2, 3, 4, "inbox"];
+
+/**
+ * While searching, an empty focused pane hands the focus to the first pane
+ * with matches (Q1..Q4, then the Inbox strip), so the keys act on a match.
+ */
+export function focusMatches(state: ViewState, panes: PaneItems): ViewState {
+  if (paneList(panes, state.focus).length > 0) return state;
+  const target = SEARCH_ORDER.find((f) => paneList(panes, f).length > 0);
+  return target === undefined ? state : clamp({ ...state, focus: target }, panes);
 }
 
 /** The task the next action applies to: the triage card's, else the selected one. */
