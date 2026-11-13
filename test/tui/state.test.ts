@@ -237,8 +237,7 @@ describe("reduce: modes", () => {
     expect(s.showDone).toBe(false);
   });
 
-  test("e, i and / are hooks that say coming soon for now", () => {
-    expect(press(state(), key("e"), p).status).toMatch(/coming soon/);
+  test("i and / are hooks that say coming soon for now", () => {
     expect(press(state(), key("i"), p).status).toMatch(/coming soon/);
     expect(press(state(), key("/"), p).status).toMatch(/coming soon/);
   });
@@ -253,11 +252,13 @@ describe("reduce: modes", () => {
       { type: "moveTo", quadrant: 3 },
       { type: "toggleDone" },
       { type: "reorder", dir: 1 },
+      { type: "edit" },
     ] as const) {
       const next = reduce(s, action, p);
       expect(next.focus).toBe(1);
       expect(next.selected[1]).toBe(1);
       expect(next.mode).toBe("normal");
+      expect(next.status).toBeNull();
     }
   });
 });

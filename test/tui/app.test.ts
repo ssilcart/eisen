@@ -1,19 +1,25 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import type { Database } from "bun:sqlite";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
+import { tmpdir } from "node:os";
 import { createTestRenderer, type TestRendererSetup } from "@opentui/core/testing";
 import { bucketOf } from "../../src/domain/task.ts";
 import { openDb } from "../../src/store/db.ts";
 import { TaskRepository } from "../../src/store/repository.ts";
-import { createMatrixApp, startTui, type MatrixApp } from "../../src/tui/app.ts";
+import { createMatrixApp, spawnEditor, startTui, type AppOptions, type MatrixApp } from "../../src/tui/app.ts";
 
 const TODAY = "2026-11-12";
 
 let setup: TestRendererSetup;
+let db: Database;
 let repo: TaskRepository;
 let app: MatrixApp;
 
-async function start(width = 100, height = 30) {
-  setup = await createTestRenderer({ width, height });
-  app = createMatrixApp(setup.renderer, repo, { today: () => TODAY });
+async function start(width = 100, height = 30, options: AppOptions = {}) {
+  // exitOnCtrlC: false like startTui's renderer, so Ctrl+C reaches the app.
+  setup = await createTestRenderer({ width, height, exitOnCtrlC: false });
+  app = createMatrixApp(setup.renderer, repo, { today: () => TODAY, ...options });
   return frame();
 }
 
@@ -76,7 +82,8 @@ function where(f: string, text: string): { row: number; col: number } {
 }
 
 beforeEach(() => {
-  repo = new TaskRepository(openDb(":memory:"));
+  db = openDb(":memory:");
+  repo = new TaskRepository(db);
   repo.create({ title: "Pay rent", quadrant: 1 });
   repo.create({ title: "Call the bank", quadrant: 1 });
   repo.create({ title: "Plan the trip", quadrant: 2 });
@@ -259,12 +266,6 @@ describe("keys (S10)", () => {
     expect(f).not.toContain("Toggle done");
   });
 
-  test("e shows coming soon in the status line", async () => {
-    await start();
-    const f = await keys("e");
-    expect(f).toContain("coming soon");
-  });
-
   test("q resolves the app's done promise", async () => {
     await start();
     setup.mockInput.pressKey("q");
@@ -353,5 +354,173 @@ describe("repository failures", () => {
     expect(await settles(run, 2000)).toBe("done");
     await expect(run).rejects.toThrow("database is locked");
     expect(setup.renderer.isDestroyed).toBe(true);
+  });
+});
+
+describe("edit in $EDITOR (S11)", () => {
+  // The test renderer has no real terminal, so its suspend()/resume() throw:
+  // replace them with recorders. Returns the call log.
+  function stubTerminal(): string[] {
+    const calls: string[] = [];
+    setup.renderer.suspend = async () => void calls.push("suspend");
+    setup.renderer.resume = async () => void calls.push("resume");
+    return calls;
+  }
+
+  function editedEvents(taskId: number): number {
+    const row = db.query("SELECT COUNT(*) AS n FROM events WHERE type = 'edited' AND task_id = $id").get({ id: taskId }) as {
+      n: number;
+    };
+    return row.n;
+  }
+
+  // Starts the app with a fake editor and stubbed suspend/resume.
+  async function startEditing(runEditor: (path: string) => Promise<number>) {
+    await start(100, 30, { runEditor });
+    return stubTerminal();
+  }
+
+  async function edit(): Promise<string> {
+    setup.mockInput.pressKey("e");
+    await app.idle();
+    return frame();
+  }
+
+  test("e writes the task to a temp file, the editor's changes are saved as one edited event", async () => {
+    const payRent = byTitle("Pay rent")!;
+    repo.update(payRent.id, { description: "Before the 5th", tags: ["todo"] }); // todo: a section tag
+    const editsBefore = editedEvents(payRent.id);
+    let seen = "";
+    let editedPath = "";
+    const calls = await startEditing(async (path) => {
+      editedPath = path;
+      seen = await Bun.file(path).text();
+      calls.push("editor");
+      await Bun.write(path, "# Pay the rent #home\ndue: 2026-11-30\n\nCall the landlord first #money\n");
+      return 0;
+    });
+    const f = await edit();
+    expect(seen).toBe("# Pay rent\n\nBefore the 5th\n");
+    expect(dirname(editedPath)).toBe(tmpdir().replace(/\/$/, ""));
+    expect(basename(editedPath)).toMatch(new RegExp(`^eisen-${payRent.id}-.+\\.md$`));
+    expect(existsSync(editedPath)).toBe(false);
+    expect(calls).toEqual(["suspend", "editor", "resume"]);
+    const task = repo.get(payRent.id)!;
+    expect(task.title).toBe("Pay the rent #home");
+    expect(task.dueDate).toBe("2026-11-30");
+    expect(task.description).toBe("Call the landlord first #money");
+    expect(task.tags).toEqual(["todo", "home", "money"]);
+    expect(editedEvents(payRent.id)).toBe(editsBefore + 1);
+    expect(f).toContain("Saved");
+    expect(f).toContain("Pay the rent #home");
+    expect(app.state.selected[1]).toBe(0);
+  });
+
+  test("an editor that changes nothing says No changes and writes no event", async () => {
+    const id = byTitle("Pay rent")!.id;
+    await startEditing(async () => 0);
+    const f = await edit();
+    expect(f).toContain("No changes");
+    expect(editedEvents(id)).toBe(0);
+    expect(repo.get(id)!.title).toBe("Pay rent");
+  });
+
+  test("a non-zero exit discards the edit", async () => {
+    const id = byTitle("Pay rent")!.id;
+    const calls = await startEditing(async (path) => {
+      await Bun.write(path, "# Changed\n\n");
+      return 3;
+    });
+    const f = await edit();
+    expect(f).toContain("Editor exited with code 3");
+    expect(repo.get(id)!.title).toBe("Pay rent");
+    expect(editedEvents(id)).toBe(0);
+    expect(calls).toEqual(["suspend", "resume"]);
+  });
+
+  test("an invalid file shows the parse error and changes nothing", async () => {
+    const id = byTitle("Pay rent")!.id;
+    await startEditing(async (path) => {
+      await Bun.write(path, "# Pay rent\ndue: someday\n\n");
+      return 0;
+    });
+    const f = await edit();
+    expect(f).toContain('Invalid due date "someday"');
+    expect(f).toContain("edit discarded");
+    expect(repo.get(id)!.dueDate).toBeNull();
+    expect(editedEvents(id)).toBe(0);
+  });
+
+  test("resume is called and the temp file removed even when the editor throws", async () => {
+    let editedPath = "";
+    const calls = await startEditing(async (path) => {
+      editedPath = path;
+      throw new Error("spawn vi ENOENT");
+    });
+    const f = await edit();
+    expect(calls).toEqual(["suspend", "resume"]);
+    expect(f).toContain("Error: spawn vi ENOENT");
+    expect(existsSync(editedPath)).toBe(false);
+    expect(byTitle("Pay rent")!.title).toBe("Pay rent");
+    // The app keeps working.
+    await keys("x");
+    expect(byTitle("Pay rent")!.status).toBe("done");
+  });
+
+  test("keys pressed while the editor runs are ignored", async () => {
+    let release!: () => void;
+    const editorDone = new Promise<void>((resolve) => (release = resolve));
+    let runs = 0;
+    await startEditing(async () => {
+      runs++;
+      await editorDone;
+      return 0;
+    });
+    setup.mockInput.pressKey("e");
+    await Bun.sleep(10);
+    for (const name of ["x", "j", "e", "d", "y", "q"]) setup.mockInput.pressKey(name);
+    setup.mockInput.pressKey("c", { ctrl: true });
+    expect(await settles(app.done, 50)).toBe("stuck");
+    release();
+    await app.idle();
+    expect(runs).toBe(1);
+    expect(byTitle("Pay rent")!.status).toBe("open");
+    expect(app.state.selected[1]).toBe(0);
+    expect(repo.list({ status: "all" })).toHaveLength(8);
+    // Keys work again once the edit is over.
+    await keys("x");
+    expect(byTitle("Pay rent")!.status).toBe("done");
+  });
+
+  test("e with nothing selected says so and does not open the editor", async () => {
+    repo.delete(byTitle("Watch TV")!.id);
+    let runs = 0;
+    const calls = await startEditing(async () => {
+      runs++;
+      return 0;
+    });
+    await keys("l", "j"); // Q2 has one task: j crosses to the empty Q4
+    expect(app.state.focus).toBe(4);
+    const f = await edit();
+    expect(f).toContain("Nothing selected");
+    expect(runs).toBe(0);
+    expect(calls).toEqual([]);
+  });
+});
+
+describe("spawnEditor", () => {
+  test("runs $VISUAL/$EDITOR split on whitespace with the file as last argument, and returns its exit code", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "eisen-editor-"));
+    try {
+      const script = join(dir, "fake-editor.sh");
+      writeFileSync(script, 'printf "%s|%s\\n" "$1" "$(cat "$2")" > "$2"\nexit 0\n');
+      const file = join(dir, "task.md");
+      writeFileSync(file, "# Old");
+      expect(await spawnEditor(file, { VISUAL: `sh ${script} --flag`, EDITOR: "nope" })).toBe(0);
+      expect(readFileSync(file, "utf8")).toBe("--flag|# Old\n");
+      expect(await spawnEditor(file, { EDITOR: "false" })).toBe(1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

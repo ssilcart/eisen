@@ -55,6 +55,13 @@ Data lives in `$XDG_DATA_HOME/eisen/eisen.db` (default
 | `?`            | Help                                               |
 | `q`            | Quit                                               |
 
+`e` opens `$VISUAL`, else `$EDITOR`, else `vi` (arguments work, e.g.
+`EDITOR="code --wait"`) on a Markdown file: `# Title` on the first line,
+an optional `due: YYYY-MM-DD` line (leave it empty or remove it to clear the
+date), a blank line, then the description. `#tags` in the title or
+description become tags. Save and quit to apply; a non-zero exit (`:cq` in
+Vim) discards the edit.
+
 ## Development
 
 ```sh

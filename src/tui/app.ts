@@ -1,6 +1,10 @@
 // The matrix TUI (S9, S10): OpenTUI view + controller. View state and key
 // mapping live in state.ts; every change to tasks goes through TaskRepository,
-// and the panes are reloaded from it after each effect.
+// and the panes are reloaded from it after each effect. `e` hands the terminal
+// to $EDITOR (S11); the edit file format lives in edit-file.ts.
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   BoxRenderable,
   StyledText,
@@ -18,6 +22,7 @@ import { displayBucket, isEscalated, localToday, DEFAULT_URGENT_WITHIN_DAYS } fr
 import { parseTags } from "../domain/tags.ts";
 import { QUADRANTS, QUADRANT_LABELS, bucketOf, type Quadrant, type Task } from "../domain/task.ts";
 import type { TaskRepository } from "../store/repository.ts";
+import { editChanges, editorCommand, parseTaskFile, serializeTask } from "./edit-file.ts";
 import { fit, gridSizes, windowStart } from "./layout.ts";
 import {
   clamp,
@@ -35,12 +40,19 @@ export interface AppOptions {
   /** Today as YYYY-MM-DD, for due-date escalation (S7). Default: local date. */
   today?: () => string;
   urgentWithinDays?: number;
+  /**
+   * Runs the editor on `path` with the terminal and resolves with its exit
+   * code. Default: `spawnEditor` ($VISUAL, $EDITOR or vi).
+   */
+  runEditor?: (path: string) => Promise<number>;
 }
 
 export interface MatrixApp {
   /** Resolves when the user quits. */
   readonly done: Promise<void>;
   readonly state: ViewState;
+  /** Resolves once no editor session (S11) is running. */
+  idle(): Promise<void>;
   /** Reload tasks from the repository and redraw. */
   refresh(): void;
   /** Detach listeners and remove the view from the renderer. */
@@ -62,7 +74,7 @@ const COLOR = {
   panel: "#16161e",
 };
 
-const HINTS = "h/j/k/l move · 1-4 send · a add · x done · d delete · J/K order · . done · ? help · q quit";
+const HINTS = "h/j/k/l move · 1-4 send · a add · e edit · x done · d delete · J/K order · . done · ? help · q quit";
 
 const HELP: [string, string][] = [
   ["h j k l / arrows", "Move between quadrants and tasks"],
@@ -72,7 +84,7 @@ const HELP: [string, string][] = [
   ["d", "Delete (y/n)"],
   ["J / K", "Reorder inside the quadrant"],
   [".", "Show / hide done tasks"],
-  ["e", "Edit in $EDITOR (coming soon)"],
+  ["e", "Edit in $EDITOR"],
   ["i", "Triage the Inbox (coming soon)"],
   ["/", "Search (coming soon)"],
   ["?", "Help"],
@@ -96,6 +108,10 @@ interface Pane {
 export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, options: AppOptions = {}): MatrixApp {
   const today = options.today ?? (() => localToday());
   const within = options.urgentWithinDays ?? DEFAULT_URGENT_WITHIN_DAYS;
+  const runEditor = options.runEditor ?? ((path: string) => spawnEditor(path));
+  /** The running editor session; keys are ignored while it is set. */
+  let editing: Promise<void> | null = null;
+  let destroyed = false;
 
   let state = initialState();
   let tasks: Record<Quadrant, Task[]> = { 1: [], 2: [], 3: [], 4: [] };
@@ -305,6 +321,12 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     let next = reduce(before, action, items());
     let followId: number | null = null;
     let message: string | null = null;
+    if (action.type === "edit" && id !== null) {
+      // The editor owns the terminal from here; editTask redraws when it is back.
+      state = next;
+      editing = editTask(id).finally(() => (editing = null));
+      return;
+    }
     try {
       switch (action.type) {
         case "moveTo": {
@@ -335,6 +357,9 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
           message = `Deleted: ${task?.title ?? id}`;
           break;
         }
+        case "edit":
+          message = "Nothing selected";
+          break;
         case "reorder":
           if (id !== null) {
             repo.reorder(id, action.dir);
@@ -356,7 +381,7 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
           break;
       }
     } catch (error) {
-      message = `Error: ${error instanceof Error ? error.message : String(error)}`;
+      message = errorMessage(error);
     }
     if (message !== null) next = { ...next, status: message };
     state = next; // load() reads showDone from the new state
@@ -370,14 +395,75 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
       load();
     } catch (error) {
       // Keep the last loaded tasks on screen and say why they may be stale.
-      next = { ...next, status: `Error: ${error instanceof Error ? error.message : String(error)}` };
+      next = { ...next, status: errorMessage(error) };
     }
     state = followId === null ? clamp(next, items()) : follow(next, items(), followId);
     draw();
   }
 
+  /**
+   * S11: write the task to a temp file, hand the terminal to the editor, read
+   * the file back and save it if it changed. Never rejects: every outcome ends
+   * in the status line. Since OpenTUI 0.6 suspend()/resume() throw while
+   * another transition is pending, so keys are ignored until this settles.
+   */
+  async function editTask(id: number): Promise<void> {
+    let message: string;
+    let path: string | null = null;
+    try {
+      const task = repo.get(id);
+      if (!task) throw new Error(`Task ${id} not found`);
+      path = join(tmpdir(), `eisen-${id}-${crypto.randomUUID().slice(0, 8)}.md`);
+      writeFileSync(path, serializeTask(task), { flag: "wx", mode: 0o600 });
+      await renderer.suspend();
+      let code: number;
+      try {
+        code = await runEditor(path);
+      } finally {
+        await renderer.resume();
+      }
+      message = code === 0 ? saveEdit(task, readFileSync(path, "utf8")) : `Editor exited with code ${code}`;
+    } catch (error) {
+      message = errorMessage(error);
+    } finally {
+      if (path !== null) {
+        try {
+          rmSync(path, { force: true });
+        } catch {
+          // A leftover temp file is not worth an error over the edit's result.
+        }
+      }
+    }
+    if (destroyed) return;
+    let next: ViewState = { ...state, status: message };
+    try {
+      load();
+    } catch (error) {
+      next = { ...next, status: errorMessage(error) };
+    }
+    state = follow(next, items(), id);
+    try {
+      draw();
+    } catch {
+      // Same as a key handler's draw failing: the next key redraws.
+    }
+  }
+
+  function saveEdit(task: Task, text: string): string {
+    const parsed = parseTaskFile(text);
+    if (!parsed.ok) return `${parsed.error} (edit discarded)`;
+    const changes = editChanges(task, parsed.value);
+    if (changes === null) return "No changes";
+    repo.update(task.id, changes);
+    return "Saved";
+  }
+
   function onKey(key: KeyEvent): void {
     if (key.eventType === "release") return;
+    if (editing !== null) {
+      key.preventDefault();
+      return;
+    }
     const action = keyToAction(state, key);
     if (action.type === "noop") return;
     key.preventDefault();
@@ -400,12 +486,16 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     get state() {
       return state;
     },
+    idle() {
+      return editing ?? Promise.resolve();
+    },
     refresh() {
       load();
       state = clamp(state, items());
       draw();
     },
     destroy() {
+      destroyed = true;
       renderer.keyInput.off("keypress", onKey);
       renderer.off("resize", onResize);
       resolveDone();
@@ -445,6 +535,19 @@ function tail(text: string, width: number): string {
     used += w;
   }
   return `…${out}`;
+}
+
+function errorMessage(error: unknown): string {
+  return `Error: ${error instanceof Error ? error.message : String(error)}`;
+}
+
+/**
+ * Runs `$VISUAL`, else `$EDITOR`, else `vi` on `path` with the terminal's
+ * stdio, and resolves with its exit code.
+ */
+export async function spawnEditor(path: string, env: Record<string, string | undefined> = process.env): Promise<number> {
+  const proc = Bun.spawn([...editorCommand(env), path], { stdin: "inherit", stdout: "inherit", stderr: "inherit" });
+  return await proc.exited;
 }
 
 /** Opens the matrix in the terminal and returns once the user quits (S9). */

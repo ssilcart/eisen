@@ -46,8 +46,9 @@ export type Action =
   | { type: "help" }
   | { type: "cancel" }
   | { type: "quit" }
-  // Hooks for later tasks: T7 (editor), T8 (triage), T11 (search).
+  /** Opens the selected task in $EDITOR (S11); the controller runs it. */
   | { type: "edit" }
+  // Hooks for later tasks: T8 (triage), T11 (search).
   | { type: "triage" }
   | { type: "search" }
   | { type: "noop" };
@@ -156,8 +157,7 @@ function normalKey(key: Key): Action {
   return NOOP;
 }
 
-const COMING_SOON: Record<"edit" | "triage" | "search", string> = {
-  edit: "Edit in $EDITOR: coming soon",
+const COMING_SOON: Record<"triage" | "search", string> = {
   triage: "Triage: coming soon",
   search: "Search: coming soon",
 };
@@ -188,7 +188,6 @@ export function reduce(state: ViewState, action: Action, panes: PaneItems): View
       return { ...s, mode: "help" };
     case "quit":
       return { ...s, quit: true };
-    case "edit":
     case "triage":
     case "search":
       return { ...s, status: COMING_SOON[action.type] };
@@ -197,6 +196,7 @@ export function reduce(state: ViewState, action: Action, panes: PaneItems): View
     case "moveTo":
     case "toggleDone":
     case "reorder":
+    case "edit":
       return s;
   }
 }
