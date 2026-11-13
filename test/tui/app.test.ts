@@ -1605,7 +1605,8 @@ describe("presets and settings (S20, S21)", () => {
     for (const label of ["1 🔴 Urgent & Important", "2 🟠 Not Urgent & Important", "3 ⚡ Needs attention", "4 🧊 Someday"]) {
       expect(f).toContain(label);
     }
-    expect(f).toContain("j/k choose · Enter save · Esc cancel");
+    // S33: the hints moved to the status line, with the v2 keys.
+    expect(statusOf(f)).toContain("Tab section · j/k move · Enter change · Esc close");
   });
 
   test(", → focus → Enter saves to the config file and changes the titles at once", async () => {
@@ -1613,9 +1614,12 @@ describe("presets and settings (S20, S21)", () => {
     await keys(",", "j", "j");
     expect(await frame()).toContain("› Focus");
     setup.mockInput.pressEnter();
-    const f = await frame();
-    expect(app.state.mode).toBe("normal");
+    await frame();
+    // S33: Enter saves at once and the settings stay open; Esc closes them.
+    expect(app.state.mode).toBe("settings");
     expect(app.state.preset).toBe("focus");
+    const f = await escape();
+    expect(app.state.mode).toBe("normal");
     for (const title of ["🔥 Urgent (3)", "⭐ Important (1)", "⚡ Needs attention (1)", "🧊 Someday (1)"]) expect(f).toContain(title);
     expect(f).not.toContain("✅ Do");
     expect(f).not.toContain("Settings");
@@ -1665,7 +1669,7 @@ describe("presets and settings (S20, S21)", () => {
     expect(existsSync(configEnv.EISEN_CONFIG!)).toBe(false);
   });
 
-  test("a failed save shows the error and keeps the previous preset", async () => {
+  test("a failed save shows the error and keeps the session value (S33)", async () => {
     await start(100, 30, {
       savePreset: () => {
         throw new Error("EACCES: permission denied");
@@ -1674,9 +1678,9 @@ describe("presets and settings (S20, S21)", () => {
     await keys(",", "j", "j");
     setup.mockInput.pressEnter();
     const f = await frame();
-    expect(app.state.preset).toBe("classic");
-    expect(f).toContain("Error: EACCES: permission denied");
-    expect(f).toContain("Q1 · ✅ Do (3)");
+    expect(app.state.preset).toBe("focus");
+    expect(statusOf(f)).toContain("Error: EACCES: permission denied");
+    expect(f).toContain("Q1 · 🔥 Urgent (3)");
   });
 
   test("the help lists , and the active preset's quadrants", async () => {
@@ -1739,9 +1743,423 @@ describe("presets and settings (S20, S21)", () => {
     await keys(",", "j");
     setup.mockInput.pressEnter();
     expect(await frame()).toContain("Q1 · 🔴 Urgent & Important (3)");
+    // S33: the settings stay open after Enter; Esc closes them before q.
+    await escape();
     setup.mockInput.pressKey("q");
     await run;
     expect(JSON.parse(readFileSync(configEnv.EISEN_CONFIG!, "utf8"))).toEqual({ preset: "priority" });
+  });
+});
+
+describe("settings v2 (S33)", () => {
+  let dir: string;
+  let configEnv: Record<string, string>;
+  /** Every patch the injected savers received, in order, tagged by saver. */
+  let patches: [string, unknown][];
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "eisen-app-settings-"));
+    configEnv = { EISEN_CONFIG: join(dir, "config.json") };
+    patches = [];
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const savers: AppOptions = {
+    savePreset: (preset) => void patches.push(["preset", preset]),
+    saveView: (patch) => void patches.push(["view", patch]),
+    saveEditor: (patch) => void patches.push(["editor", patch]),
+    saveKeys: (patch) => void patches.push(["keys", patch]),
+  };
+
+  /** No `undefined` anywhere in a patch (L29b). */
+  function noUndefined(value: unknown): boolean {
+    if (value === undefined) return false;
+    if (value === null || typeof value !== "object") return true;
+    return Object.values(value).every(noUndefined);
+  }
+
+  async function escape(): Promise<string> {
+    setup.mockInput.pressEscape();
+    await Bun.sleep(30);
+    return frame();
+  }
+
+  async function tab(shift = false): Promise<string> {
+    setup.mockInput.pressTab(shift ? { shift: true } : undefined);
+    return frame();
+  }
+
+  async function enter(): Promise<string> {
+    setup.mockInput.pressEnter();
+    return frame();
+  }
+
+  async function down(n: number): Promise<string> {
+    for (let i = 0; i < n; i++) setup.mockInput.pressKey("j");
+    return frame();
+  }
+
+  // Index of each action in the Keys section (ACTIONS order).
+  const EDIT = 10;
+  const TOGGLE_DONE = 11;
+  const QUIT = 25;
+
+  /** The frame's row holding `text`. */
+  function rowOf(f: string, text: string): string {
+    return f.split("\n").find((line) => line.includes(text)) ?? "";
+  }
+
+  test(", shows the three sections as tabs; Tab and Shift+Tab switch them", async () => {
+    await start(100, 30, savers);
+    let f = await keys(",");
+    expect(f).toContain("Settings");
+    expect(f).toMatch(/General.*Editor.*Keys/);
+    expect(f).toContain("Preview");
+    expect(f).toContain("Done panel");
+    expect(f).toContain("Bullets");
+    f = await tab();
+    expect(app.state.settingsSection).toBe("editor");
+    expect(f).toContain("(*) auto");
+    expect(f).toContain("(*) floating");
+    f = await tab();
+    expect(app.state.settingsSection).toBe("keys");
+    expect(rowOf(f, "Move left")).toMatch(/› Move left +h \/ left/);
+    expect(statusOf(f)).toContain("Enter set · a add");
+    f = await tab(true);
+    expect(app.state.settingsSection).toBe("editor");
+    expect(patches).toEqual([]);
+  });
+
+  test("General: changing the preset saves it and the titles change at once", async () => {
+    await start(100, 30, savers);
+    await keys(",", "j");
+    const f = await enter();
+    expect(app.state.preset).toBe("priority");
+    expect(f).toContain("› Priority · current");
+    expect(f).toContain("Q1 · 🔴 Urgent & Important (3)");
+    expect(statusOf(f)).toContain("Preset: Priority");
+    expect(patches).toEqual([["preset", "priority"]]);
+  });
+
+  test("General: turning the preview off saves { preview: false } and hides the panel at once", async () => {
+    await start(140, 40, { ...savers, view: { preview: true } });
+    expect(await frame()).toContain("Preview");
+    await keys(",");
+    await down(3);
+    let f = await enter();
+    expect(app.state.preview).toBe(false);
+    expect(rowOf(f, "› Preview")).toMatch(/› Preview +off/);
+    expect(statusOf(f)).toContain("Preview off");
+    // Space changes the value too.
+    f = await keys("j", " ");
+    expect(app.state.donePanel).toBe(true);
+    f = await escape();
+    expect(f).not.toContain("Preview");
+    expect(f).toContain("Done (");
+    expect(patches).toEqual([
+      ["view", { preview: false }],
+      ["view", { donePanel: true }],
+    ]);
+  });
+
+  test("Editor: picking the form editor saves { mode: form } and the next a opens the form; display rows go away", async () => {
+    await start(100, 30, savers);
+    await keys(",");
+    await tab();
+    let f = await down(2);
+    f = await enter();
+    expect(app.editor.mode).toBe("form");
+    expect(f).toContain("(*) form");
+    expect(f).not.toContain("floating");
+    expect(statusOf(f)).toContain("Editor: form");
+    expect(patches).toEqual([["editor", { mode: "form" }]]);
+    await escape();
+    f = await keys("a");
+    expect(f).toContain("New task · ✅ Do");
+    expect(statusOf(f)).toContain("Ctrl+S save");
+  });
+
+  test("Editor: Custom… opens a one-line input; Enter saves the command and the next a runs it", async () => {
+    const { launch, ptys } = fakeLauncher(writes("# Custom one\n"));
+    await start(100, 30, { ...savers, launchEditorPty: launch, editor: { mode: "command", command: "nvim", display: "floating" } });
+    await keys(",");
+    await tab();
+    let f = await down(7);
+    expect(rowOf(f, "Custom…")).toContain("› ( ) Custom…");
+    f = await enter();
+    expect(statusOf(f)).toContain("Command:");
+    // Every key types: q and j included, none reaches the matrix or the list.
+    for (const ch of "nano -R") setup.mockInput.pressKey(ch);
+    f = await frame();
+    expect(statusOf(f)).toContain("nano -R");
+    f = await enter();
+    expect(app.editor).toEqual({ mode: "command", command: "nano -R", display: "floating" });
+    expect(rowOf(f, "Custom…")).toMatch(/\(\*\) Custom… +nano -R/);
+    expect(patches).toEqual([["editor", { command: "nano -R" }]]);
+    await escape();
+    setup.mockInput.pressKey("a");
+    await app.idle();
+    expect(ptys[0]!.cmd).toEqual(["nano", "-R"]);
+    expect(byTitle("Custom one")).toBeDefined();
+  });
+
+  test("Editor: picking a named command and the full-screen display saves each field alone", async () => {
+    await start(100, 30, { ...savers, editor: { mode: "command", command: "nvim", display: "floating" } });
+    await keys(",");
+    await tab();
+    await down(5);
+    await enter(); // nano
+    await down(4);
+    await enter(); // fullscreen
+    expect(app.editor).toEqual({ mode: "command", command: "nano", display: "fullscreen" });
+    expect(patches).toEqual([
+      ["editor", { command: "nano" }],
+      ["editor", { display: "fullscreen" }],
+    ]);
+  });
+
+  test("Keys: rebinding toggle_done to space applies at once, and r resets it", async () => {
+    await start(140, 30, savers);
+    await keys(",");
+    await tab();
+    await tab();
+    await down(TOGGLE_DONE);
+    let f = await enter();
+    expect(statusOf(f)).toContain("Press a key for Toggle done (Esc cancels)");
+    f = await keys(" ");
+    expect(app.state.settingsInput).toBeNull();
+    expect(rowOf(f, "Toggle done")).toMatch(/› Toggle done +\* space/);
+    expect(statusOf(f)).toContain("Toggle done: space");
+    expect(patches).toEqual([["keys", { toggle_done: ["space"] }]]);
+    f = await escape();
+    expect(statusOf(f)).toContain("space done");
+    await keys("x");
+    expect(byTitle("Pay rent")!.status).toBe("open");
+    await keys(" ");
+    expect(byTitle("Pay rent")!.status).toBe("done");
+    // Back to the same row and reset it.
+    await keys(",");
+    await tab();
+    await tab();
+    await down(TOGGLE_DONE);
+    f = await keys("r");
+    expect(rowOf(f, "Toggle done")).toMatch(/› Toggle done +x\s+│/);
+    expect(rowOf(f, "Toggle done")).not.toContain("*");
+    expect(patches.at(-1)).toEqual(["keys", { toggle_done: null }]);
+    await escape();
+    await keys("x");
+    expect(byTitle("Call the bank")!.status).toBe("done");
+  });
+
+  test("Keys: a key of another action is refused with its name; nothing changes or is saved", async () => {
+    await start(100, 30, savers);
+    await keys(",");
+    await tab();
+    await tab();
+    await down(EDIT);
+    await enter();
+    const f = await keys("x");
+    expect(statusOf(f)).toContain("`x` is already Toggle done");
+    expect(rowOf(f, "› Edit")).toMatch(/› Edit +e\s+│/);
+    expect(patches).toEqual([]);
+    await escape();
+    await keys("x");
+    expect(byTitle("Pay rent")!.status).toBe("done");
+  });
+
+  test("Keys: a adds a key; Backspace removes the last one; Backspace on quit's last key is refused", async () => {
+    await start(100, 30, savers);
+    await keys(",");
+    await tab();
+    await tab();
+    await down(QUIT);
+    let f = await keys("a");
+    expect(statusOf(f)).toContain("Press a key for Quit (Esc cancels)");
+    f = await keys("Q");
+    expect(rowOf(f, "Quit")).toMatch(/Quit +\* q \/ Q/);
+    setup.mockInput.pressBackspace();
+    f = await frame();
+    expect(rowOf(f, "Quit")).toMatch(/Quit +q\s+│/);
+    setup.mockInput.pressBackspace();
+    f = await frame();
+    expect(statusOf(f)).toContain("Quit needs at least one key");
+    expect(rowOf(f, "Quit")).toMatch(/Quit +q\s+│/);
+    expect(patches).toEqual([
+      ["keys", { quit: ["q", "Q"] }],
+      ["keys", { quit: null }],
+    ]);
+    await escape();
+    await keys("q");
+    expect(app.state.quit).toBe(true);
+  });
+
+  test("Keys: R asks y/n, then resets every key", async () => {
+    await start(100, 30, { ...savers, keys: { toggle_done: ["space"], "triage.skip": ["n"] } });
+    await keys(",");
+    await tab();
+    await tab();
+    let f = await keys("R");
+    expect(statusOf(f)).toContain("Reset every key to its default? y/n");
+    f = await keys("n");
+    expect(patches).toEqual([]);
+    await keys("R", "y");
+    expect(patches).toHaveLength(1);
+    const [saver, patch] = patches[0]!;
+    expect(saver).toBe("keys");
+    expect((patch as Record<string, null>).toggle_done).toBeNull();
+    expect((patch as Record<string, null>)["triage.skip"]).toBeNull();
+    f = await escape();
+    await keys("x");
+    expect(byTitle("Pay rent")!.status).toBe("done");
+  });
+
+  test("keys in the settings never reach the matrix, in any section", async () => {
+    await start(100, 30, savers);
+    await keys(",");
+    for (let section = 0; section < 3; section++) {
+      for (const k of ["x", "d", "y", "1", "i", "/", ".", "?", "q", "l", "h", "p", ":"]) setup.mockInput.pressKey(k);
+      await tab();
+    }
+    expect(app.state.mode).toBe("settings");
+    expect(byTitle("Pay rent")!.status).toBe("open");
+    expect(repo.list({ status: "all" })).toHaveLength(8);
+    expect(patches).toEqual([]);
+  });
+
+  test("a save failure shows in the status line and the session keeps the value", async () => {
+    const fail = () => {
+      throw new Error("config.json is not valid JSON (invalid JSON): fix or delete it, then try again");
+    };
+    await start(100, 30, { savePreset: fail, saveView: fail, saveEditor: fail, saveKeys: fail });
+    await keys(",");
+    await down(3);
+    let f = await enter();
+    expect(app.state.preview).toBe(true);
+    expect(statusOf(f)).toContain("Error: config.json is not valid JSON");
+    await tab();
+    await down(2);
+    f = await enter();
+    expect(app.editor.mode).toBe("form");
+    expect(statusOf(f)).toContain("Error:");
+    await tab();
+    await down(TOGGLE_DONE);
+    await enter();
+    f = await keys(" ");
+    expect(statusOf(f)).toContain("Error:");
+    await escape();
+    await keys(" ");
+    expect(byTitle("Pay rent")!.status).toBe("done");
+  });
+
+  test("the injected savers receive each patch, never with undefined fields", async () => {
+    await start(100, 30, savers);
+    await keys(",", "j");
+    await enter(); // preset
+    await down(2);
+    await enter(); // preview
+    await keys("j", " ", "j", " "); // done panel, bullets
+    await tab();
+    await keys("j");
+    await enter(); // command mode
+    await down(3);
+    await enter(); // vim
+    await down(3);
+    await enter(); // Custom…
+    for (const ch of "hx --x") setup.mockInput.pressKey(ch);
+    await enter();
+    await down(1);
+    await enter(); // floating (unchanged)
+    await down(1);
+    await enter(); // fullscreen
+    await tab();
+    await down(TOGGLE_DONE);
+    await enter();
+    await keys(" ");
+    await keys("a", "X");
+    setup.mockInput.pressBackspace();
+    await frame();
+    await keys("r", "R", "y");
+    expect(patches.map(([saver]) => saver)).toEqual([
+      "preset",
+      "view",
+      "view",
+      "view",
+      "editor",
+      "editor",
+      "editor",
+      "editor",
+      "keys",
+      "keys",
+      "keys",
+      "keys",
+      "keys",
+    ]);
+    expect(patches.slice(0, 8).map(([, p]) => p)).toEqual([
+      "priority",
+      { preview: true },
+      { donePanel: true },
+      { bullets: true },
+      { mode: "command" },
+      { command: "vim" },
+      { command: "hx --x" },
+      { display: "fullscreen" },
+    ]);
+    for (const [, patch] of patches) expect(noUndefined(patch)).toBe(true);
+  });
+
+  test("startTui: the config file holds each change and a restart reads it", async () => {
+    const { launch } = fakeLauncher();
+    setup = await createTestRenderer({ width: 140, height: 40, exitOnCtrlC: false });
+    let run = startTui(repo, { today: () => TODAY, launchEditorPty: launch }, { createRenderer: async () => setup.renderer, env: configEnv });
+    await Bun.sleep(20);
+    await keys(",", "j", "j");
+    await enter(); // focus
+    await keys("j");
+    await enter(); // preview off
+    await tab();
+    await down(2);
+    await enter(); // form
+    await tab();
+    await down(TOGGLE_DONE);
+    await enter();
+    await keys(" "); // toggle_done = space
+    await escape();
+    setup.mockInput.pressKey("q");
+    await run;
+    await setup.dispose();
+    expect(JSON.parse(readFileSync(configEnv.EISEN_CONFIG!, "utf8"))).toEqual({
+      preset: "focus",
+      view: { preview: false },
+      editor: { mode: "form" },
+      keys: { toggle_done: ["space"] },
+    });
+
+    setup = await createTestRenderer({ width: 140, height: 40, exitOnCtrlC: false });
+    run = startTui(repo, { today: () => TODAY, launchEditorPty: launch }, { createRenderer: async () => setup.renderer, env: configEnv });
+    await Bun.sleep(20);
+    let f = await frame();
+    expect(f).toContain("Q1 · 🔥 Urgent (3)");
+    expect(f).not.toContain("Preview");
+    await keys("x");
+    expect(byTitle("Pay rent")!.status).toBe("open");
+    await keys(" ");
+    expect(byTitle("Pay rent")!.status).toBe("done");
+    f = await keys("a");
+    expect(statusOf(f)).toContain("Ctrl+S save");
+    await escape();
+    // r in Keys writes the reset (null removes the override).
+    await keys(",");
+    await tab();
+    await tab();
+    await down(TOGGLE_DONE);
+    await keys("r");
+    await escape();
+    setup.mockInput.pressKey("q");
+    await run;
+    expect(JSON.parse(readFileSync(configEnv.EISEN_CONFIG!, "utf8")).keys).toEqual({});
   });
 });
 

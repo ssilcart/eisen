@@ -20,7 +20,10 @@
 // The view toggles are saved through `saveView` (S29). The editor `a`/`e`
 // open follows `editor` (S32): `auto` ($VISUAL/$EDITOR/vi) or `command`
 // (editor.command), floating or full screen per `display`, or `form`, the
-// native form of form-box.ts in the same floating box.
+// native form of form-box.ts in the same floating box. `,` opens the settings
+// (S33, settings.ts): General (preset, panels), Editor and Keys; each change
+// applies at once and is saved through `savePreset` / `saveView` /
+// `saveEditor` / `saveKeys`.
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -86,9 +89,23 @@ import {
   type ViewState,
 } from "./state.ts";
 import { parseCommand, type ViewToggle } from "./commands.ts";
-import { buildKeymap, keysOf, type Keymap } from "./keymap.ts";
+import { DEFAULT_KEYMAP, buildKeymap, keysOf, withKeys, type ActionDef, type Keymap } from "./keymap.ts";
 import { previewInfo, previewLines, type PreviewInfo, type PreviewLineKind } from "./preview.ts";
-import { settingsHeight, settingsLines, settingsWidth, type SettingsLine } from "./settings.ts";
+import {
+  SETTINGS_HINTS,
+  bindKey,
+  keysPatch,
+  removeLastKey,
+  resetAllPatch,
+  resetKey,
+  settingsHeight,
+  settingsLines,
+  settingsRows,
+  settingsWidth,
+  type KeyEdit,
+  type SettingsLine,
+  type SettingsValues,
+} from "./settings.ts";
 import { BUCKET_COLOR, COLOR, DONE_COLOR, paneStyle } from "./theme.ts";
 import { cardLines, triageHints, type CardLineKind } from "./triage-card.ts";
 
@@ -128,8 +145,8 @@ export interface AppOptions {
    */
   keys?: Readonly<Record<string, unknown>>;
   /**
-   * Persists the preset picked in the settings (S21); throwing keeps the
-   * previous preset and shows the error. Default: applied for this session only.
+   * Persists the preset picked in the settings (S21, S33); throwing shows the
+   * error and the session keeps the new preset. Default: applied for this session only.
    */
   savePreset?: (preset: PresetId) => void;
   /**
@@ -145,6 +162,19 @@ export interface AppOptions {
    */
   saveView?: (patch: Partial<ViewSettings>) => void;
   /**
+   * Persists an editor setting changed in the settings (S33): the patch holds
+   * only the field that changed. Throwing shows the error; the session keeps
+   * the new value. Default: applied for this session only.
+   */
+  saveEditor?: (patch: Partial<EditorSettings>) => void;
+  /**
+   * Persists a key change from the settings (S33), by action name (the
+   * config's `keys`): a list replaces that action's keys, `null` removes the
+   * override. Throwing shows the error; the session keeps the new keys.
+   * Default: applied for this session only.
+   */
+  saveKeys?: (patch: Record<string, string[] | null>) => void;
+  /**
    * Which editor `a` and `e` open (S32). Default: auto, floating (S22).
    * EISEN_EDITOR_MODE=fullscreen in `env` still wins over `display`.
    */
@@ -152,6 +182,7 @@ export interface AppOptions {
 }
 
 const SIDEBAR_HIDDEN = `Sidebar hidden: needs ${SIDEBAR_MIN_COLUMNS} columns`;
+const SETTINGS_TITLE = " Settings ";
 
 export interface MatrixApp {
   /** Resolves when the user quits. */
@@ -357,14 +388,16 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
   const today = options.today ?? (() => localToday());
   const within = options.urgentWithinDays ?? DEFAULT_URGENT_WITHIN_DAYS;
   const env = options.env ?? process.env;
-  /** S32: auto / command / form, and floating / full screen; `setEditor` changes it. */
-  let editorSettings: EditorSettings = { ...(options.editor ?? DEFAULT_SETTINGS.editor) };
+  // S32: auto / command / form, and floating / full screen: `state.editor`,
+  // changed by the settings (S33) or `setEditor`.
   const runEditor =
-    options.runEditor ?? ((path: string) => spawnEditorCommand(editorCommandFor(editorSettings, env), path));
+    options.runEditor ?? ((path: string) => spawnEditorCommand(editorCommandFor(state.editor, env), path));
   const launchEditorPty: LaunchEditorPty =
     options.launchEditorPty ?? ((cmd, path, cols, rows) => spawnEditorPty(cmd, path, cols, rows, env));
   const savePreset = options.savePreset ?? (() => {});
   const saveView = options.saveView ?? (() => {});
+  const saveEditor = options.saveEditor ?? (() => {});
+  const saveKeys = options.saveKeys ?? (() => {});
   /** The running editor session; keys are ignored while it is set. */
   let editing: Promise<void> | null = null;
   /** The floating editor while it is open (S22): every key goes to it. */
@@ -373,14 +406,21 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
   let form: FormBox | null = null;
   let destroyed = false;
 
-  let state = initialState(options.preset, {
-    preview: options.view?.preview ?? false,
-    donePanel: options.view?.donePanel ?? false,
-    bullets: options.view?.bullets ?? false,
-  });
-  // S30: the keys of the matrix and triage actions; bad overrides are warned at start.
-  const { keymap, warnings: keyWarnings } = buildKeymap(options.keys);
-  const hints = statusHints(keymap);
+  let state = initialState(
+    options.preset,
+    {
+      preview: options.view?.preview ?? false,
+      donePanel: options.view?.donePanel ?? false,
+      bullets: options.view?.bullets ?? false,
+    },
+    options.editor ?? DEFAULT_SETTINGS.editor,
+  );
+  // S30: the keys of the matrix and triage actions; bad overrides are warned at
+  // start. The settings change them at once (S33).
+  const built = buildKeymap(options.keys);
+  const keyWarnings = built.warnings;
+  let keymap = built.keymap;
+  let hints = statusHints(keymap);
   /** Every task, open and done, as last read from the repository. */
   let all: Task[] = [];
   /** Folded fields of `all` for search (S19), built on the first query after a read. */
@@ -520,7 +560,7 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
   });
   const helpText = new TextRenderable(renderer, { id: "eisen-help-text", content: "", wrapMode: "none" });
   help.add(helpText);
-  // S21: the presets with a preview of their labels, over the grid.
+  // S33: General, Editor and Keys as tabs, over the grid.
   const settings = new BoxRenderable(renderer, {
     id: "eisen-settings",
     position: "absolute",
@@ -529,7 +569,7 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     border: true,
     borderStyle: "rounded",
     borderColor: COLOR.focus,
-    title: " Settings · quadrant names ",
+    title: SETTINGS_TITLE,
     titleColor: COLOR.focus,
     backgroundColor: COLOR.panel,
     paddingLeft: 1,
@@ -761,11 +801,26 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     }
   }
 
-  /** The settings box: its lines plus border (2) and padding (2), never over the status line. */
-  function settingsSize(): { width: number; height: number } {
+  /** What the settings screen shows (S33): the values in use. */
+  function settingsValues(): SettingsValues {
     return {
-      width: Math.min(settingsWidth() + 4, renderer.width),
-      height: Math.min(settingsHeight() + 2, Math.max(0, renderer.height - 1)),
+      preset: state.preset,
+      view: { preview: state.preview, donePanel: state.donePanel, bullets: state.bullets },
+      editor: state.editor,
+      keymap,
+    };
+  }
+
+  /**
+   * The settings box: its lines plus border (2) and padding (2), never over
+   * the status line. As wide as the widest section (the tabs do not move
+   * sideways), as tall as the section shown.
+   */
+  function settingsSize(): { width: number; height: number } {
+    const values = settingsValues();
+    return {
+      width: Math.min(settingsWidth(values) + 4, renderer.width),
+      height: Math.min(settingsHeight(state.settingsSection, values) + 2, Math.max(0, renderer.height - 1)),
     };
   }
 
@@ -774,12 +829,11 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     if (!settings.visible) return;
     const size = settingsSize();
     const inner = { width: Math.max(0, size.width - 4), height: Math.max(0, size.height - 2) };
-    const title = " Settings · quadrant names ";
-    settings.title = Bun.stringWidth(title) + 4 <= size.width ? title : undefined;
+    settings.title = Bun.stringWidth(SETTINGS_TITLE) + 4 <= size.width ? SETTINGS_TITLE : undefined;
     const chunks: TextChunk[] = [];
-    settingsLines(state.preset, state.settingsCursor, inner.width, inner.height).forEach((l, i) => {
+    settingsLines(state.settingsSection, settingsValues(), state.settingsCursor, inner.width, inner.height).forEach((l, i) => {
       if (i > 0) chunks.push(plain("\n"));
-      chunks.push(settingsChunk(l));
+      chunks.push(...settingsChunks(l));
     });
     settingsText.content = new StyledText(chunks);
   }
@@ -1014,7 +1068,7 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     const quadrant = focusLabel(state.preset, addTarget(state));
     switch (state.mode) {
       case "settings":
-        return line(width, [fg(COLOR.focus)(bold(" Settings")), fg(COLOR.muted)("  │ j/k choose · Enter save · Esc cancel")]);
+        return settingsStatus(width);
       case "command": {
         const prefix = " :";
         const cycle = state.command.completion;
@@ -1077,6 +1131,32 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     }
   }
 
+  /**
+   * The status line in the settings (S33): the prompt of a capture, a reset
+   * or the `Custom…` input; else the last message (a save error, a refused
+   * key); else the section's hints.
+   */
+  function settingsStatus(width: number): StyledText {
+    const name = fg(COLOR.focus)(bold(" Settings"));
+    const input = state.settingsInput;
+    if (input?.kind === "capture") {
+      const row = settingsRows("keys", state.editor)[state.settingsCursor];
+      const label = row?.kind === "key" ? row.action.label : "";
+      return line(width, [name, fg(COLOR.due)(`  │ Press a key for ${label} (Esc cancels)`)]);
+    }
+    if (input?.kind === "confirmReset") {
+      return line(width, [name, fg(COLOR.escalated)(bold("  │ Reset every key to its default? y/n"))]);
+    }
+    if (input?.kind === "command") {
+      const prefix = "  │ Command: ";
+      const hint = "  Enter save · Esc cancel";
+      const room = Math.max(1, width - Bun.stringWidth(" Settings") - Bun.stringWidth(prefix) - hint.length - 1);
+      return line(width, [name, fg(COLOR.focus)(prefix), plain(tail(input.text, room)), fg(COLOR.focus)("█"), fg(COLOR.muted)(hint)]);
+    }
+    if (state.status) return line(width, [name, fg(COLOR.due)(`  │ ${state.status}`)]);
+    return line(width, [name, fg(COLOR.muted)(`  │ ${SETTINGS_HINTS[state.settingsSection]}`)]);
+  }
+
   /** Chunks clipped and padded to exactly `width` columns. */
   function line(width: number, chunks: TextChunk[]): StyledText {
     const out: TextChunk[] = [];
@@ -1105,7 +1185,7 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
       // The editor owns the keys from here; the session redraws when it is over.
       state = next;
       const target: EditTarget = action.type === "newTask" ? { kind: "new", focus: addTarget(before) } : { kind: "edit", id: id! };
-      const session = editorSettings.mode === "form" ? formSession(target) : editorSession(target);
+      const session = before.editor.mode === "form" ? formSession(target) : editorSession(target);
       editing = session.finally(() => (editing = null));
       return;
     }
@@ -1189,17 +1269,34 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
           preview = { ...preview, scroll: Math.max(0, Math.min(preview.maxScroll, preview.scroll + action.dir * step)) };
           break;
         }
-        case "saveSettings": {
-          // S21: the reducer applied the choice; keep it only if it is saved.
-          const name = getPreset(next.preset).name;
-          if (next.preset === before.preset) {
-            message = `Preset unchanged: ${name}`;
-            break;
-          }
-          savePreset(next.preset);
-          message = `Preset: ${name}`;
+        case "settingsChange":
+        case "settingsInputSubmit":
+          // S33: the reducer applied the value; save what changed.
+          message = saveSettingChange(before, next);
+          break;
+        case "settingsCapture": {
+          const def = keyRow(before.settingsCursor);
+          const add = before.settingsInput?.kind === "capture" && before.settingsInput.add;
+          if (def) message = applyKeyEdit(def, bindKey(keymap, def, action.key, add));
           break;
         }
+        case "settingsRemoveKey": {
+          const def = keyRow(before.settingsCursor);
+          if (def) message = applyKeyEdit(def, removeLastKey(keymap, def));
+          break;
+        }
+        case "settingsResetKey": {
+          const def = keyRow(before.settingsCursor);
+          if (def) message = applyKeyEdit(def, resetKey(keymap, def));
+          break;
+        }
+        case "settingsResetAll":
+          // The session first: a save that fails keeps the defaults (S33).
+          keymap = DEFAULT_KEYMAP;
+          hints = statusHints(keymap);
+          message = "Every key reset to its default";
+          saveKeys(resetAllPatch());
+          break;
         default:
           break;
       }
@@ -1209,8 +1306,6 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     }
     // A failed effect keeps the triage card where it was.
     if (failed && before.triage) next = { ...next, mode: "triage", triage: before.triage };
-    // A preset that could not be saved is not applied either.
-    if (failed && action.type === "saveSettings") next = { ...next, preset: before.preset };
     // The end-of-triage summary wins over the last move's message, not over an error.
     if (message !== null && (failed || next.status === null)) next = { ...next, status: message };
     state = next; // build() reads the done panel toggle from the new state
@@ -1226,10 +1321,67 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     if (action.type === "clearSearch" || action.type === "submitSearch") followId = id;
     // Typing on the `:` line only redraws the status line: no read per keystroke.
     const commandTyping = state.mode === "command" || action.type === "cancelCommand";
-    next = reload(next, !typing && !commandTyping);
+    // Nothing in the settings touches the tasks: rebuild the panes (a panel
+    // may have been toggled) without a read.
+    const inSettings = before.mode === "settings";
+    next = reload(next, !typing && !commandTyping && !inSettings);
     state = followId === null ? clamp(next, items()) : follow(next, items(), followId);
     if (typing || action.type === "runSearch") state = focusMatches(state, items());
     draw();
+  }
+
+  /** The action of the Keys row at `cursor` (S33). */
+  function keyRow(cursor: number): ActionDef | null {
+    const row = settingsRows("keys", state.editor)[cursor];
+    return row?.kind === "key" ? row.action : null;
+  }
+
+  /**
+   * S33: a key edit from the settings. A refused one only says why; an
+   * accepted one applies at once (bindings, hints, help) and is then saved,
+   * so a failing save leaves the session with the new keys.
+   */
+  function applyKeyEdit(def: ActionDef, edit: KeyEdit): string {
+    if (!edit.ok) return edit.message;
+    keymap = withKeys(keymap, def.scope, def.id, edit.keys);
+    hints = statusHints(keymap);
+    saveKeys(keysPatch(def, edit.keys));
+    return edit.message;
+  }
+
+  /**
+   * S33: saves the one value Enter / Space (or the `Custom…` input) changed
+   * between `before` and `next`, with a patch holding only that field, and
+   * says what it is now. Nothing changed (the current value again, or an
+   * input opened): null. A save that throws leaves the session value.
+   */
+  function saveSettingChange(before: ViewState, next: ViewState): string | null {
+    if (next.preset !== before.preset) {
+      const message = `Preset: ${getPreset(next.preset).name}`;
+      savePreset(next.preset);
+      return message;
+    }
+    for (const field of ["preview", "donePanel", "bullets"] as const) {
+      if (next[field] === before[field]) continue;
+      let message = `${TOGGLE_LABEL[field]} ${next[field] ? "on" : "off"}`;
+      if (field !== "bullets" && next[field] && sidebarFor(next) === null) message += ` · ${SIDEBAR_HIDDEN}`;
+      saveView({ [field]: next[field] } as Partial<ViewSettings>);
+      return message;
+    }
+    const editor = next.editor;
+    if (editor.mode !== before.editor.mode) {
+      saveEditor({ mode: editor.mode });
+      return `Editor: ${editor.mode}`;
+    }
+    if (editor.command !== before.editor.command) {
+      saveEditor({ command: editor.command });
+      return `Editor command: ${editor.command}`;
+    }
+    if (editor.display !== before.editor.display) {
+      saveEditor({ display: editor.display });
+      return `Editor display: ${editor.display}`;
+    }
+    return null;
   }
 
   /**
@@ -1394,7 +1546,7 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     // S32: the environment wins over editor.display (S29).
     const wanted =
       env.EISEN_EDITOR_MODE !== "fullscreen" &&
-      editorSettings.display !== "fullscreen" &&
+      state.editor.display !== "fullscreen" &&
       editorFits(renderer.width, renderer.height);
     const session = wanted ? openFloating(path, title, color) : null;
     if (session) {
@@ -1424,7 +1576,7 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     let box: BoxRenderable | null = null;
     let term: EmbeddedTerminalRenderable;
     let pty: EditorPty;
-    const cmd = editorCommandFor(editorSettings, env);
+    const cmd = editorCommandFor(state.editor, env);
     // Keys and the box's replies to terminal queries go to the editor once it runs.
     let toEditor: ((data: Uint8Array) => void) | null = null;
     try {
@@ -1597,10 +1749,10 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
       draw();
     },
     get editor() {
-      return { ...editorSettings };
+      return { ...state.editor };
     },
     setEditor(editor: EditorSettings) {
-      editorSettings = { ...editor };
+      state = { ...state, editor: { ...editor } };
     },
     destroy() {
       if (destroyed) return;
@@ -1658,17 +1810,35 @@ function previewChunk(kind: PreviewLineKind, text: string, info: PreviewInfo | n
   }
 }
 
-/** Settings lines (S21): the cursor's preset stands out, the others are muted. */
-function settingsChunk(l: SettingsLine): TextChunk {
+/**
+ * Settings lines (S33): the active tab and the cursor's row stand out,
+ * headings are muted and bold, a changed key's row is tinted.
+ */
+function settingsChunks(l: SettingsLine): TextChunk[] {
   switch (l.kind) {
-    case "name":
-      return l.selected ? fg(COLOR.focus)(bold(l.text)) : fg(COLOR.text)(l.text);
+    case "tabs": {
+      // Rebuild the tabs from their labels, keeping the text's gaps, clipped like the text.
+      const out: TextChunk[] = [];
+      let rest = l.text;
+      for (const tab of l.tabs ?? []) {
+        const at = rest.indexOf(tab.label);
+        if (at < 0) break;
+        if (at > 0) out.push(plain(rest.slice(0, at)));
+        out.push(tab.active ? fg(COLOR.focus)(bold(tab.label)) : fg(COLOR.muted)(tab.label));
+        rest = rest.slice(at + tab.label.length);
+      }
+      if (rest) out.push(fg(COLOR.muted)(rest));
+      return out;
+    }
+    case "heading":
+      return [fg(COLOR.muted)(bold(l.text))];
+    case "row":
+      if (l.selected) return [fg(COLOR.focus)(bold(l.text))];
+      return [fg(l.changed ? COLOR.due : COLOR.text)(l.text)];
     case "preview":
-      return fg(l.selected ? COLOR.text : COLOR.muted)(l.text);
-    case "hint":
-      return fg(COLOR.muted)(l.text);
+      return [fg(l.selected ? COLOR.text : COLOR.muted)(l.text)];
     case "blank":
-      return plain(l.text);
+      return [plain(l.text)];
   }
 }
 
@@ -1763,6 +1933,10 @@ export async function startTui(repo: TaskRepository, options: AppOptions = {}, d
     saveView: (patch) => void saveSettings(env, { view: patch }),
     // S32: which editor `a`/`e` open; EISEN_EDITOR_MODE in `env` still wins over its display.
     editor: loaded.settings.editor,
+    // S33: the settings save each change at once, one field per patch
+    // (atomic, S29); `null` in a keys patch removes that override.
+    saveEditor: (patch) => void saveSettings(env, { editor: patch }),
+    saveKeys: (patch) => void saveSettings(env, { keys: patch }),
     // $EDITOR and EISEN_EDITOR_MODE (S22) come from the same environment.
     env,
     ...options,

@@ -694,26 +694,27 @@ describe("settings (S21)", () => {
   });
 
   test("j/k and arrows move the cursor, clamped to the list", () => {
+    // S33: General lists the three presets, then Preview, Done panel and Bullets.
     let s = press(initialState(), key(","), p);
     s = press(s, key("j"), p);
     expect(s.settingsCursor).toBe(1);
     s = press(s, key("down", { sequence: "\u001b[B" }), p);
     expect(s.settingsCursor).toBe(2);
-    s = press(s, key("j"), p);
-    expect(s.settingsCursor).toBe(2);
-    s = press(s, key("k"), p);
+    for (let i = 0; i < 5; i++) s = press(s, key("j"), p);
+    expect(s.settingsCursor).toBe(5);
+    for (let i = 0; i < 4; i++) s = press(s, key("k"), p);
     s = press(s, key("up", { sequence: "\u001b[A" }), p);
     s = press(s, key("k"), p);
     expect(s.settingsCursor).toBe(0);
   });
 
-  test("Enter applies the chosen preset and returns to the matrix", () => {
+  test("Enter applies the chosen preset at once and stays in the settings (S33)", () => {
     let s = press(initialState(), key(","), p);
     s = press(s, key("j"), p);
     s = press(s, key("j"), p);
-    expect(keyToAction(s, enter)).toEqual({ type: "saveSettings" });
+    expect(keyToAction(s, enter)).toEqual({ type: "settingsChange" });
     s = press(s, enter, p);
-    expect(s).toMatchObject({ mode: "normal", preset: "focus" });
+    expect(s).toMatchObject({ mode: "settings", preset: "focus" });
   });
 
   test("Esc cancels and keeps the preset", () => {
@@ -737,6 +738,137 @@ describe("settings (S21)", () => {
     s = press(s, key(","), p);
     s = press(s, esc, p);
     expect(s).toMatchObject({ mode: "normal", query: "zoho" });
+  });
+});
+
+describe("settings v2 (S33)", () => {
+  const p = panes([1, 2], [3]);
+  const esc = key("escape", { sequence: "\u001b" });
+  const enter = key("return", { sequence: "\r" });
+  const space = key("space", { sequence: " " });
+  const tab = key("tab", { sequence: "\t" });
+  const shiftTab = key("tab", { sequence: "\u001b[Z", shift: true });
+  const backspace = key("backspace", { sequence: "\u007f" });
+  const open = (s: ViewState = initialState()) => press(s, key(","), p);
+  const run = (s: ViewState, ...ks: Key[]) => ks.reduce((acc, k) => press(acc, k, p), s);
+
+  test("opens on General; Tab / Shift+Tab switch the section (wrapping) and put the cursor on the first row", () => {
+    let s = open(state({ preset: "focus" }));
+    expect(s).toMatchObject({ settingsSection: "general", settingsCursor: 2, settingsInput: null });
+    expect(keyToAction(s, tab)).toEqual({ type: "settingsSection", dir: 1 });
+    expect(keyToAction(s, shiftTab)).toEqual({ type: "settingsSection", dir: -1 });
+    s = run(s, tab);
+    expect(s).toMatchObject({ settingsSection: "editor", settingsCursor: 0 });
+    s = run(s, tab);
+    expect(s.settingsSection).toBe("keys");
+    s = run(s, tab);
+    expect(s.settingsSection).toBe("general");
+    s = run(s, shiftTab);
+    expect(s.settingsSection).toBe("keys");
+  });
+
+  test("Space changes the value like Enter; Esc closes the settings", () => {
+    expect(keyToAction(open(), space)).toEqual({ type: "settingsChange" });
+    expect(keyToAction(open(), esc)).toEqual({ type: "closeSettings" });
+    const s = run(open(), esc);
+    expect(s.mode).toBe("normal");
+  });
+
+  test("General: Enter on Preview, Done panel and Bullets flips them", () => {
+    let s = run(open(state({ preview: true, donePanel: false, bullets: true })), key("j"), key("j"), key("j"));
+    s = run(s, enter);
+    expect(s.preview).toBe(false);
+    s = run(s, key("j"), space);
+    expect(s.donePanel).toBe(true);
+    s = run(s, key("j"), enter, enter);
+    expect(s.bullets).toBe(true);
+    expect(s.mode).toBe("settings");
+  });
+
+  test("Editor: Enter picks the mode, the command and the display; the rows follow the mode", () => {
+    let s = run(open(), tab);
+    expect(s.editor).toEqual({ mode: "auto", command: "nvim", display: "floating" });
+    // auto: mode ×3, display ×2.
+    s = run(s, key("j"), key("j"), key("j"), key("j"), key("j"));
+    expect(s.settingsCursor).toBe(4);
+    s = run(s, enter);
+    expect(s.editor.display).toBe("fullscreen");
+    s = run(s, key("k"), key("k"), key("k"), enter);
+    expect(s.editor.mode).toBe("command");
+    // command: nano is the 3rd command row (index 5).
+    s = run(s, key("j"), key("j"), key("j"), key("j"), enter);
+    expect(s.editor.command).toBe("nano");
+    s = run(s, key("k"), key("k"), key("k"), key("k"), key("j"), key("j"), key("j"), key("j"), key("j"), key("j"), key("j"), key("j"), key("j"), key("j"));
+    expect(s.settingsCursor).toBe(9);
+    // form: only the three mode rows; the cursor is clamped.
+    s = run(s, key("k"), key("k"), key("k"), key("k"), key("k"), key("k"), key("k"), enter);
+    expect(s.editor.mode).toBe("form");
+    s = run(s, key("j"), key("j"), key("j"));
+    expect(s.settingsCursor).toBe(2);
+  });
+
+  test("Editor: Custom… opens a one-line input; Enter sets the command, Esc cancels, blank changes nothing", () => {
+    const command = state({ editor: { mode: "command", command: "nvim", display: "floating" } });
+    let s = run(open(command), tab);
+    for (let i = 0; i < 7; i++) s = run(s, key("j"));
+    s = run(s, enter);
+    expect(s.settingsInput).toEqual({ kind: "command", text: "" });
+    // Every key types, j and q included.
+    for (const ch of "emacs -nwq") s = run(s, ch === " " ? space : key(ch));
+    s = run(s, backspace);
+    expect(keyToAction(s, key("j"))).toEqual({ type: "settingsInputChar", text: "j" });
+    s = run(s, enter);
+    expect(s.settingsInput).toBeNull();
+    expect(s.editor.command).toBe("emacs -nw");
+    // Opening it again starts from the custom command.
+    s = run(s, enter);
+    expect(s.settingsInput).toEqual({ kind: "command", text: "emacs -nw" });
+    s = run(s, esc);
+    expect(s).toMatchObject({ mode: "settings", settingsInput: null, editor: { command: "emacs -nw" } });
+    s = run(s, enter, ...Array.from({ length: 9 }, () => backspace), enter);
+    expect(s.editor.command).toBe("emacs -nw");
+    expect(s.status).toBe("Empty command: nothing changed");
+  });
+
+  test("Keys: Enter and a start a capture; the next key is captured, Esc cancels", () => {
+    let s = run(open(), tab, tab);
+    expect(keyToAction(s, enter)).toEqual({ type: "settingsChange" });
+    s = run(s, enter);
+    expect(s.settingsInput).toEqual({ kind: "capture", add: false });
+    expect(keyToAction(s, space)).toEqual({ type: "settingsCapture", key: "space" });
+    expect(keyToAction(s, upper("Q"))).toEqual({ type: "settingsCapture", key: "Q" });
+    expect(keyToAction(s, key("d", { ctrl: true, sequence: "\u0004" }))).toEqual({ type: "settingsCapture", key: "ctrl+d" });
+    expect(keyToAction(s, enter)).toEqual({ type: "settingsCapture", key: "return" });
+    expect(keyToAction(s, esc)).toEqual({ type: "settingsInputCancel" });
+    // Ctrl+C still quits.
+    expect(keyToAction(s, key("c", { ctrl: true, sequence: "\u0003" }))).toEqual({ type: "quit" });
+    expect(run(s, space).settingsInput).toBeNull();
+    expect(run(s, esc)).toMatchObject({ mode: "settings", settingsInput: null });
+    expect(keyToAction(open(), key("a"))).toEqual({ type: "noop" });
+    s = run(open(), tab, tab, key("a"));
+    expect(s.settingsInput).toEqual({ kind: "capture", add: true });
+  });
+
+  test("Keys: Backspace, r and R; R asks y/n first", () => {
+    let s = run(open(), tab, tab);
+    expect(keyToAction(s, backspace)).toEqual({ type: "settingsRemoveKey" });
+    expect(keyToAction(s, key("r"))).toEqual({ type: "settingsResetKey" });
+    expect(keyToAction(s, upper("R"))).toEqual({ type: "settingsAskResetAll" });
+    s = run(s, upper("R"));
+    expect(s.settingsInput).toEqual({ kind: "confirmReset" });
+    expect(keyToAction(s, key("j"))).toEqual({ type: "noop" });
+    expect(keyToAction(s, key("y"))).toEqual({ type: "settingsResetAll" });
+    expect(run(s, key("n")).settingsInput).toBeNull();
+    expect(run(s, esc)).toMatchObject({ mode: "settings", settingsInput: null });
+    expect(run(s, key("y")).settingsInput).toBeNull();
+    // Outside Keys they do nothing.
+    for (const k of [backspace, key("r"), upper("R")]) expect(keyToAction(open(), k)).toEqual({ type: "noop" });
+  });
+
+  test("initialState takes the editor settings (S32), auto by default", () => {
+    expect(initialState().editor).toEqual({ mode: "auto", command: "nvim", display: "floating" });
+    const form = { mode: "form", command: "hx", display: "fullscreen" } as const;
+    expect(initialState("classic", {}, form).editor).toEqual(form);
   });
 });
 

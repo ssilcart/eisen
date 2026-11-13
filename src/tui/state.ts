@@ -1,10 +1,22 @@
 // Pure view state of the matrix TUI: key → action mapping and the reducer for
 // view-only changes. No @opentui and no bun:sqlite here; the controller in
 // app.ts runs the repository effects and reloads the panes.
+import { DEFAULT_SETTINGS, type EditorSettings } from "../config.ts";
 import { DEFAULT_PRESET, PRESET_IDS, type PresetId } from "../domain/presets.ts";
 import type { Quadrant } from "../domain/task.ts";
 import { completeCommand, pushHistory, walkHistory, type Completion, type HistoryCursor } from "./commands.ts";
-import { DEFAULT_KEYMAP, actionFor, keysOf, type Keymap } from "./keymap.ts";
+import { DEFAULT_KEYMAP, actionFor, eventKey, keysOf, type Keymap } from "./keymap.ts";
+import { SETTINGS_SECTIONS, isCustomCommand, settingsRows, type SettingsSection } from "./settings.ts";
+
+/**
+ * What the settings screen is waiting for (S33): a key to bind (Keys: Enter
+ * replaces, `a` adds), a `y/n` before resetting every key, or the `Custom…`
+ * editor command being typed.
+ */
+export type SettingsInput =
+  | { kind: "capture"; add: boolean }
+  | { kind: "confirmReset" }
+  | { kind: "command"; text: string };
 
 export type Mode = "normal" | "add" | "confirmDelete" | "help" | "triage" | "search" | "settings" | "command";
 
@@ -93,8 +105,14 @@ export interface ViewState {
   query: string;
   /** The quadrant labels in use (S20). */
   preset: PresetId;
-  /** The preset under the cursor in the settings screen (S21), an index in PRESET_IDS. */
+  /** Which editor `a`/`e` open (S32); the settings change it (S33). */
+  editor: EditorSettings;
+  /** The settings' section shown (S33). */
+  settingsSection: SettingsSection;
+  /** The settings' cursor: an index in the section's rows (`settingsRows`). */
   settingsCursor: number;
+  /** Set while the settings capture a key, confirm a reset or take a command (S33). */
+  settingsInput: SettingsInput | null;
   /** The `:` command line (S31); its history lives as long as the session. */
   command: CommandLine;
 }
@@ -154,10 +172,29 @@ export type Action =
   | { type: "clearSearch" }
   /** `:search <query>` (S31): the query typed and kept at once, like `/` + query + Enter. */
   | { type: "runSearch"; query: string }
-  /** `,` opens the settings (S21); j/k move its cursor; Enter applies (the controller saves). */
+  /**
+   * `,` opens the settings (S21, S33); Tab / Shift+Tab switch the section,
+   * j/k move, Enter or Space change the value under the cursor (the
+   * controller saves what changed), Esc closes.
+   */
   | { type: "openSettings" }
+  | { type: "closeSettings" }
+  | { type: "settingsSection"; dir: -1 | 1 }
   | { type: "settingsMove"; dir: -1 | 1 }
-  | { type: "saveSettings" }
+  | { type: "settingsChange" }
+  /** Keys section: `a` captures a key to add; Backspace, `r`, `R` (+ `y`); the controller edits the keymap. */
+  | { type: "settingsAddKey" }
+  | { type: "settingsRemoveKey" }
+  | { type: "settingsResetKey" }
+  | { type: "settingsAskResetAll" }
+  | { type: "settingsResetAll" }
+  /** The key pressed while capturing, as a key string (null: nothing can bind it). */
+  | { type: "settingsCapture"; key: string | null }
+  /** The `Custom…` command input. */
+  | { type: "settingsInputChar"; text: string }
+  | { type: "settingsInputBackspace" }
+  | { type: "settingsInputSubmit" }
+  | { type: "settingsInputCancel" }
   /** `:` opens the command line (S31); Enter runs it (the controller parses and runs it). */
   | { type: "openCommand" }
   | { type: "commandInput"; text: string }
@@ -169,7 +206,11 @@ export type Action =
   | { type: "cancelCommand" }
   | { type: "noop" };
 
-export function initialState(preset: PresetId = DEFAULT_PRESET, toggles: Partial<ViewToggles> = {}): ViewState {
+export function initialState(
+  preset: PresetId = DEFAULT_PRESET,
+  toggles: Partial<ViewToggles> = {},
+  editor: EditorSettings = DEFAULT_SETTINGS.editor,
+): ViewState {
   return {
     focus: 1,
     selected: { 1: 0, 2: 0, 3: 0, 4: 0 },
@@ -185,7 +226,10 @@ export function initialState(preset: PresetId = DEFAULT_PRESET, toggles: Partial
     triage: null,
     query: "",
     preset,
+    editor: { ...editor },
+    settingsSection: "general",
     settingsCursor: 0,
+    settingsInput: null,
     command: { line: "", history: [], cursor: null, completion: null },
   };
 }
@@ -284,7 +328,7 @@ export function keyToAction(state: ViewState, key: Key, keymap: Keymap = DEFAULT
     case "search":
       return searchKey(key);
     case "settings":
-      return settingsKey(key);
+      return settingsKey(state, key);
     case "command":
       return commandKey(key);
     case "normal":
@@ -314,14 +358,43 @@ function commandKey(key: Key): Action {
   return text === null ? NOOP : { type: "commandInput", text };
 }
 
-/** Only the settings' own keys: nothing reaches the matrix (S21). */
-function settingsKey(key: Key): Action {
+/**
+ * Only the settings' own keys: nothing reaches the matrix (S21), and none of
+ * them is rebindable (S30, S33). While a key is captured, the next key is the
+ * capture (Esc cancels); the `Custom…` input types like the search.
+ */
+function settingsKey(state: ViewState, key: Key): Action {
+  const input = state.settingsInput;
+  if (input?.kind === "capture") {
+    if (isBareEscape(key)) return { type: "settingsInputCancel" };
+    return { type: "settingsCapture", key: eventKey(key) };
+  }
+  if (input?.kind === "confirmReset") {
+    if (key.ctrl || key.meta) return NOOP;
+    if (key.name === "y" && !key.shift) return { type: "settingsResetAll" };
+    if ((key.name === "n" && !key.shift) || key.name === "escape") return { type: "settingsInputCancel" };
+    return NOOP;
+  }
+  if (input?.kind === "command") {
+    if (key.name === "escape") return { type: "settingsInputCancel" };
+    if (key.name === "return" || key.name === "enter") return { type: "settingsInputSubmit" };
+    if (key.name === "backspace") return { type: "settingsInputBackspace" };
+    const text = printable(key);
+    return text === null ? NOOP : { type: "settingsInputChar", text };
+  }
   if (key.ctrl || key.meta) return NOOP;
-  if (key.name === "escape") return { type: "cancel" };
-  if (key.name === "return" || key.name === "enter") return { type: "saveSettings" };
+  if (key.name === "escape") return { type: "closeSettings" };
+  if (key.name === "tab") return { type: "settingsSection", dir: key.shift ? -1 : 1 };
+  if (key.name === "return" || key.name === "enter" || key.name === "space" || key.sequence === " ") return { type: "settingsChange" };
+  const keys = state.settingsSection === "keys";
+  if (keys && key.name === "backspace") return { type: "settingsRemoveKey" };
+  const pressed = eventKey(key);
+  if (keys && pressed === "R") return { type: "settingsAskResetAll" };
   if (key.shift) return NOOP;
   if (key.name === "j" || key.name === "down") return { type: "settingsMove", dir: 1 };
   if (key.name === "k" || key.name === "up") return { type: "settingsMove", dir: -1 };
+  if (keys && pressed === "a") return { type: "settingsAddKey" };
+  if (keys && pressed === "r") return { type: "settingsResetKey" };
   return NOOP;
 }
 
@@ -409,13 +482,49 @@ export function reduce(
       if (action.query.trim() === "") return endSearch(s);
       return { ...s, mode: "normal", query: action.query, selected: { 1: 0, 2: 0, 3: 0, 4: 0, inbox: 0 } };
     case "openSettings":
-      return { ...s, mode: "settings", settingsCursor: Math.max(0, PRESET_IDS.indexOf(s.preset)) };
-    case "settingsMove": {
-      const cursor = Math.max(0, Math.min(PRESET_IDS.length - 1, s.settingsCursor + action.dir));
-      return { ...s, settingsCursor: cursor };
+      return {
+        ...s,
+        mode: "settings",
+        settingsSection: "general",
+        settingsCursor: Math.max(0, PRESET_IDS.indexOf(s.preset)),
+        settingsInput: null,
+      };
+    case "closeSettings":
+      return { ...s, mode: "normal", settingsInput: null };
+    case "settingsSection": {
+      const n = SETTINGS_SECTIONS.length;
+      const section = SETTINGS_SECTIONS[(SETTINGS_SECTIONS.indexOf(s.settingsSection) + action.dir + n) % n]!;
+      return { ...s, settingsSection: section, settingsCursor: 0, settingsInput: null };
     }
-    case "saveSettings":
-      return { ...s, mode: "normal", preset: PRESET_IDS[s.settingsCursor] ?? s.preset };
+    case "settingsMove":
+      return clampSettings({ ...s, settingsCursor: s.settingsCursor + action.dir });
+    case "settingsChange":
+      return changeSetting(s);
+    case "settingsAddKey":
+      return s.settingsSection === "keys" ? { ...s, settingsInput: { kind: "capture", add: true } } : s;
+    case "settingsAskResetAll":
+      return s.settingsSection === "keys" ? { ...s, settingsInput: { kind: "confirmReset" } } : s;
+    case "settingsCapture":
+    case "settingsResetAll":
+    case "settingsInputCancel":
+      return { ...s, settingsInput: null };
+    case "settingsInputChar":
+      return s.settingsInput?.kind === "command"
+        ? { ...s, settingsInput: { kind: "command", text: s.settingsInput.text + action.text } }
+        : s;
+    case "settingsInputBackspace":
+      return s.settingsInput?.kind === "command"
+        ? { ...s, settingsInput: { kind: "command", text: Array.from(s.settingsInput.text).slice(0, -1).join("") } }
+        : s;
+    case "settingsInputSubmit": {
+      if (s.settingsInput?.kind !== "command") return s;
+      const command = s.settingsInput.text.trim();
+      if (command === "") return { ...s, settingsInput: null, status: "Empty command: nothing changed" };
+      return { ...s, settingsInput: null, editor: { ...s.editor, command } };
+    }
+    case "settingsRemoveKey":
+    case "settingsResetKey":
+      return s;
     case "openCommand":
       return { ...s, mode: "command", command: { ...s.command, line: "", cursor: null, completion: null } };
     case "commandInput":
@@ -449,6 +558,40 @@ export function reduce(
     case "newTask":
     case "scrollPreview":
       return s;
+  }
+}
+
+/** The settings cursor kept inside its section's rows (they change with the editor mode). */
+function clampSettings(s: ViewState): ViewState {
+  const count = settingsRows(s.settingsSection, s.editor).length;
+  return { ...s, settingsCursor: Math.max(0, Math.min(count - 1, s.settingsCursor)) };
+}
+
+/**
+ * Enter or Space on the row under the cursor (S33): a preset, a panel, an
+ * editor mode / command / display is applied here (the controller saves
+ * what changed); `Custom…` opens its input; a Keys row starts a capture.
+ */
+function changeSetting(s: ViewState): ViewState {
+  const row = settingsRows(s.settingsSection, s.editor)[s.settingsCursor];
+  if (!row) return s;
+  switch (row.kind) {
+    case "preset":
+      return { ...s, preset: row.preset };
+    case "view":
+      return { ...s, [row.field]: !s[row.field] };
+    case "mode":
+      return clampSettings({ ...s, editor: { ...s.editor, mode: row.mode } });
+    case "command":
+      if (row.command === null) {
+        const text = isCustomCommand(s.editor.command) ? s.editor.command : "";
+        return { ...s, settingsInput: { kind: "command", text } };
+      }
+      return { ...s, editor: { ...s.editor, command: row.command } };
+    case "display":
+      return { ...s, editor: { ...s.editor, display: row.display } };
+    case "key":
+      return { ...s, settingsInput: { kind: "capture", add: false } };
   }
 }
 
