@@ -4,13 +4,17 @@
 // to $EDITOR (S11); the edit file format lives in edit-file.ts. `i` triages
 // the Inbox one card at a time (S12); the card's layout is in triage-card.ts.
 // `/` filters every pane live with the domain's search (S19); while it is
-// active an Inbox strip under the grid lists the Inbox matches.
+// active an Inbox strip under the grid lists the Inbox matches. Pane titles
+// and messages use the active quadrant preset (S20), which `,` changes and
+// saves (S21); each pane has its colour (S23, theme.ts).
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   BoxRenderable,
+  RGBA,
   StyledText,
+  TextAttributes,
   TextRenderable,
   bg,
   bold,
@@ -24,7 +28,9 @@ import {
 import { displayBucket, isEscalated, localToday, DEFAULT_URGENT_WITHIN_DAYS } from "../domain/escalation.ts";
 import { prepareSearch, search, type SearchIndex } from "../domain/search.ts";
 import { parseTags } from "../domain/tags.ts";
-import { QUADRANTS, QUADRANT_LABELS, bucketOf, type Quadrant, type Task } from "../domain/task.ts";
+import { loadConfig, saveConfig } from "../config.ts";
+import { getPreset, headingFor, labelFor, type PresetId } from "../domain/presets.ts";
+import { QUADRANTS, bucketOf, type Quadrant, type Task } from "../domain/task.ts";
 import type { TaskRepository } from "../store/repository.ts";
 import { editChanges, editorCommand, parseTaskFile, serializeTask } from "./edit-file.ts";
 import { fit, gridSizes, stripHeight, windowStart } from "./layout.ts";
@@ -44,7 +50,9 @@ import {
   type PaneItems,
   type ViewState,
 } from "./state.ts";
-import { cardLines, type CardLineKind } from "./triage-card.ts";
+import { settingsHeight, settingsLines, settingsWidth, type SettingsLine } from "./settings.ts";
+import { COLOR, paneStyle } from "./theme.ts";
+import { cardLines, triageHints, type CardLineKind } from "./triage-card.ts";
 
 export interface AppOptions {
   /** Today as YYYY-MM-DD, for due-date escalation (S7). Default: local date. */
@@ -55,6 +63,15 @@ export interface AppOptions {
    * code. Default: `spawnEditor` ($VISUAL, $EDITOR or vi).
    */
   runEditor?: (path: string) => Promise<number>;
+  /** The quadrant labels to start with (S20). Default: classic. */
+  preset?: PresetId;
+  /** Shown in the status line at start, e.g. a config file that could not be used (S21). */
+  warning?: string;
+  /**
+   * Persists the preset picked in the settings (S21); throwing keeps the
+   * previous preset and shows the error. Default: applied for this session only.
+   */
+  savePreset?: (preset: PresetId) => void;
 }
 
 export interface MatrixApp {
@@ -69,27 +86,19 @@ export interface MatrixApp {
   destroy(): void;
 }
 
-const COLOR = {
-  border: "#4b5263",
-  focus: "#7aa2f7",
-  title: "#a9b1d6",
-  text: "#c0caf5",
-  muted: "#7f849c",
-  done: "#5c6370",
-  escalated: "#f7768e",
-  due: "#e0af68",
-  ok: "#9ece6a",
-  selectBg: "#3b4261",
-  statusBg: "#1f2335",
-  panel: "#16161e",
-};
-
 const HINTS =
-  "h/j/k/l move · 1-4 send · a add · e edit · x done · d delete · / search · J/K order · . done · ? help · q quit";
+  "h/j/k/l move · 1-4 send · a add · e edit · x done · d delete · / search · J/K order · . done · , settings · ? help · q quit";
 
-const HELP: [string, string][] = [
-  ["h j k l / arrows", "Move between quadrants and tasks"],
-  ["1 – 4", "Move the selected task to that quadrant"],
+/** The help's rows; `1`–`4` name the quadrants with the active preset (S20). */
+function helpRows(preset: PresetId): [string, string][] {
+  return [
+    ["h j k l / arrows", "Move between quadrants and tasks"],
+    ...QUADRANTS.map((q): [string, string] => [String(q), `Send to ${labelFor(preset, q)}`]),
+    ...HELP_REST,
+  ];
+}
+
+const HELP_REST: [string, string][] = [
   ["a", "Add a task here (#tags work)"],
   ["x", "Toggle done"],
   ["d", "Delete (y/n)"],
@@ -98,6 +107,7 @@ const HELP: [string, string][] = [
   ["e", "Edit in $EDITOR"],
   ["i", "Triage the Inbox: 1-4 sort, s skip, Esc exit"],
   ["/", "Search every task: type to filter, Enter keep, Esc clear"],
+  [",", "Settings: quadrant names"],
   ["?", "Help"],
   ["q", "Quit"],
 ];
@@ -105,16 +115,18 @@ const HELP: [string, string][] = [
 const plain = (text: string): TextChunk => ({ __isChunk: true, text });
 
 /**
- * `Q1 · Do (n)`, or `Q1 (n)` when the pane is too narrow for the label;
- * `count` is the open count, or `matches/total` while searching (S19).
+ * `Q1 · ✅ Do (n)` in the preset's labels, or `Q1 (n)` when the pane is too
+ * narrow for the label (display width, so the emoji count as 2); `count` is
+ * the open count, or `matches/total` while searching (S19).
  */
-function paneTitle(q: Quadrant, count: string, paneWidth = Infinity): string {
-  const full = ` Q${q} · ${QUADRANT_LABELS[q]} (${count}) `;
+function paneTitle(preset: PresetId, q: Quadrant, count: string, paneWidth = Infinity): string {
+  const full = ` ${headingFor(preset, q)} (${count}) `;
   return Bun.stringWidth(full) + 4 <= paneWidth ? full : ` Q${q} (${count}) `;
 }
 
-function focusLabel(focus: Focus): string {
-  return focus === "inbox" ? "Inbox" : `Q${focus} · ${QUADRANT_LABELS[focus]}`;
+/** `Q1 · ✅ Do` or `📥 Inbox`, for messages. */
+function focusLabel(preset: PresetId, focus: Focus): string {
+  return headingFor(preset, focus);
 }
 
 interface Pane {
@@ -127,11 +139,12 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
   const today = options.today ?? (() => localToday());
   const within = options.urgentWithinDays ?? DEFAULT_URGENT_WITHIN_DAYS;
   const runEditor = options.runEditor ?? ((path: string) => spawnEditor(path));
+  const savePreset = options.savePreset ?? (() => {});
   /** The running editor session; keys are ignored while it is set. */
   let editing: Promise<void> | null = null;
   let destroyed = false;
 
-  let state = initialState();
+  let state = initialState(options.preset);
   /** Every task, open and done, as last read from the repository. */
   let all: Task[] = [];
   /** Folded fields of `all` for search (S19), built on the first query after a read. */
@@ -154,33 +167,51 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
   const rows = [0, 1].map(
     (i) => new BoxRenderable(renderer, { id: `eisen-row-${i}`, flexDirection: "row", flexShrink: 0 }),
   );
+  /**
+   * S23: the focused pane's title, redrawn bold over the one the box draws
+   * (OpenTUI 0.8.4 boxes take a title colour but no attributes).
+   */
+  const boldTitles = new Map<BoxRenderable, { text: string; color: RGBA }>();
+  function withBoldTitle(box: BoxRenderable): BoxRenderable {
+    box.renderAfter = function (buffer) {
+      const title = boldTitles.get(box);
+      if (!title || box.title !== title.text || Bun.stringWidth(title.text) + 4 > this.width) return;
+      // Left-aligned titles start 2 cells in, after the corner and one border cell.
+      buffer.drawText(title.text, this.x + 2, this.y, title.color, undefined, TextAttributes.BOLD);
+    };
+    return box;
+  }
   const panes = {} as Record<Quadrant, Pane>;
   for (const q of QUADRANTS) {
-    const box = new BoxRenderable(renderer, {
-      id: `eisen-q${q}`,
-      border: true,
-      borderStyle: "rounded",
-      borderColor: COLOR.border,
-      titleColor: COLOR.title,
-      title: paneTitle(q, "0"),
-      flexShrink: 0,
-      overflow: "hidden",
-    });
+    const box = withBoldTitle(
+      new BoxRenderable(renderer, {
+        id: `eisen-q${q}`,
+        border: true,
+        borderStyle: "rounded",
+        borderColor: COLOR.border,
+        titleColor: COLOR.title,
+        title: paneTitle(state.preset, q, "0"),
+        flexShrink: 0,
+        overflow: "hidden",
+      }),
+    );
     const text = new TextRenderable(renderer, { id: `eisen-q${q}-list`, content: "", wrapMode: "none", fg: COLOR.text });
     box.add(text);
     rows[q <= 2 ? 0 : 1]!.add(box);
     panes[q] = { box, text };
   }
-  const stripBox = new BoxRenderable(renderer, {
-    id: "eisen-inbox",
-    border: true,
-    borderStyle: "rounded",
-    borderColor: COLOR.border,
-    titleColor: COLOR.title,
-    flexShrink: 0,
-    overflow: "hidden",
-    visible: false,
-  });
+  const stripBox = withBoldTitle(
+    new BoxRenderable(renderer, {
+      id: "eisen-inbox",
+      border: true,
+      borderStyle: "rounded",
+      borderColor: COLOR.border,
+      titleColor: COLOR.title,
+      flexShrink: 0,
+      overflow: "hidden",
+      visible: false,
+    }),
+  );
   const stripText = new TextRenderable(renderer, { id: "eisen-inbox-list", content: "", wrapMode: "none", fg: COLOR.text });
   stripBox.add(stripText);
   const status = new TextRenderable(renderer, {
@@ -206,8 +237,26 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     paddingLeft: 1,
     paddingRight: 1,
   });
-  const helpText = new TextRenderable(renderer, { id: "eisen-help-text", content: helpContent(), wrapMode: "none" });
+  const helpText = new TextRenderable(renderer, { id: "eisen-help-text", content: "", wrapMode: "none" });
   help.add(helpText);
+  // S21: the presets with a preview of their labels, over the grid.
+  const settings = new BoxRenderable(renderer, {
+    id: "eisen-settings",
+    position: "absolute",
+    zIndex: 10,
+    visible: false,
+    border: true,
+    borderStyle: "rounded",
+    borderColor: COLOR.focus,
+    title: " Settings · quadrant names ",
+    titleColor: COLOR.focus,
+    backgroundColor: COLOR.panel,
+    paddingLeft: 1,
+    paddingRight: 1,
+    overflow: "hidden",
+  });
+  const settingsText = new TextRenderable(renderer, { id: "eisen-settings-text", content: "", wrapMode: "none" });
+  settings.add(settingsText);
   // The triage card covers the grid (not the status line) while triaging.
   const card = new BoxRenderable(renderer, {
     id: "eisen-triage",
@@ -230,6 +279,7 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
   container.add(status);
   container.add(card);
   container.add(help);
+  container.add(settings);
   renderer.root.add(container);
 
   // ── Data ─────────────────────────────────────────────────────────────────
@@ -328,8 +378,9 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     stripBox.width = width;
     stripBox.height = stripRows;
     status.width = width;
-    const helpWidth = Math.min(helpContentWidth() + 4, Math.max(0, width - 4));
-    const helpHeight = Math.min(HELP.length + 2, Math.max(0, height - 2));
+    const rowsOfHelp = helpRows(state.preset);
+    const helpWidth = Math.min(helpContentWidth(rowsOfHelp) + 4, Math.max(0, width - 4));
+    const helpHeight = Math.min(rowsOfHelp.length + 2, Math.max(0, height - 2));
     help.width = helpWidth;
     help.height = helpHeight;
     help.left = Math.max(0, Math.floor((width - helpWidth) / 2));
@@ -338,6 +389,34 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     card.top = 0;
     card.width = width;
     card.height = Math.max(0, height - 1);
+    const { width: settingsW, height: settingsH } = settingsSize();
+    settings.width = settingsW;
+    settings.height = settingsH;
+    settings.left = Math.max(0, Math.floor((width - settingsW) / 2));
+    settings.top = Math.max(0, Math.floor((height - 1 - settingsH) / 2));
+  }
+
+  /** The settings box: its lines plus border (2) and padding (2), never over the status line. */
+  function settingsSize(): { width: number; height: number } {
+    return {
+      width: Math.min(settingsWidth() + 4, renderer.width),
+      height: Math.min(settingsHeight() + 2, Math.max(0, renderer.height - 1)),
+    };
+  }
+
+  function drawSettings(): void {
+    settings.visible = state.mode === "settings";
+    if (!settings.visible) return;
+    const size = settingsSize();
+    const inner = { width: Math.max(0, size.width - 4), height: Math.max(0, size.height - 2) };
+    const title = " Settings · quadrant names ";
+    settings.title = Bun.stringWidth(title) + 4 <= size.width ? title : undefined;
+    const chunks: TextChunk[] = [];
+    settingsLines(state.preset, state.settingsCursor, inner.width, inner.height).forEach((l, i) => {
+      if (i > 0) chunks.push(plain("\n"));
+      chunks.push(settingsChunk(l));
+    });
+    settingsText.content = new StyledText(chunks);
   }
 
   /** Inner size of the card: border (2) and padding (2) across, border (2) down. */
@@ -358,7 +437,7 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
       return;
     }
     const chunks: TextChunk[] = [];
-    cardLines(task, inner.width, inner.height).forEach((l, i) => {
+    cardLines(task, inner.width, inner.height, triageHints(state.preset)).forEach((l, i) => {
       if (i > 0) chunks.push(plain("\n"));
       chunks.push(CARD_STYLE[l.kind](l.text));
     });
@@ -376,16 +455,18 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
         height: Math.max(0, (q <= 2 ? g.top : g.bottom) - 2),
       };
       const count = filter ? `${tasks[q].length}/${filter.total[q]}` : `${openCounts[q]}`;
-      drawList(pane.box, pane.text, tasks[q], q, inner, paneTitle(q, count, inner.width + 2));
+      drawList(pane.box, pane.text, tasks[q], q, inner, paneTitle(state.preset, q, count, inner.width + 2));
     }
     if (strip && stripRows > 0) {
       const inner = { width: Math.max(0, renderer.width - 2), height: Math.max(0, stripRows - 2) };
       const count = filter ? `${strip.length}/${filter.total.inbox}` : `${strip.length}`;
-      drawList(stripBox, stripText, strip, "inbox", inner, ` Inbox (${count}) `);
+      drawList(stripBox, stripText, strip, "inbox", inner, ` ${labelFor(state.preset, "inbox")} (${count}) `);
     }
     status.content = statusContent(renderer.width);
     drawCard();
     help.visible = state.mode === "help";
+    if (help.visible) helpText.content = helpContent(helpRows(state.preset));
+    drawSettings();
     renderer.requestRender();
   }
 
@@ -400,28 +481,32 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
   ): void {
     const focused = state.focus === id;
     const selected = state.selected[id] ?? 0;
+    const style = paneStyle(id, focused);
     box.title = title;
-    box.borderColor = focused ? COLOR.focus : COLOR.border;
-    box.titleColor = focused ? COLOR.focus : COLOR.title;
+    box.borderColor = style.border;
+    box.titleColor = style.title;
+    if (style.bold) boldTitles.set(box, { text: title, color: RGBA.fromHex(style.title) });
+    else boldTitles.delete(box);
     const start = windowStart(selected, list.length, inner.height);
     const visible = list.slice(start, start + inner.height);
     box.bottomTitle =
       list.length > inner.height && inner.height > 0 ? ` ${start + 1}-${start + visible.length} of ${list.length} ` : undefined;
     box.bottomTitleAlignment = "right";
-    text.content = paneContent(visible, start, inner.width, focused ? selected : -1);
+    text.content = paneContent(visible, start, inner.width, focused ? selected : -1, style.selectBg);
   }
 
-  function paneContent(visible: Task[], start: number, width: number, selected: number): StyledText {
+  function paneContent(visible: Task[], start: number, width: number, selected: number, selectBg: string): StyledText {
     if (visible.length === 0) return new StyledText([fg(COLOR.muted)(fit(filter ? "  No matches" : "  No tasks", width))]);
     const chunks: TextChunk[] = [];
     visible.forEach((task, i) => {
       if (i > 0) chunks.push(plain("\n"));
-      chunks.push(...rowChunks(task, width, start + i === selected));
+      chunks.push(...rowChunks(task, width, start + i === selected ? selectBg : null));
     });
     return new StyledText(chunks);
   }
 
-  function rowChunks(task: Task, width: number, selected: boolean): TextChunk[] {
+  /** One task row; `selectBg` is the highlight of the selected row (S23), null for the others. */
+  function rowChunks(task: Task, width: number, selectBg: string | null): TextChunk[] {
     const isDone = task.status === "done";
     const escalated = isEscalated(task, currentDay, within);
     const mark = isDone ? "✓" : escalated ? "!" : " ";
@@ -432,7 +517,7 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
       isDone ? dim(fg(COLOR.done)(fit(task.title, titleWidth))) : fg(COLOR.text)(fit(task.title, titleWidth)),
     ];
     if (due) parts.push(fg(escalated ? COLOR.escalated : isDone ? COLOR.done : COLOR.due)(due));
-    return selected ? parts.map((chunk) => bg(COLOR.selectBg)(chunk)) : parts;
+    return selectBg ? parts.map((chunk) => bg(selectBg)(chunk)) : parts;
   }
 
   /** `2 matches`, `No matches for "q"`, or null when no query filters. */
@@ -443,8 +528,10 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
   }
 
   function statusContent(width: number): StyledText {
-    const quadrant = focusLabel(state.focus);
+    const quadrant = focusLabel(state.preset, state.focus);
     switch (state.mode) {
+      case "settings":
+        return line(width, [fg(COLOR.focus)(bold(" Settings")), fg(COLOR.muted)("  │ j/k choose · Enter save · Esc cancel")]);
       case "search": {
         const prefix = " / ";
         const after = `  ${matchesText() ?? "type to search"} · Enter keep · Esc clear`;
@@ -534,7 +621,7 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
           }
           const from = bucketOf(repo.get(id)!);
           repo.move(id, action.quadrant);
-          const label = `Q${action.quadrant} · ${QUADRANT_LABELS[action.quadrant]}`;
+          const label = headingFor(before.preset, action.quadrant);
           message = from === action.quadrant ? `Already in ${label}` : `Moved to ${label}`;
           break;
         }
@@ -573,7 +660,18 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
           const quadrant = before.focus === "inbox" ? null : before.focus;
           const task = repo.create({ title, quadrant, tags: parseTags(title) });
           followId = task.id;
-          message = `Added to ${focusLabel(before.focus)}`;
+          message = `Added to ${focusLabel(before.preset, before.focus)}`;
+          break;
+        }
+        case "saveSettings": {
+          // S21: the reducer applied the choice; keep it only if it is saved.
+          const name = getPreset(next.preset).name;
+          if (next.preset === before.preset) {
+            message = `Preset unchanged: ${name}`;
+            break;
+          }
+          savePreset(next.preset);
+          message = `Preset: ${name}`;
           break;
         }
         default:
@@ -585,6 +683,8 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     }
     // A failed effect keeps the triage card where it was.
     if (failed && before.triage) next = { ...next, mode: "triage", triage: before.triage };
+    // A preset that could not be saved is not applied either.
+    if (failed && action.type === "saveSettings") next = { ...next, preset: before.preset };
     // The end-of-triage summary wins over the last move's message, not over an error.
     if (message !== null && (failed || next.status === null)) next = { ...next, status: message };
     state = next; // load() reads showDone from the new state
@@ -676,6 +776,8 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
   renderer.on("resize", onResize);
   load();
   state = offerTriage(state, inboxCount);
+  // S21: a config file that could not be used says so, next to the triage offer.
+  if (options.warning) state = { ...state, status: state.status ? `${options.warning} · ${state.status}` : options.warning };
   layout();
   draw();
 
@@ -711,16 +813,30 @@ const CARD_STYLE: Record<CardLineKind, (text: string) => TextChunk> = {
   blank: (text) => plain(text),
 };
 
-const HELP_KEY_WIDTH = Math.max(...HELP.map(([k]) => k.length)) + 2;
-
-function helpContentWidth(): number {
-  return HELP_KEY_WIDTH + Math.max(...HELP.map(([, label]) => Bun.stringWidth(label)));
+/** Settings lines (S21): the cursor's preset stands out, the others are muted. */
+function settingsChunk(l: SettingsLine): TextChunk {
+  switch (l.kind) {
+    case "name":
+      return l.selected ? fg(COLOR.focus)(bold(l.text)) : fg(COLOR.text)(l.text);
+    case "preview":
+      return fg(l.selected ? COLOR.text : COLOR.muted)(l.text);
+    case "hint":
+      return fg(COLOR.muted)(l.text);
+    case "blank":
+      return plain(l.text);
+  }
 }
 
-function helpContent(): StyledText {
-  const keyWidth = HELP_KEY_WIDTH;
+const helpKeyWidth = (rows: [string, string][]) => Math.max(...rows.map(([k]) => k.length)) + 2;
+
+function helpContentWidth(rows: [string, string][]): number {
+  return helpKeyWidth(rows) + Math.max(...rows.map(([, label]) => Bun.stringWidth(label)));
+}
+
+function helpContent(rows: [string, string][]): StyledText {
+  const keyWidth = helpKeyWidth(rows);
   const chunks: TextChunk[] = [];
-  HELP.forEach(([k, label], i) => {
+  rows.forEach(([k, label], i) => {
     if (i > 0) chunks.push(plain("\n"));
     chunks.push(fg(COLOR.focus)(bold(k.padEnd(keyWidth))), fg(COLOR.text)(label));
   });
@@ -756,15 +872,29 @@ export async function spawnEditor(path: string, env: Record<string, string | und
   return await proc.exited;
 }
 
-/** Opens the matrix in the terminal and returns once the user quits (S9). */
 export interface TuiDeps {
   /** Builds the renderer. Default: a real terminal renderer on the alternate screen. */
   createRenderer?: () => Promise<CliRenderer>;
+  /** Where the config file is found (S21). Default: process.env. */
+  env?: Record<string, string | undefined>;
 }
 
+/**
+ * Opens the matrix in the terminal and returns once the user quits (S9). The
+ * preset comes from the config file and `,` saves it there (S21); a config
+ * that cannot be used shows a warning in the status line.
+ */
 export async function startTui(repo: TaskRepository, options: AppOptions = {}, deps: TuiDeps = {}): Promise<void> {
   const createRenderer =
     deps.createRenderer ?? (() => createCliRenderer({ exitOnCtrlC: false, screenMode: "alternate-screen" }));
+  const env = deps.env ?? process.env;
+  const { config, warning } = loadConfig(env);
+  options = {
+    preset: config.preset,
+    warning,
+    savePreset: (preset) => void saveConfig(env, { preset }),
+    ...options,
+  };
   const renderer = await createRenderer();
   // Whatever fails from here on (the first load included), the renderer is
   // torn down before the error propagates: OpenTUI's process handlers would

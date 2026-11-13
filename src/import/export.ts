@@ -1,17 +1,15 @@
-import { bucketOf, QUADRANT_LABELS, QUADRANTS, type Bucket, type Task } from "../domain/task.ts";
+import { DEFAULT_PRESET, headingFor, type PresetId } from "../domain/presets.ts";
+import { bucketOf, QUADRANTS, type Bucket, type Task } from "../domain/task.ts";
 import { parseTags } from "../domain/tags.ts";
-
-const HEADINGS: Record<string, string> = {
-  ...Object.fromEntries(QUADRANTS.map((q) => [String(q), `Q${q} · ${QUADRANT_LABELS[q]}`])),
-  inbox: "Inbox",
-};
 
 /**
  * S13: Markdown grouped by quadrant, then Inbox, in the format `parseMarkdown`
  * reads back. Tags that the text does not carry and the due date go in an
- * HTML comment, so the file still renders as a plain checklist.
+ * HTML comment, so the file still renders as a plain checklist. Headings are
+ * `# Q{n} · {label}` in the active preset (S20) and `# 📥 Inbox`; the importer
+ * reads only the `Q{n}` prefix (and the slug `inbox`).
  */
-export function exportMarkdown(tasks: readonly Task[]): string {
+export function exportMarkdown(tasks: readonly Task[], preset: PresetId = DEFAULT_PRESET): string {
   const order: Bucket[] = [...QUADRANTS, "inbox"];
   const sections: string[] = [];
   for (const bucket of order) {
@@ -19,7 +17,7 @@ export function exportMarkdown(tasks: readonly Task[]): string {
       .filter((t) => bucketOf(t) === bucket)
       .sort((a, b) => Number(a.status === "done") - Number(b.status === "done") || a.position - b.position || a.id - b.id);
     if (inBucket.length === 0) continue;
-    sections.push(`# ${HEADINGS[String(bucket)]}\n\n${inBucket.map(taskBlock).join("\n\n")}`);
+    sections.push(`# ${headingFor(preset, bucket)}\n\n${inBucket.map(taskBlock).join("\n\n")}`);
   }
   return sections.length ? `${sections.join("\n\n")}\n` : "";
 }

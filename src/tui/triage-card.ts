@@ -1,8 +1,15 @@
 // Pure layout of the triage card (S12): which lines fit in the card's inner
 // box, in priority order. app.ts styles them by kind.
+import { DEFAULT_PRESET, labelFor, type PresetId } from "../domain/presets.ts";
+import { QUADRANTS } from "../domain/task.ts";
 import { fit, wrap } from "./layout.ts";
 
-export const TRIAGE_HINTS = "1 Do · 2 Schedule · 3 Delegate · 4 Delete · s skip · e edit · d delete · Esc exit";
+/** The S12 keys, with the quadrants named by `preset` (S20). */
+export function triageHints(preset: PresetId): string {
+  return [...QUADRANTS.map((q) => `${q} ${labelFor(preset, q)}`), "s skip", "e edit", "d delete", "Esc exit"].join(" · ");
+}
+
+export const TRIAGE_HINTS = triageHints(DEFAULT_PRESET);
 
 export type CardLineKind = "title" | "text" | "meta" | "hint" | "blank";
 
@@ -31,10 +38,10 @@ function ellipsize(text: string, width: number): string {
 }
 
 /** The hints wrapped between their items, so a key never leaves its label. */
-function hintLines(width: number): string[] {
+function hintLines(hints: string, width: number): string[] {
   const out: string[] = [];
   let line = "";
-  for (const item of TRIAGE_HINTS.split(" · ")) {
+  for (const item of hints.split(" · ")) {
     const next = line ? `${line} · ${item}` : item;
     if (Bun.stringWidth(next) <= width) {
       line = next;
@@ -52,9 +59,9 @@ function hintLines(width: number): string[] {
  * than `height`, never wider than `width`. When space is short the title's
  * first line goes first, then the key hints, tags and due date, the rest of
  * the title, and the description (cut with an ellipsis); blank lines last.
- * The hints sit at the bottom.
+ * The hints (`hints`, items separated by " · ") sit at the bottom.
  */
-export function cardLines(task: CardTask, width: number, height: number): CardLine[] {
+export function cardLines(task: CardTask, width: number, height: number, hints: string = TRIAGE_HINTS): CardLine[] {
   const w = Math.max(0, width);
   let room = Math.max(0, height);
   if (w === 0 || room === 0) return [];
@@ -65,7 +72,7 @@ export function cardLines(task: CardTask, width: number, height: number): CardLi
   const meta: string[] = [];
   if (task.tags.length > 0) meta.push(clip(task.tags.map((t) => `#${t}`).join(" "), w));
   if (task.dueDate) meta.push(clip(`Due ${task.dueDate}`, w));
-  const hints = hintLines(w);
+  const hintRows = hintLines(hints, w);
 
   const take = (want: number): number => {
     const n = Math.max(0, Math.min(want, room));
@@ -73,7 +80,7 @@ export function cardLines(task: CardTask, width: number, height: number): CardLi
     return n;
   };
   let nTitle = take(1);
-  const nHints = take(hints.length);
+  const nHints = take(hintRows.length);
   const nMeta = take(meta.length);
   nTitle += take(Math.min(title.length, MAX_TITLE_LINES) - 1);
   const nDesc = take(description.length);
@@ -96,6 +103,6 @@ export function cardLines(task: CardTask, width: number, height: number): CardLi
   blanks(gapBeforeMeta);
   section("meta", meta, nMeta);
   blanks(room); // pushes the hints to the bottom
-  section("hint", hints, nHints);
+  section("hint", hintRows, nHints);
   return lines;
 }

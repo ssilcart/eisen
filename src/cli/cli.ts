@@ -2,7 +2,9 @@ import { readFileSync } from "node:fs";
 import { basename } from "node:path";
 import { parseArgs } from "node:util";
 import { displayBucket, isEscalated, localToday } from "../domain/escalation.ts";
-import { bucketOf, isValidDate, QUADRANT_LABELS, QUADRANTS, type Bucket, type Quadrant, type Task } from "../domain/task.ts";
+import { loadConfig } from "../config.ts";
+import { headingFor, type PresetId } from "../domain/presets.ts";
+import { bucketOf, isValidDate, QUADRANTS, type Bucket, type Quadrant, type Task } from "../domain/task.ts";
 import { search } from "../domain/search.ts";
 import { parseTags } from "../domain/tags.ts";
 import { exportMarkdown } from "../import/export.ts";
@@ -40,6 +42,8 @@ Options:
   -v, --version   Show the version
 
 Data: $EISEN_DB, else $XDG_DATA_HOME/eisen/eisen.db, else ~/.local/share/eisen/eisen.db
+Config: $EISEN_CONFIG, else $XDG_CONFIG_HOME/eisen/config.json, else ~/.config/eisen/config.json
+  {"preset": "classic" | "priority" | "focus"} names the quadrants (press , in the matrix)
 `,
   add: `Usage: eisen add "<title>" [--q1|--q2|--q3|--q4] [--due YYYY-MM-DD]
 
@@ -117,6 +121,13 @@ function repository(io: CliIO): TaskRepository {
   return new TaskRepository(openDb(resolveDbPath(io.env)));
 }
 
+/** The quadrant preset from the config file (S21); a bad file warns on stderr. */
+function preset(io: CliIO): PresetId {
+  const { config, warning } = loadConfig(io.env);
+  if (warning) io.stderr(`eisen: ${warning}\n`);
+  return config.preset;
+}
+
 function pickQuadrant(values: Partial<Record<"q1" | "q2" | "q3" | "q4", boolean>>): Quadrant | null {
   const chosen = QUADRANTS.filter((q) => values[`q${q}`]);
   if (chosen.length > 1) throw new UsageError("Pick at most one quadrant (--q1..--q4).");
@@ -136,7 +147,7 @@ const COMMANDS: Record<"add" | "ls" | "import" | "export", (args: string[], io: 
     const quadrant = pickQuadrant(values);
     if (values.due !== undefined && !isValidDate(values.due)) throw new UsageError(`--due must be a date as YYYY-MM-DD, got "${values.due}".`);
     const task = repository(io).create({ title, quadrant, dueDate: values.due ?? null, tags: parseTags(title) });
-    io.stdout(`Added ${task.id} to ${heading(bucketOf(task))}: ${task.title}\n`);
+    io.stdout(`Added ${task.id} to ${headingFor(preset(io), bucketOf(task))}: ${task.title}\n`);
     return EXIT_OK;
   },
 
@@ -186,12 +197,13 @@ const COMMANDS: Record<"add" | "ls" | "import" | "export", (args: string[], io: 
       io.stdout(query === null ? "No tasks.\n" : `No matches for "${query}".\n`);
       return EXIT_OK;
     }
+    const labels = preset(io);
     const lines: string[] = [];
     let current: Bucket | undefined;
     for (const row of rows) {
       if (row.shownIn !== current) {
         current = row.shownIn;
-        lines.push(heading(current));
+        lines.push(headingFor(labels, current));
       }
       lines.push(`  ${row.id}  ${describe(row, row.escalated)}`);
     }
@@ -215,14 +227,10 @@ const COMMANDS: Record<"add" | "ls" | "import" | "export", (args: string[], io: 
 
   export(args, io) {
     parseArgs({ args, strict: true });
-    io.stdout(exportMarkdown(repository(io).list({ status: "all" })));
+    io.stdout(exportMarkdown(repository(io).list({ status: "all" }), preset(io)));
     return EXIT_OK;
   },
 };
-
-function heading(bucket: Bucket): string {
-  return bucket === "inbox" ? "Inbox" : `Q${bucket} · ${QUADRANT_LABELS[bucket]}`;
-}
 
 function describe(task: Task, escalated: boolean): string {
   const inText = new Set([...parseTags(task.title), ...parseTags(task.description ?? "")]);

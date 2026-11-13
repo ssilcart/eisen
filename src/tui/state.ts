@@ -1,9 +1,10 @@
 // Pure view state of the matrix TUI: key → action mapping and the reducer for
 // view-only changes. No @opentui and no bun:sqlite here; the controller in
 // app.ts runs the repository effects and reloads the panes.
+import { DEFAULT_PRESET, PRESET_IDS, type PresetId } from "../domain/presets.ts";
 import type { Quadrant } from "../domain/task.ts";
 
-export type Mode = "normal" | "add" | "confirmDelete" | "help" | "triage" | "search";
+export type Mode = "normal" | "add" | "confirmDelete" | "help" | "triage" | "search" | "settings";
 
 /** A pane: a quadrant, or the Inbox strip shown while a search is active (S19). */
 export type Focus = Quadrant | "inbox";
@@ -47,6 +48,10 @@ export interface ViewState {
    * Enter; "" means no filter.
    */
   query: string;
+  /** The quadrant labels in use (S20). */
+  preset: PresetId;
+  /** The preset under the cursor in the settings screen (S21), an index in PRESET_IDS. */
+  settingsCursor: number;
 }
 
 /**
@@ -86,9 +91,13 @@ export type Action =
   | { type: "submitSearch" }
   /** Esc: drop the filter and restore the full view. */
   | { type: "clearSearch" }
+  /** `,` opens the settings (S21); j/k move its cursor; Enter applies (the controller saves). */
+  | { type: "openSettings" }
+  | { type: "settingsMove"; dir: -1 | 1 }
+  | { type: "saveSettings" }
   | { type: "noop" };
 
-export function initialState(): ViewState {
+export function initialState(preset: PresetId = DEFAULT_PRESET): ViewState {
   return {
     focus: 1,
     selected: { 1: 0, 2: 0, 3: 0, 4: 0 },
@@ -99,6 +108,8 @@ export function initialState(): ViewState {
     quit: false,
     triage: null,
     query: "",
+    preset,
+    settingsCursor: 0,
   };
 }
 
@@ -151,6 +162,8 @@ export function keyToAction(state: ViewState, key: Key): Action {
       return triageKey(key);
     case "search":
       return searchKey(key);
+    case "settings":
+      return settingsKey(key);
     case "normal":
       return normalKey(key, searchActive(state));
   }
@@ -163,6 +176,17 @@ function searchKey(key: Key): Action {
   if (key.name === "backspace") return { type: "searchBackspace" };
   const text = printable(key);
   return text === null ? NOOP : { type: "searchInput", text };
+}
+
+/** Only the settings' own keys: nothing reaches the matrix (S21). */
+function settingsKey(key: Key): Action {
+  if (key.ctrl || key.meta) return NOOP;
+  if (key.name === "escape") return { type: "cancel" };
+  if (key.name === "return" || key.name === "enter") return { type: "saveSettings" };
+  if (key.shift) return NOOP;
+  if (key.name === "j" || key.name === "down") return { type: "settingsMove", dir: 1 };
+  if (key.name === "k" || key.name === "up") return { type: "settingsMove", dir: -1 };
+  return NOOP;
 }
 
 function triageKey(key: Key): Action {
@@ -213,6 +237,8 @@ function normalKey(key: Key, searching: boolean): Action {
       return { type: "toggleShowDone" };
     case "/":
       return { type: "search" };
+    case ",":
+      return { type: "openSettings" };
     case "1":
     case "2":
     case "3":
@@ -297,6 +323,14 @@ export function reduce(
       return s.query.trim() === "" ? endSearch(s) : { ...s, mode: "normal" };
     case "clearSearch":
       return endSearch(s);
+    case "openSettings":
+      return { ...s, mode: "settings", settingsCursor: Math.max(0, PRESET_IDS.indexOf(s.preset)) };
+    case "settingsMove": {
+      const cursor = Math.max(0, Math.min(PRESET_IDS.length - 1, s.settingsCursor + action.dir));
+      return { ...s, settingsCursor: cursor };
+    }
+    case "saveSettings":
+      return { ...s, mode: "normal", preset: PRESET_IDS[s.settingsCursor] ?? s.preset };
     case "noop":
       return { ...s, status: state.status };
     case "moveTo":

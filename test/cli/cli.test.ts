@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCli } from "../../src/cli/cli.ts";
@@ -10,7 +10,8 @@ let dir: string;
 let env: Record<string, string>;
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "eisen-cli-"));
-  env = { EISEN_DB: join(dir, "eisen.db"), HOME: dir };
+  // EISEN_CONFIG keeps the user's real config out of the tests (S21).
+  env = { EISEN_DB: join(dir, "eisen.db"), HOME: dir, EISEN_CONFIG: join(dir, "config.json") };
 });
 afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
@@ -40,7 +41,7 @@ describe("add", () => {
   test("--q2 --due", () => {
     const r = run("add", "plan", "--q2", "--due", "2026-12-01");
     expect(r.code).toBe(0);
-    expect(r.stdout).toContain("Q2 · Schedule");
+    expect(r.stdout).toContain("Q2 · 📅 Schedule");
     const [task] = JSON.parse(run("ls", "--q2", "--json").stdout);
     expect(task).toMatchObject({ title: "plan", dueDate: "2026-12-01", bucket: 2 });
   });
@@ -66,8 +67,41 @@ describe("ls", () => {
     const r = run("ls");
     expect(r.code).toBe(0);
     expect(r.stdout).toBe(
-      ["Q1 · Do", "  1  first", "Q4 · Delete", "  3  third", "Inbox", "  2  second", ""].join("\n"),
+      ["Q1 · ✅ Do", "  1  first", "Q4 · 🧹 Delete", "  3  third", "📥 Inbox", "  2  second", ""].join("\n"),
     );
+  });
+
+  test("headings follow the preset in the config file (S20, S21)", () => {
+    writeFileSync(env.EISEN_CONFIG!, '{"preset": "priority"}');
+    run("add", "first", "--q1");
+    run("add", "second");
+    run("add", "third", "--q4");
+    const r = run("ls");
+    expect(r.stderr).toBe("");
+    expect(r.stdout).toBe(
+      ["Q1 · 🔴 Urgent & Important", "  1  first", "Q4 · 🟢 Not Urgent & Unimportant", "  3  third", "📥 Inbox", "  2  second", ""].join(
+        "\n",
+      ),
+    );
+    expect(run("export").stdout).toContain("# Q4 · 🟢 Not Urgent & Unimportant");
+  });
+
+  test("the config is found under XDG_CONFIG_HOME when EISEN_CONFIG is not set", () => {
+    const { EISEN_CONFIG: _, ...rest } = env;
+    env = { ...rest, XDG_CONFIG_HOME: join(dir, "xdg") };
+    mkdirSync(join(dir, "xdg", "eisen"), { recursive: true });
+    writeFileSync(join(dir, "xdg", "eisen", "config.json"), '{"preset": "focus"}');
+    run("add", "first", "--q1");
+    expect(run("ls").stdout).toStartWith("Q1 · 🔥 Urgent\n");
+  });
+
+  test("an invalid config warns on stderr and uses the classic labels", () => {
+    writeFileSync(env.EISEN_CONFIG!, "{nope");
+    run("add", "first", "--q1");
+    const r = run("ls");
+    expect(r.code).toBe(0);
+    expect(r.stdout).toStartWith("Q1 · ✅ Do\n");
+    expect(r.stderr).toContain("invalid JSON");
   });
 
   test("escalated tasks are listed where they are shown, with a mark", () => {
@@ -103,7 +137,7 @@ describe("ls --search (S19)", () => {
   test("a typo finds the Delivra task in the Inbox, grouped like ls", () => {
     const r = run("ls", "--search", "delvira");
     expect(r.code).toBe(0);
-    expect(r.stdout).toMatch(/^Inbox\n {2}\d+ {2}en delivra montar los sigueintes features: {2}#todo\n$/);
+    expect(r.stdout).toMatch(/^📥 Inbox\n {2}\d+ {2}en delivra montar los sigueintes features: {2}#todo\n$/);
   });
 
   test("--json lists the matches best first with their score and matched fields", () => {

@@ -574,3 +574,67 @@ describe("search (S19)", () => {
     expect(focusMatches(state({ query: "x", focus: 2 }), searchPanes([], [], [], [], [])).focus).toBe(2);
   });
 });
+
+describe("settings (S21)", () => {
+  const p = panes([1, 2], [3]);
+  const esc = key("escape", { sequence: "\u001b" });
+  const enter = key("return", { sequence: "\r" });
+
+  test(", opens the settings with the cursor on the active preset", () => {
+    expect(keyToAction(initialState(), key(",", { sequence: "," }))).toEqual({ type: "openSettings" });
+    const s = press(state({ preset: "priority" }), key(",", { sequence: "," }), p);
+    expect(s.mode).toBe("settings");
+    expect(s.settingsCursor).toBe(1);
+  });
+
+  test("the default preset is classic", () => {
+    expect(initialState().preset).toBe("classic");
+    expect(initialState("focus").preset).toBe("focus");
+  });
+
+  test("j/k and arrows move the cursor, clamped to the list", () => {
+    let s = press(initialState(), key(","), p);
+    s = press(s, key("j"), p);
+    expect(s.settingsCursor).toBe(1);
+    s = press(s, key("down", { sequence: "\u001b[B" }), p);
+    expect(s.settingsCursor).toBe(2);
+    s = press(s, key("j"), p);
+    expect(s.settingsCursor).toBe(2);
+    s = press(s, key("k"), p);
+    s = press(s, key("up", { sequence: "\u001b[A" }), p);
+    s = press(s, key("k"), p);
+    expect(s.settingsCursor).toBe(0);
+  });
+
+  test("Enter applies the chosen preset and returns to the matrix", () => {
+    let s = press(initialState(), key(","), p);
+    s = press(s, key("j"), p);
+    s = press(s, key("j"), p);
+    expect(keyToAction(s, enter)).toEqual({ type: "saveSettings" });
+    s = press(s, enter, p);
+    expect(s).toMatchObject({ mode: "normal", preset: "focus" });
+  });
+
+  test("Esc cancels and keeps the preset", () => {
+    let s = press(initialState(), key(","), p);
+    s = press(s, key("j"), p);
+    s = press(s, esc, p);
+    expect(s).toMatchObject({ mode: "normal", preset: "classic" });
+  });
+
+  test("matrix keys do nothing in the settings", () => {
+    const s = press(initialState(), key(","), p);
+    for (const k of [key("q"), key("x"), key("d"), key("1"), key("a"), key("/"), key("i"), key("l"), key("h"), upper("J"), key("?"), key(".")]) {
+      expect(keyToAction(s, k)).toEqual({ type: "noop" });
+    }
+    // Ctrl+C still quits.
+    expect(keyToAction(s, key("c", { ctrl: true, sequence: "\u0003" }))).toEqual({ type: "quit" });
+  });
+
+  test("a kept search filter survives a trip to the settings", () => {
+    let s = state({ query: "zoho" });
+    s = press(s, key(","), p);
+    s = press(s, esc, p);
+    expect(s).toMatchObject({ mode: "normal", query: "zoho" });
+  });
+});

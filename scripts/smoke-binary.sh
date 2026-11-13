@@ -17,6 +17,8 @@ expected="$2"
 work="$(mktemp -d "${TMPDIR:-/tmp}/eisen-smoke.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 export EISEN_DB="$work/eisen.db"
+# A config that does not exist: the default (classic) preset, whatever the machine's config says.
+export EISEN_CONFIG="$work/config.json"
 export TERM="${TERM:-xterm-256color}"
 [ "$TERM" = "dumb" ] && export TERM=xterm-256color
 
@@ -66,7 +68,7 @@ show_log() {
   tail -c 1500 "$log" | cat -v >&2
   echo >&2
 }
-grep -a -q "Q1 · Do" "$log" || { show_log; fail "the TUI did not draw the matrix"; }
+grep -a -q "Q1 · ✅ Do" "$log" || { show_log; fail "the TUI did not draw the matrix"; }
 grep -a -q "smoke task #ci" "$log" || { show_log; fail "the TUI did not show the added task"; }
 grep -a -q "eisen-exit=0" "$log" || fail "the TUI did not exit 0: $(grep -a -o 'eisen-exit=[0-9]*' "$log" || echo 'no exit line')"
 echo "smoke: TUI drew the matrix and quit with exit 0"

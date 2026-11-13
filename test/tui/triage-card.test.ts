@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { TRIAGE_HINTS, cardLines, type CardTask } from "../../src/tui/triage-card.ts";
+import { TRIAGE_HINTS, cardLines, triageHints, type CardTask } from "../../src/tui/triage-card.ts";
 
 const task: CardTask = {
   title: "provide new meta permissions integration description for sending messages #instagram and #messenger",
@@ -24,8 +24,20 @@ describe("cardLines (S12)", () => {
     expect(lines.at(-1)).toEqual({ kind: "hint", text: TRIAGE_HINTS });
   });
 
-  test("the hints are the S12 keys", () => {
-    expect(TRIAGE_HINTS).toBe("1 Do · 2 Schedule · 3 Delegate · 4 Delete · s skip · e edit · d delete · Esc exit");
+  test("the hints are the S12 keys, with the classic labels by default", () => {
+    expect(TRIAGE_HINTS).toBe("1 ✅ Do · 2 📅 Schedule · 3 🤝 Delegate · 4 🧹 Delete · s skip · e edit · d delete · Esc exit");
+    expect(triageHints("classic")).toBe(TRIAGE_HINTS);
+  });
+
+  test("the hints follow the active preset (S20) and the card uses the ones it is given", () => {
+    const hints = triageHints("focus");
+    expect(hints).toBe("1 🔥 Urgent · 2 ⭐ Important · 3 ⚡ Needs attention · 4 🧊 Someday · s skip · e edit · d delete · Esc exit");
+    expect(cardLines(task, 120, 20, hints).at(-1)).toEqual({ kind: "hint", text: hints });
+    // Wrapped between items, never wider than the card.
+    const narrow = cardLines(task, 30, 20, triageHints("priority")).filter((l) => l.kind === "hint");
+    expect(narrow.length).toBeGreaterThan(1);
+    expect(narrow.map((l) => l.text)).toContain("1 🔴 Urgent & Important");
+    for (const line of narrow) expect(Bun.stringWidth(line.text)).toBeLessThanOrEqual(30);
   });
 
   test("long titles and descriptions wrap to the width", () => {

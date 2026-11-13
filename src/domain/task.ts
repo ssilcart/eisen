@@ -18,12 +18,7 @@ export interface Task {
   completedAt: string | null;
 }
 
-export const QUADRANT_LABELS: Record<Quadrant, string> = {
-  1: "Do",
-  2: "Schedule",
-  3: "Delegate",
-  4: "Delete",
-};
+// Quadrant labels depend on the active preset: see presets.ts (S20).
 
 export const QUADRANTS: readonly Quadrant[] = [1, 2, 3, 4];
 

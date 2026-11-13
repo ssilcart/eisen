@@ -16,7 +16,10 @@ export interface ImportWarning {
   message: string;
 }
 
-/** Headings written by `eisen export`: "# Q2 · Schedule" and "# Inbox". */
+/**
+ * Headings written by `eisen export`: "# Q2 · 📅 Schedule" (any preset's label,
+ * S20: only the `Q{n}` counts) and "# 📥 Inbox" (its slug is `inbox`).
+ */
 const QUADRANT_HEADING = /^q([1-4])\b/i;
 const HEADING = /^#{1,6}\s+(.*)$/;
 const TASK = /^\s*[-*]\s+\[([ xX])\]\s+(.*)$/;

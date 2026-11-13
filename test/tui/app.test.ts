@@ -6,10 +6,12 @@ import { tmpdir } from "node:os";
 import { TextAttributes } from "@opentui/core";
 import { createTestRenderer, type TestRendererSetup } from "@opentui/core/testing";
 import { bucketOf } from "../../src/domain/task.ts";
+import { loadConfig, saveConfig } from "../../src/config.ts";
 import { importMarkdown } from "../../src/import/importer.ts";
 import { openDb } from "../../src/store/db.ts";
 import { TaskRepository } from "../../src/store/repository.ts";
 import { createMatrixApp, spawnEditor, startTui, type AppOptions, type MatrixApp } from "../../src/tui/app.ts";
+import { BUCKET_COLOR, COLOR, paneStyle } from "../../src/tui/theme.ts";
 
 const TODAY = "2026-11-12";
 
@@ -104,15 +106,15 @@ afterEach(async () => {
 describe("matrix view (S9)", () => {
   test("shows the four panes with open counts in a 2×2 grid and the Inbox count", async () => {
     const f = await start();
-    expect(f).toContain("Q1 · Do (3)");
-    expect(f).toContain("Q2 · Schedule (1)");
-    expect(f).toContain("Q3 · Delegate (1)");
-    expect(f).toContain("Q4 · Delete (1)");
+    expect(f).toContain("Q1 · ✅ Do (3)");
+    expect(f).toContain("Q2 · 📅 Schedule (1)");
+    expect(f).toContain("Q3 · 🤝 Delegate (1)");
+    expect(f).toContain("Q4 · 🧹 Delete (1)");
     expect(f).toContain("Inbox: 2");
-    const q1 = where(f, "Q1 · Do");
-    const q2 = where(f, "Q2 · Schedule");
-    const q3 = where(f, "Q3 · Delegate");
-    const q4 = where(f, "Q4 · Delete");
+    const q1 = where(f, "Q1 · ✅ Do");
+    const q2 = where(f, "Q2 · 📅 Schedule");
+    const q3 = where(f, "Q3 · 🤝 Delegate");
+    const q4 = where(f, "Q4 · 🧹 Delete");
     expect(q1.row).toBe(q2.row);
     expect(q3.row).toBe(q4.row);
     expect(q3.row).toBeGreaterThan(q1.row);
@@ -127,7 +129,7 @@ describe("matrix view (S9)", () => {
     const row = f.split("\n").find((line) => line.includes("Renew passport"))!;
     expect(row).toContain("!");
     expect(row).toContain("2026-11-13");
-    expect(where(f, "Renew passport").col).toBeLessThan(where(f, "Q2 · Schedule").col);
+    expect(where(f, "Renew passport").col).toBeLessThan(where(f, "Q2 · 📅 Schedule").col);
   });
 
   test("long titles are truncated to the pane width", async () => {
@@ -153,12 +155,12 @@ describe("matrix view (S9)", () => {
     await start();
     setup.resize(60, 16);
     let f = await frame();
-    for (const title of ["Q1 · Do", "Q2 · Schedule", "Q3 · Delegate", "Q4 · Delete"]) expect(f).toContain(title);
+    for (const title of ["Q1 · ✅ Do", "Q2 · 📅 Schedule", "Q3 · 🤝 Delegate", "Q4 · 🧹 Delete"]) expect(f).toContain(title);
     expect(f.split("\n")[0]!.length).toBeLessThanOrEqual(60);
     setup.resize(140, 40);
     f = await frame();
-    for (const title of ["Q1 · Do", "Q2 · Schedule", "Q3 · Delegate", "Q4 · Delete"]) expect(f).toContain(title);
-    expect(where(f, "Q2 · Schedule").col).toBeGreaterThanOrEqual(70);
+    for (const title of ["Q1 · ✅ Do", "Q2 · 📅 Schedule", "Q3 · 🤝 Delegate", "Q4 · 🧹 Delete"]) expect(f).toContain(title);
+    expect(where(f, "Q2 · 📅 Schedule").col).toBeGreaterThanOrEqual(70);
   });
 
   test("a very narrow screen keeps compact pane titles with counts", async () => {
@@ -189,8 +191,8 @@ describe("keys (S10)", () => {
     await start();
     const f = await keys("2");
     expect(bucketOf(byTitle("Pay rent")!)).toBe(2);
-    expect(f).toContain("Q1 · Do (2)");
-    expect(f).toContain("Q2 · Schedule (2)");
+    expect(f).toContain("Q1 · ✅ Do (2)");
+    expect(f).toContain("Q2 · 📅 Schedule (2)");
   });
 
   test("j then 4 moves the second task", async () => {
@@ -206,11 +208,11 @@ describe("keys (S10)", () => {
     expect(byTitle("Pay rent")!.status).toBe("done");
     expect(grid(f)).not.toContain("Pay rent");
     expect(f).toContain("Done: Pay rent");
-    expect(f).toContain("Q1 · Do (2)");
+    expect(f).toContain("Q1 · ✅ Do (2)");
     f = await keys(".");
     const row = f.split("\n").find((line) => line.includes("Pay rent"))!;
     expect(row).toContain("✓");
-    expect(f).toContain("Q1 · Do (2)");
+    expect(f).toContain("Q1 · ✅ Do (2)");
   });
 
   test("d asks, n keeps the task, y deletes it", async () => {
@@ -222,7 +224,7 @@ describe("keys (S10)", () => {
     f = await keys("d", "y");
     expect(byTitle("Pay rent")).toBeUndefined();
     expect(grid(f)).not.toContain("Pay rent");
-    expect(f).toContain("Q1 · Do (2)");
+    expect(f).toContain("Q1 · ✅ Do (2)");
   });
 
   test("a + typing + Enter adds a task in the focused quadrant with #tags", async () => {
@@ -236,7 +238,7 @@ describe("keys (S10)", () => {
     const task = byTitle("Book flights #travel")!;
     expect(bucketOf(task)).toBe(2);
     expect(task.tags).toEqual(["travel"]);
-    expect(f).toContain("Q2 · Schedule (2)");
+    expect(f).toContain("Q2 · 📅 Schedule (2)");
   });
 
   test("Esc cancels the add input without creating anything", async () => {
@@ -344,7 +346,7 @@ describe("repository failures", () => {
     f = await keys("j"); // the next action reloads normally
     expect(f).not.toContain("Error:");
     expect(grid(f)).not.toContain("Pay rent");
-    expect(f).toContain("Q1 · Do (2)");
+    expect(f).toContain("Q1 · ✅ Do (2)");
     f = await keys("x");
     expect(f).toMatch(/Done: (Call the bank|Renew passport)/);
   });
@@ -542,7 +544,7 @@ describe("triage (S12) on the user's fixture", () => {
     expect(f).toContain("Inbox: 8");
     expect(f).toContain("press i to triage");
     expect(app.state.mode).toBe("normal");
-    expect(f).toContain("Q1 · Do (0)");
+    expect(f).toContain("Q1 · ✅ Do (0)");
   });
 
   test("an empty Inbox is not offered", async () => {
@@ -560,9 +562,9 @@ describe("triage (S12) on the user's fixture", () => {
     expect(f).toContain(inbox[0]!.title);
     expect(f).toContain("poder organizar los subitems");
     expect(f).toContain("#todo");
-    expect(f).toContain("1 Do · 2 Schedule · 3 Delegate · 4 Delete · s skip · e edit · d delete · Esc exit");
+    expect(f).toContain("1 ✅ Do · 2 📅 Schedule · 3 🤝 Delegate · 4 🧹 Delete · s skip · e edit · d delete · Esc exit");
     // The card replaces the grid.
-    expect(f).not.toContain("Q2 · Schedule");
+    expect(f).not.toContain("Q2 · 📅 Schedule");
   });
 
   test("2 moves the task to Q2 with a moved event and shows the next one", async () => {
@@ -576,7 +578,7 @@ describe("triage (S12) on the user's fixture", () => {
     expect(events(first.id, "moved")).toBe(1);
     expect(f).toContain("Triage 2/8");
     expect(f).toContain(inbox[1]!.title.slice(0, 40));
-    expect(f).toContain("Moved to Q2 · Schedule");
+    expect(f).toContain("Moved to Q2 · 📅 Schedule");
   });
 
   test("s skips: the task stays in the Inbox and the next one is shown", async () => {
@@ -651,8 +653,8 @@ describe("triage (S12) on the user's fixture", () => {
     expect(app.state.mode).toBe("normal");
     expect(f).toContain("Inbox triaged: 6 sorted, 2 skipped");
     expect(f).toContain("Inbox: 2");
-    expect(f).toContain("Q1 · Do (2)");
-    expect(f).toContain("Q2 · Schedule (2)");
+    expect(f).toContain("Q1 · ✅ Do (2)");
+    expect(f).toContain("Q2 · 📅 Schedule (2)");
     expect(f).not.toContain("Triage 8/8");
     // The matrix works again and nothing quit.
     expect(await settles(app.done, 20)).toBe("stuck");
@@ -666,7 +668,7 @@ describe("triage (S12) on the user's fixture", () => {
     let f = await escape();
     expect(app.state.mode).toBe("normal");
     expect(f).toContain("Triage stopped: 1 sorted, 0 skipped, 7 left in the Inbox");
-    expect(f).toContain("Q2 · Schedule (1)");
+    expect(f).toContain("Q2 · 📅 Schedule (1)");
     f = await keys("i");
     expect(f).toContain("Triage 1/7");
     f = await keys("q");
@@ -701,7 +703,7 @@ describe("triage (S12) on the user's fixture", () => {
     setup.resize(140, 40);
     f = await frame();
     expect(f).toContain("Triage 2/8");
-    expect(f).toContain("1 Do · 2 Schedule · 3 Delegate · 4 Delete · s skip · e edit · d delete · Esc exit");
+    expect(f).toContain("1 ✅ Do · 2 📅 Schedule · 3 🤝 Delegate · 4 🧹 Delete · s skip · e edit · d delete · Esc exit");
   });
 
   test("starting triage on a 30×10 screen does not throw", async () => {
@@ -804,7 +806,7 @@ describe("search (S19) on the user's fixture", () => {
     expect(f).not.toContain("Inbox (");
     f = await keys("/");
     expect(app.state.mode).toBe("search");
-    expect(f).toContain("Inbox (4)"); // the strip, unfiltered until something is typed
+    expect(f).toContain("📥 Inbox (4)"); // the strip, unfiltered until something is typed
     f = await type("rai");
     expect(statusLine(f)).toContain("/ rai");
     expect(f).toContain(META);
@@ -814,13 +816,13 @@ describe("search (S19) on the user's fixture", () => {
     expect(statusLine(f)).toContain("/ rainer");
     expect(statusLine(f)).toContain("2 matches");
     // Each pane shows matches/total; the strip lists the Inbox matches.
-    expect(f).toContain("Q1 · Do (0/1)");
-    expect(f).toContain("Q2 · Schedule (1/1)");
-    expect(f).toContain("Q3 · Delegate (0/1)");
-    expect(f).toContain("Q4 · Delete (0/1)");
-    expect(f).toContain("Inbox (1/4)");
+    expect(f).toContain("Q1 · ✅ Do (0/1)");
+    expect(f).toContain("Q2 · 📅 Schedule (1/1)");
+    expect(f).toContain("Q3 · 🤝 Delegate (0/1)");
+    expect(f).toContain("Q4 · 🧹 Delete (0/1)");
+    expect(f).toContain("📥 Inbox (1/4)");
     expect(grid(f)).toContain(META);
-    expect(where(f, CLOUDBEDS).row).toBeGreaterThan(where(f, "Q4 · Delete").row);
+    expect(where(f, CLOUDBEDS).row).toBeGreaterThan(where(f, "Q4 · 🧹 Delete").row);
     expect(grid(f)).not.toContain(VACATIONS);
     // Backspace widens it again, live.
     setup.mockInput.pressBackspace();
@@ -846,13 +848,13 @@ describe("search (S19) on the user's fixture", () => {
     await start(120, 30);
     await keys("/");
     let f = await type("delvira");
-    expect(f).toContain("Q3 · Delegate (1/1)");
+    expect(f).toContain("Q3 · 🤝 Delegate (1/1)");
     expect(grid(f)).toContain(DELIVRA);
     setup.mockInput.pressKey("u", { ctrl: true }); // ignored, not typed
     for (let i = 0; i < "delvira".length; i++) setup.mockInput.pressBackspace();
     f = await type("compañía");
     expect(grid(f)).toContain("cuando se elimina una compania");
-    expect(f).toContain("Inbox (1/4)");
+    expect(f).toContain("📥 Inbox (1/4)");
   });
 
   test("Enter keeps the filter; 2 moves the selected Inbox match and the filter re-applies after the reload", async () => {
@@ -867,9 +869,9 @@ describe("search (S19) on the user's fixture", () => {
     expect(app.state.query).toBe("cloudbeds");
     f = await keys("2");
     expect(bucketOf(find(CLOUDBEDS))).toBe(2);
-    expect(f).toContain("Moved to Q2 · Schedule");
-    expect(f).toContain("Q2 · Schedule (1/2)");
-    expect(f).toContain("Inbox (0/3)");
+    expect(f).toContain("Moved to Q2 · 📅 Schedule");
+    expect(f).toContain("Q2 · 📅 Schedule (1/2)");
+    expect(f).toContain("📥 Inbox (0/3)");
     expect(grid(f)).not.toContain(META); // still filtered
     expect(app.state.query).toBe("cloudbeds");
   });
@@ -904,7 +906,7 @@ describe("search (S19) on the user's fixture", () => {
     expect(f).toContain(`Delete "${CLOUDBEDS}"? y/n`);
     f = await keys("y");
     expect(repo.list({ status: "all" }).some((t) => t.title === CLOUDBEDS)).toBe(false);
-    expect(f).toContain("Inbox (0/3)");
+    expect(f).toContain("📥 Inbox (0/3)");
   });
 
   test("a in the focused Inbox strip adds to the Inbox, and the new match shows up there", async () => {
@@ -915,14 +917,14 @@ describe("search (S19) on the user's fixture", () => {
     await frame();
     expect(app.state.focus).toBe("inbox");
     let f = await keys("a");
-    expect(f).toContain("Add to Inbox:");
+    expect(f).toContain("Add to 📥 Inbox:");
     await type("Ask cloudbeds for keys");
     setup.mockInput.pressEnter();
     f = await frame();
     const added = repo.list({ status: "all" }).find((t) => t.title === "Ask cloudbeds for keys")!;
     expect(bucketOf(added)).toBe("inbox");
-    expect(f).toContain("Added to Inbox");
-    expect(f).toContain("Inbox (2/5)");
+    expect(f).toContain("Added to 📥 Inbox");
+    expect(f).toContain("📥 Inbox (2/5)");
   });
 
   test("Esc clears the filter and restores the view; / again edits the query, prefilled", async () => {
@@ -936,14 +938,14 @@ describe("search (S19) on the user's fixture", () => {
     expect(app.state.query).toBe("zoho");
     f = await type(" prod");
     expect(app.state.query).toBe("zoho prod");
-    expect(f).toContain("Q1 · Do (1/1)");
+    expect(f).toContain("Q1 · ✅ Do (1/1)");
     f = await escape();
     expect(app.state.mode).toBe("normal");
     expect(app.state.query).toBe("");
     expect(f).not.toContain("Inbox (");
-    expect(f).toContain("Q1 · Do (1)");
-    expect(f).toContain("Q2 · Schedule (1)");
-    expect(f).toContain("Q4 · Delete (0)");
+    expect(f).toContain("Q1 · ✅ Do (1)");
+    expect(f).toContain("Q2 · 📅 Schedule (1)");
+    expect(f).toContain("Q4 · 🧹 Delete (0)");
     expect(grid(f)).toContain(META);
     expect(grid(f)).not.toContain(API); // done and hidden again
     // Esc after Enter also clears it.
@@ -961,7 +963,7 @@ describe("search (S19) on the user's fixture", () => {
     expect(app.state.showDone).toBe(false);
     await keys("/");
     const f = await type("api calls");
-    expect(f).toContain("Q4 · Delete (1/1)");
+    expect(f).toContain("Q4 · 🧹 Delete (1/1)");
     const row = f.split("\n").find((line) => line.includes(API))!;
     expect(row).toContain("✓");
     const spans = setup.captureSpans().lines.flatMap((l) => l.spans);
@@ -974,8 +976,8 @@ describe("search (S19) on the user's fixture", () => {
     await keys("/");
     let f = await type("xyzzy");
     expect(statusLine(f)).toContain('No matches for "xyzzy"');
-    expect(f).toContain("Q1 · Do (0/1)");
-    expect(f).toContain("Inbox (0/4)");
+    expect(f).toContain("Q1 · ✅ Do (0/1)");
+    expect(f).toContain("📥 Inbox (0/4)");
     setup.mockInput.pressEnter();
     f = await frame();
     expect(statusLine(f)).toContain('No matches for "xyzzy"');
@@ -988,7 +990,7 @@ describe("search (S19) on the user's fixture", () => {
     await type("rainer");
     setup.resize(70, 18);
     let f = await frame();
-    expect(f).toContain("Inbox (1/4)");
+    expect(f).toContain("📥 Inbox (1/4)");
     expect(statusLine(f)).toContain("rainer");
     expect(f).toContain("(1/1)");
     setup.resize(30, 10);
@@ -998,7 +1000,7 @@ describe("search (S19) on the user's fixture", () => {
     setup.mockInput.pressBackspace();
     f = await frame();
     expect(app.state.query).toBe("raine");
-    expect(f).toContain("Inbox (1/4)");
+    expect(f).toContain("📥 Inbox (1/4)");
   });
 
   test("q and Ctrl+C still quit while a search is kept and every reload fails", async () => {
@@ -1053,8 +1055,8 @@ describe("search (S19) on the user's fixture", () => {
     f = await escape();
     expect(app.state.mode).toBe("normal");
     expect(app.state.query).toBe("rainer");
-    expect(f).toContain("Inbox (1/4)");
-    expect(f).toContain("Q2 · Schedule (1/1)");
+    expect(f).toContain("📥 Inbox (1/4)");
+    expect(f).toContain("Q2 · 📅 Schedule (1/1)");
   });
 });
 
@@ -1072,5 +1074,268 @@ describe("spawnEditor", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("presets and settings (S20, S21)", () => {
+  let dir: string;
+  let configEnv: Record<string, string>;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "eisen-app-config-"));
+    configEnv = { EISEN_CONFIG: join(dir, "config.json") };
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const save = (preset: "classic" | "priority" | "focus") => void saveConfig(configEnv, { preset });
+
+  async function escape(): Promise<string> {
+    setup.mockInput.pressEscape();
+    await Bun.sleep(30);
+    return frame();
+  }
+
+  test("the default titles are the classic emoji titles", async () => {
+    const f = await start();
+    for (const title of ["Q1 · ✅ Do (3)", "Q2 · 📅 Schedule (1)", "Q3 · 🤝 Delegate (1)", "Q4 · 🧹 Delete (1)"]) expect(f).toContain(title);
+  });
+
+  test("the preset option sets the titles", async () => {
+    const f = await start(100, 30, { preset: "focus" });
+    for (const title of ["Q1 · 🔥 Urgent (3)", "Q2 · ⭐ Important (1)", "Q3 · ⚡ Needs attention (1)", "Q4 · 🧊 Someday (1)"]) {
+      expect(f).toContain(title);
+    }
+  });
+
+  test(", lists the presets with their labels and marks the current one", async () => {
+    await start(100, 30);
+    const f = await keys(",");
+    expect(app.state.mode).toBe("settings");
+    expect(f).toContain("Settings");
+    expect(f).toContain("› Classic · current");
+    expect(f).toContain("Priority");
+    expect(f).toContain("Focus");
+    for (const label of ["1 🔴 Urgent & Important", "2 🟠 Not Urgent & Important", "3 ⚡ Needs attention", "4 🧊 Someday"]) {
+      expect(f).toContain(label);
+    }
+    expect(f).toContain("j/k choose · Enter save · Esc cancel");
+  });
+
+  test(", → focus → Enter saves to the config file and changes the titles at once", async () => {
+    await start(100, 30, { savePreset: save });
+    await keys(",", "j", "j");
+    expect(await frame()).toContain("› Focus");
+    setup.mockInput.pressEnter();
+    const f = await frame();
+    expect(app.state.mode).toBe("normal");
+    expect(app.state.preset).toBe("focus");
+    for (const title of ["🔥 Urgent (3)", "⭐ Important (1)", "⚡ Needs attention (1)", "🧊 Someday (1)"]) expect(f).toContain(title);
+    expect(f).not.toContain("✅ Do");
+    expect(f).not.toContain("Settings");
+    expect(readFileSync(configEnv.EISEN_CONFIG!, "utf8")).toContain('"preset": "focus"');
+    expect(loadConfig(configEnv).config.preset).toBe("focus");
+    // Messages use the new labels too.
+    expect(await keys("2")).toContain("Moved to Q2 · ⭐ Important");
+  });
+
+  test("arrows choose too", async () => {
+    await start(100, 30, { savePreset: save });
+    await keys(",");
+    setup.mockInput.pressArrow("down");
+    setup.mockInput.pressArrow("down");
+    setup.mockInput.pressArrow("up");
+    await frame();
+    setup.mockInput.pressEnter();
+    expect(await frame()).toContain("Q1 · 🔴 Urgent & Important (3)");
+  });
+
+  test("Esc cancels: nothing is saved and the titles stay", async () => {
+    let calls = 0;
+    await start(100, 30, { savePreset: () => void calls++ });
+    await keys(",", "j", "j");
+    const f = await escape();
+    expect(app.state.mode).toBe("normal");
+    expect(app.state.preset).toBe("classic");
+    expect(calls).toBe(0);
+    expect(f).toContain("Q1 · ✅ Do (3)");
+    expect(f).not.toContain("Settings");
+  });
+
+  test("keys in the settings never reach the matrix", async () => {
+    await start(100, 30, { savePreset: save });
+    await keys(",");
+    for (const k of ["x", "d", "y", "1", "4", "a", "e", "i", "/", ".", "?", "q", "l", "h"]) setup.mockInput.pressKey(k);
+    setup.mockInput.pressKey("J", { shift: true });
+    await frame();
+    expect(app.state.mode).toBe("settings");
+    expect(await settles(app.done, 50)).toBe("stuck");
+    const rent = byTitle("Pay rent")!;
+    expect(rent.status).toBe("open");
+    expect(bucketOf(rent)).toBe(1);
+    expect(repo.list({ status: "all" })).toHaveLength(8);
+    expect(app.state.focus).toBe(1);
+    expect(app.state.showDone).toBe(false);
+    expect(existsSync(configEnv.EISEN_CONFIG!)).toBe(false);
+  });
+
+  test("a failed save shows the error and keeps the previous preset", async () => {
+    await start(100, 30, {
+      savePreset: () => {
+        throw new Error("EACCES: permission denied");
+      },
+    });
+    await keys(",", "j", "j");
+    setup.mockInput.pressEnter();
+    const f = await frame();
+    expect(app.state.preset).toBe("classic");
+    expect(f).toContain("Error: EACCES: permission denied");
+    expect(f).toContain("Q1 · ✅ Do (3)");
+  });
+
+  test("the help lists , and the active preset's quadrants", async () => {
+    await start(100, 30, { preset: "focus" });
+    const f = await keys("?");
+    expect(f).toContain("Settings: quadrant names");
+    expect(f).toContain("Send to 🔥 Urgent");
+    expect(f).toContain("Send to 🧊 Someday");
+  });
+
+  test("the triage hints follow the preset", async () => {
+    await start(120, 30, { preset: "focus" });
+    const f = await keys("i");
+    expect(f).toContain("1 🔥 Urgent · 2 ⭐ Important · 3 ⚡ Needs attention · 4 🧊 Someday");
+  });
+
+  test("the add prompt names the quadrant with the preset's label", async () => {
+    await start(100, 30, { preset: "priority" });
+    expect(await keys("a")).toContain("Add to Q1 · 🔴 Urgent & Important:");
+  });
+
+  test("narrow panes still fall back to Q1 (n) with long labels", async () => {
+    await start(60, 16, { preset: "priority" });
+    const f = await frame();
+    for (const title of ["Q1 (3)", "Q2 (1)", "Q3 (1)", "Q4 (1)"]) expect(f).toContain(title);
+    expect(f).not.toContain("Urgent");
+  });
+
+  test("a config warning passed in shows in the status line at start", async () => {
+    const f = await start(120, 30, { warning: "Config: invalid JSON, using defaults (~/.config/eisen/config.json)" });
+    expect(f).toContain("Config: invalid JSON, using defaults");
+  });
+
+  test("startTui reads the preset, and shows a config warning", async () => {
+    writeFileSync(configEnv.EISEN_CONFIG!, '{"preset": "focus"}');
+    setup = await createTestRenderer({ width: 100, height: 30, exitOnCtrlC: false });
+    let run = startTui(repo, { today: () => TODAY }, { createRenderer: async () => setup.renderer, env: configEnv });
+    await Bun.sleep(20);
+    expect(await frame()).toContain("Q1 · 🔥 Urgent (3)");
+    setup.mockInput.pressKey("q");
+    await run;
+    await setup.dispose();
+
+    writeFileSync(configEnv.EISEN_CONFIG!, '{"preset": "fantasy"}');
+    setup = await createTestRenderer({ width: 120, height: 30, exitOnCtrlC: false });
+    run = startTui(repo, { today: () => TODAY }, { createRenderer: async () => setup.renderer, env: configEnv });
+    await Bun.sleep(20);
+    const f = await frame();
+    expect(f).toContain('unknown preset "fantasy"');
+    expect(f).toContain("Q1 · ✅ Do (3)");
+    setup.mockInput.pressKey("q");
+    await run;
+  });
+
+  test("startTui saves the preset picked in the settings to the config file", async () => {
+    setup = await createTestRenderer({ width: 100, height: 30, exitOnCtrlC: false });
+    const run = startTui(repo, { today: () => TODAY }, { createRenderer: async () => setup.renderer, env: configEnv });
+    await Bun.sleep(20);
+    await keys(",", "j");
+    setup.mockInput.pressEnter();
+    expect(await frame()).toContain("Q1 · 🔴 Urgent & Important (3)");
+    setup.mockInput.pressKey("q");
+    await run;
+    expect(JSON.parse(readFileSync(configEnv.EISEN_CONFIG!, "utf8"))).toEqual({ preset: "priority" });
+  });
+});
+
+describe("quadrant colours (S23)", () => {
+  // Hex of an OpenTUI RGBA.
+  const hex = (c: { toInts(): number[] }) =>
+    `#${c
+      .toInts()
+      .slice(0, 3)
+      .map((n) => n.toString(16).padStart(2, "0"))
+      .join("")}`;
+  const lower = (s: string) => s.toLowerCase();
+
+  type Span = ReturnType<TestRendererSetup["captureSpans"]>["lines"][number]["spans"][number];
+
+  // The span holding `text`, the span before it on its row, and the first span of the next row.
+  function spanOf(text: string): { span: Span; before: Span | undefined; below: Span | undefined } {
+    const { lines } = setup.captureSpans();
+    for (let row = 0; row < lines.length; row++) {
+      const spans = lines[row]!.spans;
+      const i = spans.findIndex((s) => s.text.includes(text));
+      if (i >= 0) return { span: spans[i]!, before: spans[i - 1], below: lines[row + 1]?.spans[0] };
+    }
+    throw new Error(`"${text}" not in the frame`);
+  }
+
+  const isBold = (s: Span) => (s.attributes & TextAttributes.BOLD) !== 0;
+
+  test("the focused pane's border and title are in its colour, bold; the others dim with a tinted title", async () => {
+    await start();
+    const q1 = spanOf("Q1 · ✅ Do (3)");
+    expect(hex(q1.span.fg)).toBe(lower(BUCKET_COLOR[1]));
+    expect(isBold(q1.span)).toBe(true);
+    expect(q1.before!.text).toContain("╭");
+    expect(hex(q1.before!.fg)).toBe(lower(BUCKET_COLOR[1]));
+    expect(q1.below!.text).toBe("│");
+    expect(hex(q1.below!.fg)).toBe(lower(BUCKET_COLOR[1]));
+
+    const q2 = spanOf("Q2 · 📅 Schedule (1)");
+    expect(hex(q2.span.fg)).toBe(lower(BUCKET_COLOR[2]));
+    expect(isBold(q2.span)).toBe(false);
+    expect(q2.before!.text.endsWith("╭─")).toBe(true);
+    expect(hex(q2.before!.fg)).toBe(lower(COLOR.border));
+
+    const q3 = spanOf("Q3 · 🤝 Delegate (1)");
+    expect(hex(q3.span.fg)).toBe(lower(BUCKET_COLOR[3]));
+    expect(hex(q3.before!.fg)).toBe(lower(COLOR.border));
+  });
+
+  test("the selected row is highlighted with the focused pane's colour, and the colour follows the focus", async () => {
+    await start();
+    expect(hex(spanOf("Pay rent").span.bg)).toBe(lower(paneStyle(1, true).selectBg));
+    await keys("l");
+    const q2 = spanOf("Q2 · 📅 Schedule (1)");
+    expect(isBold(q2.span)).toBe(true);
+    expect(hex(q2.before!.fg)).toBe(lower(BUCKET_COLOR[2]));
+    expect(hex(spanOf("Plan the trip").span.bg)).toBe(lower(paneStyle(2, true).selectBg));
+    const q1 = spanOf("Q1 · ✅ Do (3)");
+    expect(hex(q1.span.fg)).toBe(lower(BUCKET_COLOR[1]));
+    expect(isBold(q1.span)).toBe(false);
+    expect(hex(q1.before!.fg)).toBe(lower(COLOR.border));
+  });
+
+  test("the colours do not depend on the preset", async () => {
+    await start(100, 30, { preset: "focus" });
+    expect(hex(spanOf("Q1 · 🔥 Urgent (3)").span.fg)).toBe(lower(BUCKET_COLOR[1]));
+    expect(hex(spanOf("Q4 · 🧊 Someday (1)").span.fg)).toBe(lower(BUCKET_COLOR[4]));
+  });
+
+  test("the search Inbox strip uses the Inbox colour", async () => {
+    await start(100, 30);
+    await keys("/");
+    await setup.mockInput.typeText("idea");
+    await frame();
+    expect(app.state.focus).toBe("inbox"); // the only matches are in the Inbox
+    const strip = spanOf("📥 Inbox (2/2)");
+    expect(hex(strip.span.fg)).toBe(lower(BUCKET_COLOR.inbox));
+    expect(isBold(strip.span)).toBe(true);
+    expect(hex(strip.before!.fg)).toBe(lower(BUCKET_COLOR.inbox));
+    expect(hex(spanOf("Unsorted idea").span.bg)).toBe(lower(paneStyle("inbox", true).selectBg));
   });
 });

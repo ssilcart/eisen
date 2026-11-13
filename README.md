@@ -3,8 +3,9 @@
 Eisenhower matrix in your terminal.
 
 `eisen` is a terminal UI that sorts your tasks into the four quadrants of the
-Eisenhower matrix (Do, Schedule, Delegate, Delete), with an Inbox for tasks you
-have not triaged yet and a global search to find any task instantly.
+Eisenhower matrix (Do, Schedule, Delegate, Delete, or the names of another
+preset), with an Inbox for tasks you have not triaged yet and a global search
+to find any task instantly.
 
 > Status: v0.1 in development.
 
@@ -44,6 +45,35 @@ eisen export > backup.md       # Markdown backup, readable by `eisen import`
 Data lives in `$XDG_DATA_HOME/eisen/eisen.db` (default
 `~/.local/share/eisen/eisen.db`); set `EISEN_DB` to use another file.
 
+## Quadrant names and settings
+
+The quadrants keep their meaning (Q1 important and urgent, Q2 important, Q3
+urgent, Q4 neither); a preset only changes their names:
+
+| Preset              | Q1                     | Q2                         | Q3                       | Q4                          |
+| ------------------- | ---------------------- | -------------------------- | ------------------------ | --------------------------- |
+| `classic` (default) | ✅ Do                  | 📅 Schedule                | 🤝 Delegate              | 🧹 Delete                   |
+| `priority`          | 🔴 Urgent & Important  | 🟠 Not Urgent & Important  | 🔵 Urgent & Unimportant  | 🟢 Not Urgent & Unimportant |
+| `focus`             | 🔥 Urgent              | ⭐ Important               | ⚡ Needs attention        | 🧊 Someday                  |
+
+The Inbox is `📥 Inbox` in every preset. Each quadrant has its colour (Q1 red,
+Q2 amber, Q3 blue, Q4 green, the Inbox grey): the focused pane draws its
+border and title in it and highlights its selected task with it.
+
+Press `,` in the matrix to pick a preset (`j`/`k` choose, `Enter` saves,
+`Esc` cancels). It is saved in `$EISEN_CONFIG`, else
+`$XDG_CONFIG_HOME/eisen/config.json`, else `~/.config/eisen/config.json`:
+
+```json
+{ "preset": "focus" }
+```
+
+`eisen ls` and `eisen export` use the same names. Exports keep the
+`# Q1 · …` headings, and `eisen import` reads only the `Q1`–`Q4` part, so a
+backup written with one preset imports into the same quadrants with any other.
+A config file that cannot be read or names an unknown preset is ignored with
+a warning (the status line in the matrix, stderr in the CLI).
+
 ## Keybindings
 
 | Key            | Action                                             |
@@ -58,6 +88,7 @@ Data lives in `$XDG_DATA_HOME/eisen/eisen.db` (default
 | `/`            | Global search (quadrants, Inbox and done tasks)    |
 | `i`            | Triage the Inbox                                   |
 | `.`            | Show / hide done tasks                             |
+| `,`            | Settings: pick the quadrant names (preset)         |
 | `?`            | Help                                               |
 | `q`            | Quit                                               |
 

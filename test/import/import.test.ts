@@ -117,6 +117,33 @@ describe("export (S13)", () => {
     const repo = freshRepo();
     repo.create({ title: "inbox one" });
     repo.create({ title: "do it", quadrant: 1 });
-    expect(exportMarkdown(repo.list())).toBe("# Q1 · Do\n\n- [ ] do it\n\n# Inbox\n\n- [ ] inbox one\n");
+    expect(exportMarkdown(repo.list())).toBe("# Q1 · ✅ Do\n\n- [ ] do it\n\n# 📥 Inbox\n\n- [ ] inbox one\n");
+  });
+
+  test("headings use the active preset's labels (S20)", () => {
+    const repo = freshRepo();
+    repo.create({ title: "do it", quadrant: 1 });
+    repo.create({ title: "someday", quadrant: 4 });
+    expect(exportMarkdown(repo.list(), "focus")).toBe("# Q1 · 🔥 Urgent\n\n- [ ] do it\n\n# Q4 · 🧊 Someday\n\n- [ ] someday\n");
+  });
+
+  test("an export written with one preset imports into the same quadrants with another (S20)", () => {
+    const a = freshRepo();
+    a.create({ title: "q1", quadrant: 1 });
+    a.create({ title: "q2", quadrant: 2 });
+    a.create({ title: "q3", quadrant: 3 });
+    a.create({ title: "q4", quadrant: 4 });
+    a.create({ title: "inbox" });
+    const text = exportMarkdown(a.list(), "priority");
+    expect(text).toContain("# Q2 · 🟠 Not Urgent & Important");
+    expect(text).toContain("# 📥 Inbox");
+    // The importer reads only the Q{n} prefix, whatever the preset was.
+    const b = freshRepo();
+    const report = importMarkdown(b, text);
+    expect(report.warnings).toEqual([]);
+    const buckets = (r: TaskRepository) => Object.fromEntries(r.list().map((t) => [t.title, bucketOf(t)]));
+    expect(buckets(b)).toEqual({ q1: 1, q2: 2, q3: 3, q4: 4, inbox: "inbox" });
+    // No section tags come from the export headings.
+    expect(b.list().every((t) => t.tags.length === 0)).toBe(true);
   });
 });
