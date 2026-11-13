@@ -17,7 +17,10 @@
 // off screen (S19). Above it the preview panel (S25, preview.ts) shows the
 // selected task, toggled with `p` and scrolled with ctrl+d / ctrl+u; it is
 // never focused. Rows start with a bullet in the pane's colour (S28).
-// The view toggles are saved through `saveView` (S29).
+// The view toggles are saved through `saveView` (S29). The editor `a`/`e`
+// open follows `editor` (S32): `auto` ($VISUAL/$EDITOR/vi) or `command`
+// (editor.command), floating or full screen per `display`, or `form`, the
+// native form of form-box.ts in the same floating box.
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -40,12 +43,22 @@ import {
 import { displayBucket, isEscalated, localToday, DEFAULT_URGENT_WITHIN_DAYS } from "../domain/escalation.ts";
 import { prepareSearch, search, type SearchIndex } from "../domain/search.ts";
 import { parseTags } from "../domain/tags.ts";
-import { loadConfig, loadSettings, saveConfig, saveSettings, type ViewSettings } from "../config.ts";
+import {
+  DEFAULT_SETTINGS,
+  loadConfig,
+  loadSettings,
+  saveConfig,
+  saveSettings,
+  type EditorSettings,
+  type ViewSettings,
+} from "../config.ts";
 import { getPreset, headingFor, labelFor, type PresetId } from "../domain/presets.ts";
 import { QUADRANTS, bucketOf, type Bucket, type Quadrant, type Task } from "../domain/task.ts";
 import type { TaskRepository } from "../store/repository.ts";
 import { NEW_TASK_FILE, editChanges, editorCommand, parseNewTask, parseTaskFile, serializeTask } from "./edit-file.ts";
 import { spawnEditorPty, type EditorPty, type LaunchEditorPty } from "./editor-pty.ts";
+import { editorCommandFor, formValues } from "./edit-form.ts";
+import { FORM_HINT, createFormBox, type FormBox, type FormResult } from "./form-box.ts";
 import {
   SIDEBAR_MIN_COLUMNS,
   editorBox,
@@ -87,8 +100,9 @@ export interface AppOptions {
   urgentWithinDays?: number;
   /**
    * The full-screen editor (S11, the S22 fallback): runs the editor on `path`
-   * with the terminal and resolves with its exit code. Default: `spawnEditor`
-   * ($VISUAL, $EDITOR or vi).
+   * with the terminal and resolves with its exit code. Default: the editor
+   * command of `editor` (S32: $VISUAL, $EDITOR or vi for auto, editor.command
+   * for command) with the terminal's stdio.
    */
   runEditor?: (path: string) => Promise<number>;
   /**
@@ -130,6 +144,11 @@ export interface AppOptions {
    * Default: applied for this session only.
    */
   saveView?: (patch: Partial<ViewSettings>) => void;
+  /**
+   * Which editor `a` and `e` open (S32). Default: auto, floating (S22).
+   * EISEN_EDITOR_MODE=fullscreen in `env` still wins over `display`.
+   */
+  editor?: EditorSettings;
 }
 
 const SIDEBAR_HIDDEN = `Sidebar hidden: needs ${SIDEBAR_MIN_COLUMNS} columns`;
@@ -142,6 +161,13 @@ export interface MatrixApp {
   idle(): Promise<void>;
   /** Reload tasks from the repository and redraw. */
   refresh(): void;
+  /** The editor settings in use (S32). */
+  readonly editor: EditorSettings;
+  /**
+   * Switches the editor for the next `a`/`e` (S32, for the settings screen,
+   * S33); an editor already open keeps running. Does not save anything.
+   */
+  setEditor(editor: EditorSettings): void;
   /** Detach listeners and remove the view from the renderer. */
   destroy(): void;
 }
@@ -331,7 +357,10 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
   const today = options.today ?? (() => localToday());
   const within = options.urgentWithinDays ?? DEFAULT_URGENT_WITHIN_DAYS;
   const env = options.env ?? process.env;
-  const runEditor = options.runEditor ?? ((path: string) => spawnEditor(path, env));
+  /** S32: auto / command / form, and floating / full screen; `setEditor` changes it. */
+  let editorSettings: EditorSettings = { ...(options.editor ?? DEFAULT_SETTINGS.editor) };
+  const runEditor =
+    options.runEditor ?? ((path: string) => spawnEditorCommand(editorCommandFor(editorSettings, env), path));
   const launchEditorPty: LaunchEditorPty =
     options.launchEditorPty ?? ((cmd, path, cols, rows) => spawnEditorPty(cmd, path, cols, rows, env));
   const savePreset = options.savePreset ?? (() => {});
@@ -340,6 +369,8 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
   let editing: Promise<void> | null = null;
   /** The floating editor while it is open (S22): every key goes to it. */
   let floating: FloatingEditor | null = null;
+  /** The native form while it is open (S32): every key goes to it. */
+  let form: FormBox | null = null;
   let destroyed = false;
 
   let state = initialState(options.preset, {
@@ -701,6 +732,13 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
 
   /** The floating editor follows the screen (S22): its box, the embedded terminal and the PTY. */
   function layoutEditor(): void {
+    if (form) {
+      // S32: the same box as the floating editor; under its minimum size
+      // editorBox clamps it to the whole area above the status line.
+      const rect = editorBox(renderer.width, renderer.height);
+      form.layout(rect);
+      form.box.title = editorTitle(form.title, rect.width);
+    }
     const f = floating;
     if (!f) return;
     const rect = editorBox(renderer.width, renderer.height);
@@ -961,6 +999,12 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
   }
 
   function statusContent(width: number): StyledText {
+    if (form) {
+      const msg = form.message;
+      const name = fg(form.color)(bold(" Form"));
+      if (msg) return line(width, [name, (msg.kind === "error" ? fg(COLOR.escalated) : fg(COLOR.due))(`  │ ${msg.text}`)]);
+      return line(width, [name, fg(COLOR.muted)(`  │ ${FORM_HINT}`)]);
+    }
     if (floating) {
       return line(width, [
         fg(floating.color)(bold(` ${floating.name}`)),
@@ -1061,7 +1105,8 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
       // The editor owns the keys from here; the session redraws when it is over.
       state = next;
       const target: EditTarget = action.type === "newTask" ? { kind: "new", focus: addTarget(before) } : { kind: "edit", id: id! };
-      editing = editorSession(target).finally(() => (editing = null));
+      const session = editorSettings.mode === "form" ? formSession(target) : editorSession(target);
+      editing = session.finally(() => (editing = null));
       return;
     }
     if (action.type === "submitCommand") {
@@ -1273,6 +1318,64 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
       if (path !== null) removeQuietly(path);
     }
     if (destroyed) return;
+    endSession(message, followId);
+  }
+
+  /**
+   * S32: the native form instead of an editor. Same results as the file
+   * path: `a` creates the task (one `created` event; an empty title is
+   * Cancelled), `e` saves only what changed (`editChanges`: one `edited`
+   * event, none when nothing changed). Never rejects.
+   */
+  async function formSession(target: EditTarget): Promise<void> {
+    let message: string;
+    let followId = target.kind === "edit" ? target.id : null;
+    const newIn = target.kind === "new" ? target.focus : null;
+    try {
+      const task = target.kind === "edit" ? repo.get(target.id) : null;
+      if (target.kind === "edit" && !task) throw new Error(`Task ${target.id} not found`);
+      const bucket = task ? displayBucket(task, currentDay, within) : (newIn ?? "inbox");
+      const title = task ? `Edit · ${task.title}` : `New task · ${labelFor(state.preset, bucket)}`;
+      const result = await runForm(title, BUCKET_COLOR[bucket], task);
+      if (destroyed) return;
+      if (result === null) message = "Cancelled";
+      else if (task) {
+        const changes = editChanges(task, result);
+        if (changes === null) message = "No changes";
+        else {
+          repo.update(task.id, changes);
+          message = "Saved";
+        }
+      } else {
+        const focus = newIn ?? "inbox";
+        const { title: name, dueDate, description, tags } = result;
+        const created = repo.create({ title: name, description, dueDate, tags, quadrant: focus === "inbox" ? null : focus });
+        message = `Added to ${focusLabel(state.preset, focus)}`;
+        followId = created.id;
+      }
+    } catch (error) {
+      message = errorMessage(error);
+    }
+    if (destroyed) return;
+    endSession(message, followId);
+  }
+
+  /** Opens the form over the matrix (S32) and resolves with what it saves, or null. */
+  async function runForm(title: string, color: string, task: Task | null): Promise<FormResult> {
+    const session = createFormBox(renderer, { title, color, initial: formValues(task), isNew: task === null });
+    try {
+      container.add(session.box);
+      form = session;
+      draw();
+      return await session.result;
+    } finally {
+      if (form === session) form = null;
+      session.destroy();
+    }
+  }
+
+  /** After an editor or the form: the result in the status line, the task selected. */
+  function endSession(message: string, followId: number | null): void {
     const next = reload({ ...state, status: message });
     state = followId === null ? clamp(next, items()) : follow(next, items(), followId);
     try {
@@ -1288,7 +1391,11 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
    * otherwise full screen. Resolves with the editor's exit code.
    */
   async function runInEditor(path: string, title: string, color: string): Promise<number> {
-    const wanted = env.EISEN_EDITOR_MODE !== "fullscreen" && editorFits(renderer.width, renderer.height);
+    // S32: the environment wins over editor.display (S29).
+    const wanted =
+      env.EISEN_EDITOR_MODE !== "fullscreen" &&
+      editorSettings.display !== "fullscreen" &&
+      editorFits(renderer.width, renderer.height);
     const session = wanted ? openFloating(path, title, color) : null;
     if (session) {
       try {
@@ -1317,6 +1424,7 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     let box: BoxRenderable | null = null;
     let term: EmbeddedTerminalRenderable;
     let pty: EditorPty;
+    const cmd = editorCommandFor(editorSettings, env);
     // Keys and the box's replies to terminal queries go to the editor once it runs.
     let toEditor: ((data: Uint8Array) => void) | null = null;
     try {
@@ -1340,12 +1448,11 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
         onData: (data) => toEditor?.(data),
       });
       box.add(term);
-      pty = launchEditorPty(editorCommand(env), path, cols, rows);
+      pty = launchEditorPty(cmd, path, cols, rows);
     } catch {
       box?.destroyRecursively();
       return null;
     }
-    const cmd = editorCommand(env);
     const session: FloatingEditor = {
       box,
       term,
@@ -1414,6 +1521,19 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
 
   function onKey(key: KeyEvent): void {
     if (key.eventType === "release") return;
+    // S32: while the form is open every key is the form's. Preventing the
+    // default keeps the focused field's own handler out (L11): the form
+    // hands the key to it, so it is typed once.
+    if (form) {
+      key.preventDefault();
+      form.handleKey(key);
+      try {
+        draw();
+      } catch {
+        // The next key redraws.
+      }
+      return;
+    }
     // S22: while the floating editor is open every key is the editor's, q and Ctrl+C included.
     if (floating) {
       floating.term.handleKeyPress(key);
@@ -1476,9 +1596,20 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
       state = clamp(syncTriage(state, inbox), items());
       draw();
     },
+    get editor() {
+      return { ...editorSettings };
+    },
+    setEditor(editor: EditorSettings) {
+      editorSettings = { ...editor };
+    },
     destroy() {
       if (destroyed) return;
       destroyed = true;
+      // Quitting with the form open cancels it; its session ends without saving.
+      if (form) {
+        form.destroy();
+        form = null;
+      }
       // Quitting with the editor open ends it; its session deletes the temp file.
       if (floating) {
         try {
@@ -1591,7 +1722,12 @@ function errorMessage(error: unknown): string {
  * stdio, and resolves with its exit code.
  */
 export async function spawnEditor(path: string, env: Record<string, string | undefined> = process.env): Promise<number> {
-  const proc = Bun.spawn([...editorCommand(env), path], { stdin: "inherit", stdout: "inherit", stderr: "inherit" });
+  return spawnEditorCommand(editorCommand(env), path);
+}
+
+/** Runs `cmd` on `path` with the terminal's stdio (S11, S32) and resolves with its exit code. */
+export async function spawnEditorCommand(cmd: readonly string[], path: string): Promise<number> {
+  const proc = Bun.spawn([...cmd, path], { stdin: "inherit", stdout: "inherit", stderr: "inherit" });
   return await proc.exited;
 }
 
@@ -1618,13 +1754,15 @@ export async function startTui(repo: TaskRepository, options: AppOptions = {}, d
   options = {
     preset: config.preset,
     warning,
-    warnings: loaded.warnings.filter((w) => w.startsWith("Config: keys") || w.startsWith("Config: view")),
+    warnings: loaded.warnings.filter((w) => ["Config: keys", "Config: view", "Config: editor"].some((p) => w.startsWith(p))),
     keys: loaded.settings.keys,
     savePreset: (preset) => void saveConfig(env, { preset }),
     // S29: the view toggles start from the file (defaults: done panel off,
     // bullets on) and each toggle saves only its own field.
     view: loaded.settings.view,
     saveView: (patch) => void saveSettings(env, { view: patch }),
+    // S32: which editor `a`/`e` open; EISEN_EDITOR_MODE in `env` still wins over its display.
+    editor: loaded.settings.editor,
     // $EDITOR and EISEN_EDITOR_MODE (S22) come from the same environment.
     env,
     ...options,

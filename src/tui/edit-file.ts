@@ -57,7 +57,8 @@ export function parseTaskFile(text: string): ParseResult {
   return { ok: true, value: { title, dueDate, description: description || null } };
 }
 
-const textTags = (title: string, description: string | null): string[] => parseTags(`${title}\n${description ?? ""}`);
+/** The `#tags` of a title and a description, as the file format reads them (also the form's, S32). */
+export const textTags = (title: string, description: string | null): string[] => parseTags(`${title}\n${description ?? ""}`);
 
 /** The file `a` opens (S22): the edit format with an empty title and an empty `due:` line. */
 export const NEW_TASK_FILE = "# \ndue: \n\n";

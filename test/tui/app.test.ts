@@ -3028,3 +3028,510 @@ describe("command line (S31)", () => {
     expect(app.state.mode).toBe("command");
   });
 });
+
+describe("editor modes (S32)", () => {
+  const FORM: AppOptions = { editor: { mode: "form", command: "nvim", display: "floating" } };
+
+  function events(taskId: number, type: string): number {
+    const row = db.query("SELECT COUNT(*) AS n FROM events WHERE type = $type AND task_id = $id").get({ id: taskId, type }) as {
+      n: number;
+    };
+    return row.n;
+  }
+
+  const hex = (c: { toInts(): number[] }) =>
+    `#${c
+      .toInts()
+      .slice(0, 3)
+      .map((n) => n.toString(16).padStart(2, "0"))
+      .join("")}`;
+
+  function spanWith(text: string) {
+    for (const line of setup.captureSpans().lines) {
+      const span = line.spans.find((s) => s.text.includes(text));
+      if (span) return span;
+    }
+    throw new Error(`"${text}" not in the frame`);
+  }
+
+  // Types `text` one key at a time (each character is one keypress).
+  async function type(text: string): Promise<string> {
+    for (const ch of text) setup.mockInput.pressKey(ch);
+    return frame();
+  }
+
+  async function tab(shift = false): Promise<string> {
+    setup.mockInput.pressTab(shift ? { shift: true } : undefined);
+    return frame();
+  }
+
+  async function enter(): Promise<string> {
+    setup.mockInput.pressEnter();
+    return frame();
+  }
+
+  async function escape(): Promise<string> {
+    setup.mockInput.pressEscape();
+    await Bun.sleep(30); // L11: an Escape followed at once by a key merges
+    return frame();
+  }
+
+  // Ctrl+S, then waits for the form's session to settle when it closes.
+  async function save(): Promise<string> {
+    setup.mockInput.pressKey("s", { ctrl: true });
+    await settles(app.idle(), 200);
+    return frame();
+  }
+
+  test("form: a in Q2 opens the form titled in Q2's colour; title, due and a two-line description create one task with its #tags", async () => {
+    await start(100, 30, FORM);
+    const before = repo.list({ status: "all" }).length;
+    let f = await keys("l", "a");
+    expect(f).toContain("New task · 📅 Schedule");
+    expect(hex(spanWith("New task · 📅 Schedule").fg)).toBe(BUCKET_COLOR[2].toLowerCase());
+    // Centred like the floating editor: the box's top row is 4 at 100 x 30.
+    expect(where(f, "New task · 📅 Schedule").row).toBe(4);
+    expect(f).toContain("Title");
+    expect(f).toContain("Due");
+    expect(f).toContain("Description");
+    expect(statusOf(f)).toContain("Ctrl+S save");
+    await type("Book flights #travel");
+    await enter(); // Enter in Title: next field
+    await type("2026-12-01");
+    await enter(); // Enter in Due: next field
+    await type("Window seat #cheap");
+    await enter(); // Enter in Description: a newline
+    f = await type("Aisle if not");
+    expect(f).toContain("Book flights #travel");
+    expect(f).toContain("2026-12-01");
+    expect(f).toContain("Aisle if not");
+    f = await save();
+    const task = byTitle("Book flights #travel")!;
+    expect(task).toBeDefined();
+    expect(bucketOf(task)).toBe(2);
+    expect(task.dueDate).toBe("2026-12-01");
+    expect(task.description).toBe("Window seat #cheap\nAisle if not");
+    expect(task.tags).toEqual(["travel", "cheap"]);
+    expect(events(task.id, "created")).toBe(1);
+    expect(repo.list({ status: "all" })).toHaveLength(before + 1);
+    expect(f).not.toContain("New task ·");
+    expect(statusOf(f)).toContain("Added to Q2 · 📅 Schedule");
+    expect(app.state.focus).toBe(2);
+    expect(app.state.selected[2]).toBe(1);
+  });
+
+  test("form: a with the Inbox strip focused creates in the Inbox", async () => {
+    await start(100, 30, FORM);
+    await keys("j", "j", "j", "j");
+    expect(app.state.focus).toBe("inbox");
+    const f = await keys("a");
+    expect(f).toContain("New task · 📥 Inbox");
+    await type("Call the plumber");
+    await save();
+    expect(bucketOf(byTitle("Call the plumber")!)).toBe("inbox");
+  });
+
+  test("form: e shows the task; changing only the description saves it as exactly one edited event", async () => {
+    const payRent = byTitle("Pay rent")!;
+    repo.update(payRent.id, { description: "Before the 5th", tags: ["todo"] });
+    const editsBefore = events(payRent.id, "edited");
+    await start(100, 30, FORM);
+    let f = await keys("e");
+    expect(f).toContain("Edit · Pay rent");
+    expect(hex(spanWith("Edit · Pay rent").fg)).toBe(BUCKET_COLOR[1].toLowerCase());
+    expect(f).toContain("Before the 5th");
+    await tab();
+    await tab();
+    await type(" or the 6th");
+    f = await save();
+    const task = repo.get(payRent.id)!;
+    expect(task.description).toBe("Before the 5th or the 6th");
+    expect(task.title).toBe("Pay rent");
+    expect(task.dueDate).toBeNull();
+    expect(task.tags).toEqual(["todo"]);
+    expect(events(payRent.id, "edited")).toBe(editsBefore + 1);
+    expect(statusOf(f)).toContain("Saved");
+    expect(f).not.toContain("Edit · Pay rent");
+  });
+
+  test("form: e then Ctrl+S with nothing changed says No changes and writes no event", async () => {
+    const id = byTitle("Pay rent")!.id;
+    await start(100, 30, FORM);
+    await keys("e");
+    const f = await save();
+    expect(statusOf(f)).toContain("No changes");
+    expect(events(id, "edited")).toBe(0);
+  });
+
+  test("form: e can clear the due date and adds the description's #tags", async () => {
+    const id = byTitle("Renew passport")!.id;
+    await start(100, 30, FORM);
+    // Renew passport is escalated into Q1 (S7), under Pay rent and Call the bank.
+    await keys("j", "j");
+    let f = await keys("e");
+    expect(f).toContain("Edit · Renew passport");
+    expect(f).toContain("2026-11-13");
+    await tab();
+    for (let i = 0; i < 10; i++) setup.mockInput.pressBackspace();
+    await tab();
+    await type("Photos first #admin");
+    f = await save();
+    const task = repo.get(id)!;
+    expect(task.dueDate).toBeNull();
+    expect(task.description).toBe("Photos first #admin");
+    expect(task.tags).toEqual(["admin"]);
+    expect(events(id, "edited")).toBe(1);
+  });
+
+  test("form: an invalid due shows an inline error and saves nothing; fixing it saves", async () => {
+    await start(100, 30, FORM);
+    const before = repo.list({ status: "all" }).length;
+    await keys("a");
+    await type("Buy milk");
+    await tab();
+    await type("2026-13-45");
+    let f = await save();
+    expect(f).toContain('Invalid due date "2026-13-45"');
+    expect(f).toContain("New task · ✅ Do"); // still open
+    expect(repo.list({ status: "all" })).toHaveLength(before);
+    for (let i = 0; i < 10; i++) setup.mockInput.pressBackspace(); // the focus is on Due
+    await type("2026-12-24");
+    f = await save();
+    expect(byTitle("Buy milk")!.dueDate).toBe("2026-12-24");
+    expect(f).not.toContain("Invalid due date");
+    expect(repo.list({ status: "all" })).toHaveLength(before + 1);
+  });
+
+  test("form: an empty title on a new task is Cancelled; on an edit it is an inline error", async () => {
+    await start(100, 30, FORM);
+    const before = repo.list({ status: "all" }).length;
+    await keys("a");
+    await tab();
+    await tab();
+    await type("only a description");
+    let f = await save();
+    expect(statusOf(f)).toContain("Cancelled");
+    expect(f).not.toContain("New task ·");
+    expect(repo.list({ status: "all" })).toHaveLength(before);
+
+    const id = byTitle("Pay rent")!.id;
+    await keys("e");
+    for (let i = 0; i < 8; i++) setup.mockInput.pressBackspace();
+    f = await save();
+    expect(f).toContain("Empty title");
+    expect(f).toContain("Edit · Pay rent");
+    expect(repo.get(id)!.title).toBe("Pay rent");
+    await escape();
+    await escape();
+    await settles(app.idle(), 200);
+    expect(events(id, "edited")).toBe(0);
+    expect(await frame()).not.toContain("Edit · Pay rent");
+  });
+
+  test("form: Esc with nothing changed closes at once; with changes it asks once and the second Esc discards", async () => {
+    await start(100, 30, FORM);
+    const before = repo.list({ status: "all" }).length;
+    await keys("a");
+    await escape();
+    await settles(app.idle(), 200);
+    let f = await frame();
+    expect(f).not.toContain("New task ·");
+    expect(statusOf(f)).toContain("Cancelled");
+
+    await keys("a");
+    await type("x");
+    f = await escape();
+    expect(f).toContain("Discard changes? Esc again");
+    expect(f).toContain("New task ·");
+    // Any other key carries on editing and drops the question.
+    f = await type("y");
+    expect(f).not.toContain("Discard changes?");
+    expect(f).toContain("xy");
+    f = await escape();
+    expect(f).toContain("Discard changes? Esc again");
+    await escape();
+    await settles(app.idle(), 200);
+    f = await frame();
+    expect(f).not.toContain("New task ·");
+    expect(statusOf(f)).toContain("Cancelled");
+    expect(repo.list({ status: "all" })).toHaveLength(before);
+    // Back on the matrix: keys act on it again.
+    await keys("x");
+    expect(byTitle("Pay rent")!.status).toBe("done");
+  });
+
+  test("form: Esc on an edit with nothing changed closes without an event", async () => {
+    const id = byTitle("Pay rent")!.id;
+    await start(100, 30, FORM);
+    await keys("e");
+    await escape();
+    await settles(app.idle(), 200);
+    const f = await frame();
+    expect(f).not.toContain("Edit · Pay rent");
+    expect(events(id, "edited")).toBe(0);
+  });
+
+  test("form: matrix keys typed into the title only type, once each; q, Ctrl+C and Enter never reach the matrix", async () => {
+    await start(100, 30, FORM);
+    await keys("a");
+    await type("xdq1j?:,/iAe.p");
+    setup.mockInput.pressKey("c", { ctrl: true });
+    let f = await frame();
+    expect(f).toContain("xdq1j?:,/iAe.p");
+    expect(f).not.toContain("xxdd");
+    expect(app.state.mode).toBe("normal");
+    expect(app.state.selected[1]).toBe(0);
+    expect(byTitle("Pay rent")!.status).toBe("open");
+    expect(bucketOf(byTitle("Pay rent")!)).toBe(1);
+    expect(await settles(app.done, 50)).toBe("stuck");
+    f = await save();
+    const task = byTitle("xdq1j?:,/iAe.p")!;
+    expect(task).toBeDefined();
+    expect(bucketOf(task)).toBe(1);
+    expect(repo.list({ status: "all" })).toHaveLength(9);
+  });
+
+  test("form: Tab and Shift+Tab move between the fields and wrap", async () => {
+    await start(100, 30, FORM);
+    await keys("a");
+    await type("T");
+    await tab();
+    await type("2026-01-02");
+    await tab(true); // back to Title
+    await type("X");
+    await tab();
+    await tab(); // Description
+    await type("d");
+    await tab(); // wraps to Title
+    await type("Y");
+    await tab(true); // wraps back to Description
+    await type("e");
+    await save();
+    const task = byTitle("TXY")!;
+    expect(task).toBeDefined();
+    expect(task.dueDate).toBe("2026-01-02");
+    expect(task.description).toBe("de");
+  });
+
+  test("form: a resize re-lays the box; down to 30 x 10 it still takes keys and saves", async () => {
+    await start(100, 30, FORM);
+    await keys("a");
+    setup.resize(120, 40);
+    let f = await frame();
+    expect(where(f, "New task · ✅ Do").row).toBe(6);
+    setup.resize(30, 10);
+    f = await frame();
+    expect(f).toContain("New task");
+    await type("Tiny");
+    setup.resize(100, 30);
+    f = await frame();
+    expect(where(f, "New task · ✅ Do").row).toBe(4);
+    expect(f).toContain("Tiny");
+    await save();
+    expect(bucketOf(byTitle("Tiny")!)).toBe(1);
+  });
+
+  test("form: under 40 x 12 the form fills the screen above the status line instead of the full-screen editor", async () => {
+    let runs = 0;
+    await start(36, 11, {
+      ...FORM,
+      runEditor: async () => {
+        runs++;
+        return 0;
+      },
+    });
+    const f = await keys("a");
+    expect(f).toContain("New task");
+    expect(where(f, "New task").row).toBe(0);
+    await type("Small");
+    await save();
+    expect(runs).toBe(0);
+    expect(byTitle("Small")).toBeDefined();
+  });
+
+  test("form: e on the triage card edits it and returns to the same card", async () => {
+    await start(120, 30, FORM);
+    await keys("i");
+    expect(app.state.mode).toBe("triage");
+    const id = app.state.triage!.queue[0]!;
+    const title = repo.get(id)!.title;
+    let f = await keys("e");
+    expect(f).toContain(`Edit · ${title}`);
+    await tab();
+    await tab();
+    await type("Needs a plan #later");
+    f = await save();
+    const task = repo.get(id)!;
+    expect(task.description).toBe("Needs a plan #later");
+    expect(task.tags).toEqual(["later"]);
+    expect(events(id, "edited")).toBe(1);
+    expect(bucketOf(task)).toBe("inbox");
+    expect(app.state.mode).toBe("triage");
+    expect(app.state.triage!.queue[app.state.triage!.index]).toBe(id);
+    expect(f).toContain("Needs a plan #later");
+    expect(statusOf(f)).toContain("Saved");
+  });
+
+  test("form: A and :add stay one-line quick adds", async () => {
+    await start(100, 30, FORM);
+    let f = await keys("A");
+    expect(app.state.mode).toBe("add");
+    expect(f).not.toContain("New task ·");
+    await type("Quick one");
+    await enter();
+    expect(bucketOf(byTitle("Quick one")!)).toBe(1);
+    await type(":add Another quick");
+    f = await enter();
+    expect(f).not.toContain("New task ·");
+    expect(byTitle("Another quick")).toBeDefined();
+  });
+
+  test("command mode launches editor.command in the floating PTY, whatever $VISUAL says", async () => {
+    const { launch, ptys } = fakeLauncher();
+    await start(100, 30, {
+      launchEditorPty: launch,
+      env: { VISUAL: "vim", EDITOR: "vi" },
+      editor: { mode: "command", command: "nano", display: "floating" },
+    });
+    await keys("a");
+    await Bun.sleep(10);
+    const f = await frame();
+    expect(ptys).toHaveLength(1);
+    expect(ptys[0]!.cmd).toEqual(["nano"]);
+    expect(basename(ptys[0]!.path)).toMatch(/^eisen-new-.+\.md$/);
+    expect(f).toContain("New task · ✅ Do");
+    expect(statusOf(f)).toContain("nano");
+    await Bun.write(ptys[0]!.path, "# Written in nano\n");
+    ptys[0]!.exit(0);
+    await app.idle();
+    expect(bucketOf(byTitle("Written in nano")!)).toBe(1);
+  });
+
+  test("command mode splits editor.command on whitespace", async () => {
+    const { launch, ptys } = fakeLauncher(writes("# Split\n"));
+    await start(100, 30, { launchEditorPty: launch, editor: { mode: "command", command: "nvim -u NONE", display: "floating" } });
+    setup.mockInput.pressKey("a");
+    await app.idle();
+    expect(ptys[0]!.cmd).toEqual(["nvim", "-u", "NONE"]);
+    expect(byTitle("Split")).toBeDefined();
+  });
+
+  test("display fullscreen uses the full-screen editor for auto and command", async () => {
+    for (const mode of ["auto", "command"] as const) {
+      const { launch, ptys } = fakeLauncher();
+      let runs = 0;
+      await start(100, 30, {
+        launchEditorPty: launch,
+        editor: { mode, command: "nano", display: "fullscreen" },
+        runEditor: async (path) => {
+          runs++;
+          await Bun.write(path, `# Full ${mode}\n`);
+          return 0;
+        },
+      });
+      setup.renderer.suspend = async () => {};
+      setup.renderer.resume = async () => {};
+      setup.mockInput.pressKey("a");
+      await app.idle();
+      expect(ptys).toHaveLength(0);
+      expect(runs).toBe(1);
+      expect(byTitle(`Full ${mode}`)).toBeDefined();
+      app.destroy();
+      await setup.dispose();
+    }
+  });
+
+  test("EISEN_EDITOR_MODE=fullscreen overrides display floating", async () => {
+    const { launch, ptys } = fakeLauncher();
+    let runs = 0;
+    await start(100, 30, {
+      launchEditorPty: launch,
+      env: { EISEN_EDITOR_MODE: "fullscreen" },
+      editor: { mode: "command", command: "nano", display: "floating" },
+      runEditor: async (path) => {
+        runs++;
+        await Bun.write(path, "# Env wins\n");
+        return 0;
+      },
+    });
+    setup.renderer.suspend = async () => {};
+    setup.renderer.resume = async () => {};
+    setup.mockInput.pressKey("a");
+    await app.idle();
+    expect(ptys).toHaveLength(0);
+    expect(runs).toBe(1);
+    expect(byTitle("Env wins")).toBeDefined();
+  });
+
+  test("the default full-screen editor in command mode runs editor.command on the file", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "eisen-cmd-"));
+    try {
+      const script = join(dir, "editor.sh");
+      // Called as `editor.sh marker <file>`: writes a title naming its first argument.
+      writeFileSync(script, '#!/bin/sh\nprintf "# From the command %s\\n" "$1" > "$2"\nexit 0\n');
+      chmodSync(script, 0o755);
+      setup = await createTestRenderer({ width: 100, height: 30, exitOnCtrlC: false });
+      app = createMatrixApp(setup.renderer, repo, {
+        today: () => TODAY,
+        env: { VISUAL: "false" },
+        editor: { mode: "command", command: `${script} marker`, display: "fullscreen" },
+      });
+      setup.renderer.suspend = async () => {};
+      setup.renderer.resume = async () => {};
+      setup.mockInput.pressKey("a");
+      expect(await settles(app.idle(), 5000)).toBe("done");
+      expect(byTitle("From the command marker")).toBeDefined();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("setEditor changes the editor at runtime (for the settings screen)", async () => {
+    const { launch, ptys } = fakeLauncher();
+    await start(100, 30, { launchEditorPty: launch });
+    expect(app.editor).toEqual({ mode: "auto", command: "nvim", display: "floating" });
+    app.setEditor({ mode: "form", command: "nvim", display: "floating" });
+    expect(app.editor.mode).toBe("form");
+    const f = await keys("a");
+    expect(ptys).toHaveLength(0);
+    expect(f).toContain("Description");
+    await escape();
+    await settles(app.idle(), 200);
+    app.setEditor({ mode: "command", command: "hx", display: "floating" });
+    await keys("a");
+    expect(ptys[0]!.cmd).toEqual(["hx"]);
+    ptys[0]!.exit(0);
+    await app.idle();
+  });
+
+  test("startTui reads the editor settings and shows their warnings", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "eisen-editor-"));
+    const env = { EISEN_CONFIG: join(dir, "config.json") };
+    try {
+      writeFileSync(env.EISEN_CONFIG, '{"editor": {"mode": "command", "command": "nano"}}');
+      setup = await createTestRenderer({ width: 120, height: 30, exitOnCtrlC: false });
+      const { launch, ptys } = fakeLauncher();
+      let run = startTui(repo, { today: () => TODAY, launchEditorPty: launch }, { createRenderer: async () => setup.renderer, env });
+      await Bun.sleep(20);
+      setup.mockInput.pressKey("a");
+      await Bun.sleep(20);
+      expect(ptys).toHaveLength(1);
+      expect(ptys[0]!.cmd).toEqual(["nano"]);
+      ptys[0]!.exit(0);
+      await Bun.sleep(20);
+      setup.mockInput.pressKey("q");
+      expect(await settles(run, 2000)).toBe("done");
+      await setup.dispose();
+
+      writeFileSync(env.EISEN_CONFIG, '{"editor": {"mode": "fancy"}}');
+      setup = await createTestRenderer({ width: 120, height: 30, exitOnCtrlC: false });
+      run = startTui(repo, { today: () => TODAY }, { createRenderer: async () => setup.renderer, env });
+      await Bun.sleep(20);
+      expect(statusOf(await frame())).toContain('Config: editor.mode "fancy" unknown');
+      setup.mockInput.pressKey("q");
+      expect(await settles(run, 2000)).toBe("done");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
