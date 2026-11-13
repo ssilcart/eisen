@@ -268,7 +268,7 @@ function helpRows(preset: PresetId, keymap: Keymap): [string, string][] {
     [all("toggle_preview"), "Show / hide the preview of the selected task"],
     [[all("preview_down"), all("preview_up")].filter(Boolean).join(" / "), "Scroll the preview down / up"],
     [all("toggle_bullets"), "Show / hide the bullets"],
-    [all("edit"), "Edit in $EDITOR (a floating box; quit it to save)"],
+    [all("edit"), "Edit the task (the editor or form chosen in Settings)"],
     [all("triage"), `Triage the Inbox: ${triage}`],
     [all("search"), "Search every task: type to filter, Enter keep, Esc clear"],
     [all("command_line"), "Command line: preview/done/bullets [on|off], add, search, triage, q (Tab completes)"],

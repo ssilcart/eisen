@@ -43,7 +43,8 @@ Options:
 
 Data: $EISEN_DB, else $XDG_DATA_HOME/eisen/eisen.db, else ~/.local/share/eisen/eisen.db
 Config: $EISEN_CONFIG, else $XDG_CONFIG_HOME/eisen/config.json, else ~/.config/eisen/config.json
-  {"preset": "classic" | "priority" | "focus"} names the quadrants (press , in the matrix)
+  "preset": "classic" | "priority" | "focus" names the quadrants; "view", "editor"
+  and "keys" set the panels, the editor and the keys (press , in the matrix)
 `,
   add: `Usage: eisen add "<title>" [--q1|--q2|--q3|--q4] [--due YYYY-MM-DD]
 
