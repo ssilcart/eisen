@@ -3,7 +3,7 @@ import type { Database } from "bun:sqlite";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
-import { TextAttributes } from "@opentui/core";
+import { TextAttributes, type EmbeddedTerminalRenderable, type RGBA, type TextareaRenderable } from "@opentui/core";
 import { createTestRenderer, type TestRendererSetup } from "@opentui/core/testing";
 import { bucketOf } from "../../src/domain/task.ts";
 import { loadConfig, saveConfig } from "../../src/config.ts";
@@ -18,7 +18,8 @@ import {
   type EditorPty,
   type MatrixApp,
 } from "../../src/tui/app.ts";
-import { BUCKET_COLOR, COLOR, paneStyle } from "../../src/tui/theme.ts";
+import { editorBox } from "../../src/tui/layout.ts";
+import { BUCKET_COLOR, COLOR, DONE_COLOR, blend, dividerColor, paneStyle } from "../../src/tui/theme.ts";
 
 const TODAY = "2026-11-12";
 
@@ -100,6 +101,43 @@ function grid(f: string): string {
 function statusOf(f: string): string {
   return f.trimEnd().split("\n").at(-1)!;
 }
+
+interface Cell {
+  ch: string;
+  fg: RGBA;
+  bg: RGBA;
+  attributes: number;
+}
+
+/**
+ * The last rendered frame as rows of cells, one per terminal column (a wide
+ * glyph's second column is a cell with `ch` ""), so columns can be compared
+ * whatever emoji a row holds.
+ */
+function cellRows(): Cell[][] {
+  const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+  return setup.captureSpans().lines.map((line) => {
+    const cells: Cell[] = [];
+    for (const span of line.spans) {
+      for (const { segment } of segmenter.segment(span.text)) {
+        const cell = { fg: span.fg, bg: span.bg, attributes: span.attributes };
+        cells.push({ ch: segment, ...cell });
+        for (let i = 1; i < Bun.stringWidth(segment); i++) cells.push({ ch: "", ...cell });
+      }
+    }
+    return cells;
+  });
+}
+
+/** The cells inside a box's border at `rect` in the last frame. */
+function interior(rect: { left: number; top: number; width: number; height: number }): Cell[][] {
+  return cellRows()
+    .slice(rect.top + 1, rect.top + rect.height - 1)
+    .map((row) => row.slice(rect.left + 1, rect.left + rect.width - 1));
+}
+
+/** Glyphs of the matrix's pane borders and of the sidebar rule: none may show inside a floating box. */
+const MATRIX_GLYPHS = /[│─╭╮╰╯┃]/;
 
 /** Row and column of the first occurrence of `text` in the frame. */
 function where(f: string, text: string): { row: number; col: number } {
@@ -791,6 +829,30 @@ describe("floating editor (S22)", () => {
     expect(f).toContain("Edit · Pay rent");
     expect(hex(spanWith("Edit · Pay rent").fg)).toBe(BUCKET_COLOR[1].toLowerCase());
     edit.ptys[0]!.exit(0);
+    await app.idle();
+  });
+
+  test("the box keeps the terminal's own background: the embedded terminal is transparent and nothing of the matrix shows through", async () => {
+    // The editor paints its default background (SGR 49) and leaves most of its screen empty.
+    const { launch, ptys } = fakeLauncher((pty) => pty.emit("\u001b[H\u001b[49m# Hello from the editor"));
+    await start(100, 30, { launchEditorPty: launch });
+    await keys("l", "a");
+    await Bun.sleep(10);
+    const f = await frame();
+    expect(f).toContain("# Hello from the editor");
+    const term = setup.renderer.root.findDescendantById("eisen-editor-terminal") as EmbeddedTerminalRenderable;
+    expect(term.transparentBackground).toBe(true);
+    const inside = interior(editorBox(100, 30));
+    expect(inside).toHaveLength(18);
+    // The test renderer composes the embedded terminal's default background as
+    // opaque black whatever the option; in a real pty the option makes those
+    // cells SGR 49 (checked by hand), so here only the option and the bleed.
+    for (const row of inside) {
+      expect(row).toHaveLength(68);
+      expect(row.map((c) => c.ch).join("")).not.toMatch(MATRIX_GLYPHS);
+    }
+    expect(inside.map((r) => r.map((c) => c.ch).join("")).join("\n")).not.toContain("Pay rent");
+    ptys[0]!.exit(0);
     await app.idle();
   });
 
@@ -2925,6 +2987,55 @@ describe("done panel in the sidebar (S26, S27)", () => {
   });
 });
 
+describe("divider between the matrix and the sidebar", () => {
+  // At 140 columns sidebarLayout gives the sidebar 49; the rule takes one more from the matrix.
+  const RULE = 140 - 49 - 1;
+
+  test("with the sidebar a ┃ rule in COLOR.divider runs the full height above the status line, and the matrix is one column narrower", async () => {
+    for (const view of [{ donePanel: true }, { preview: true }, { preview: true, donePanel: true }]) {
+      await start(140, 40, { view });
+      const rows = cellRows();
+      for (let y = 0; y < 39; y++) {
+        expect(rows[y]![RULE]!.ch).toBe("┃");
+        expect(hexOf(rows[y]![RULE]!.fg)).toBe(COLOR.divider.toLowerCase());
+      }
+      expect(rows[39]!.some((c) => c.ch === "┃")).toBe(false); // not on the status line
+      // Q2's corner right before the rule, the sidebar's right after it; the strip stops at the rule too.
+      expect(rows[0]![RULE - 1]!.ch).toBe("╮");
+      expect(rows[0]![RULE + 1]!.ch).toBe("╭");
+      expect(rows[38]![RULE - 1]!.ch).toBe("╯");
+      expect(rows[38]![RULE + 1]!.ch).toBe("╰");
+      app.destroy();
+      await setup.dispose();
+    }
+    await start(140, 40);
+  });
+
+  test("no rule without the sidebar (off, or under 100 columns): the matrix takes the full width", async () => {
+    for (const [width, view] of [
+      [140, {}],
+      [99, { preview: true, donePanel: true }],
+    ] as const) {
+      const f = await start(width, 30, { view });
+      expect(f).not.toContain("┃");
+      expect(cellRows()[0]![width - 1]!.ch).toBe("╮");
+      app.destroy();
+      await setup.dispose();
+    }
+    await start(140, 40);
+  });
+
+  test("the rule takes the done panel's colour while it is focused, and goes back when focus leaves", async () => {
+    await start(140, 40, { view: { donePanel: true } });
+    await keys("l", "l");
+    expect(app.state.focus).toBe("done");
+    expect(hexOf(cellRows()[5]![RULE]!.fg)).toBe(dividerColor(true).toLowerCase());
+    await keys("h");
+    expect(app.state.focus).not.toBe("done");
+    expect(hexOf(cellRows()[5]![RULE]!.fg)).toBe(COLOR.divider.toLowerCase());
+  });
+});
+
 describe("bullets (S28)", () => {
   test("open rows start with • in the pane's colour, escalated ones with !, in the quadrants and the strip", async () => {
     const f = await start(120, 30, { view: { bullets: true } });
@@ -3536,6 +3647,42 @@ describe("editor modes (S32)", () => {
     expect(statusOf(f)).toContain("Added to Q2 · 📅 Schedule");
     expect(app.state.focus).toBe(2);
     expect(app.state.selected[2]).toBe(1);
+  });
+
+  test("form: the box and its fields keep the terminal's own background, nothing of the matrix shows through, and the focused field is marked by its label", async () => {
+    await start(100, 30, FORM);
+    await keys("l", "a");
+    let f = await type("Book flights");
+    const inside = () => interior(editorBox(100, 30));
+    const labelRow = (name: string) => inside().find((r) => r.map((c) => c.ch).join("").includes(name))!;
+    for (const row of inside()) {
+      expect(row.map((c) => c.ch).join("")).not.toMatch(MATRIX_GLYPHS);
+      expect(row.filter((c) => c.bg.toInts()[3] !== 0)).toEqual([]);
+    }
+    expect(f).toContain("Book flights");
+    // The unfocused fields' own background (the focused one is checked cell by cell above).
+    for (const id of ["due", "description"]) {
+      const field = setup.renderer.root.findDescendantById(`eisen-form-${id}`) as TextareaRenderable;
+      expect(field.backgroundColor.toInts()[3]).toBe(0);
+    }
+    // The focused field: a ▍ marker and its label in the quadrant's colour, bold; the others muted, no marker.
+    const marked = (name: string) => {
+      const row = labelRow(name);
+      const at = row.findIndex((c) => c.ch === "▍");
+      return at < 0 ? null : row[at]!;
+    };
+    expect(hexOf(marked("Title")!.fg)).toBe(BUCKET_COLOR[2].toLowerCase());
+    expect(marked("Title")!.attributes & TextAttributes.BOLD).toBeTruthy();
+    expect(marked("Due")).toBeNull();
+    f = await tab();
+    expect(marked("Title")).toBeNull();
+    expect(hexOf(marked("Due")!.fg)).toBe(BUCKET_COLOR[2].toLowerCase());
+    expect(hexOf(labelRow("Title").find((c) => c.ch === "T")!.fg)).toBe(COLOR.muted.toLowerCase());
+    for (const row of inside()) expect(row.filter((c) => c.bg.toInts()[3] !== 0)).toEqual([]);
+    setup.mockInput.pressEscape();
+    await Bun.sleep(30);
+    setup.mockInput.pressEscape();
+    await settles(app.idle(), 200);
   });
 
   test("form: a with the Inbox strip focused creates in the Inbox", async () => {

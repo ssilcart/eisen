@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { BUCKET_COLOR, COLOR, blend, paneStyle } from "../../src/tui/theme.ts";
+import { BUCKET_COLOR, COLOR, DONE_COLOR, blend, dividerColor, paneStyle } from "../../src/tui/theme.ts";
 
 // S23: one colour per quadrant, the same in every preset.
 describe("theme (S23)", () => {
@@ -19,6 +19,13 @@ describe("theme (S23)", () => {
     expect(paneStyle(1, true).selectBg).toBe(blend("#E5534B", COLOR.panel, 0.35));
     expect(paneStyle("inbox", true).selectBg).toBe(blend("#8B949E", COLOR.panel, 0.35));
     expect(new Set([1, 2, 3, 4, "inbox"].map((b) => paneStyle(b as 1, true).selectBg)).size).toBe(5);
+  });
+
+  test("the sidebar rule: the focus blue dimmed, apart from the pane borders; the done colour dimmed while the sidebar has focus", () => {
+    expect<string>(COLOR.divider).toBe(blend(COLOR.focus, COLOR.panel, 0.65));
+    expect<string>(COLOR.divider).not.toBe(COLOR.border);
+    expect(dividerColor(false)).toBe(COLOR.divider);
+    expect(dividerColor(true)).toBe(blend(DONE_COLOR, COLOR.panel, 0.65));
   });
 
   test("blend mixes two hex colours", () => {
