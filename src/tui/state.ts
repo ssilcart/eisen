@@ -3,9 +3,18 @@
 // app.ts runs the repository effects and reloads the panes.
 import { DEFAULT_PRESET, PRESET_IDS, type PresetId } from "../domain/presets.ts";
 import type { Quadrant } from "../domain/task.ts";
+import { completeCommand, pushHistory, walkHistory, type Completion, type HistoryCursor } from "./commands.ts";
 import { DEFAULT_KEYMAP, actionFor, keysOf, type Keymap } from "./keymap.ts";
 
-export type Mode = "normal" | "add" | "confirmDelete" | "help" | "triage" | "search" | "settings";
+export type Mode = "normal" | "add" | "confirmDelete" | "help" | "triage" | "search" | "settings" | "command";
+
+/** The `:` line (S31): what is typed, this session's history, ↑/↓ and Tab in progress. */
+export interface CommandLine {
+  line: string;
+  history: readonly string[];
+  cursor: HistoryCursor | null;
+  completion: Completion | null;
+}
 
 /**
  * A pane: a quadrant, the Inbox strip always shown under the grid (S24), or
@@ -86,6 +95,8 @@ export interface ViewState {
   preset: PresetId;
   /** The preset under the cursor in the settings screen (S21), an index in PRESET_IDS. */
   settingsCursor: number;
+  /** The `:` command line (S31); its history lives as long as the session. */
+  command: CommandLine;
 }
 
 /**
@@ -141,10 +152,21 @@ export type Action =
   | { type: "submitSearch" }
   /** Esc: drop the filter and restore the full view. */
   | { type: "clearSearch" }
+  /** `:search <query>` (S31): the query typed and kept at once, like `/` + query + Enter. */
+  | { type: "runSearch"; query: string }
   /** `,` opens the settings (S21); j/k move its cursor; Enter applies (the controller saves). */
   | { type: "openSettings" }
   | { type: "settingsMove"; dir: -1 | 1 }
   | { type: "saveSettings" }
+  /** `:` opens the command line (S31); Enter runs it (the controller parses and runs it). */
+  | { type: "openCommand" }
+  | { type: "commandInput"; text: string }
+  /** Backspace; on an empty line it closes the command line (vim-like). */
+  | { type: "commandBackspace" }
+  | { type: "commandComplete" }
+  | { type: "commandHistory"; dir: -1 | 1 }
+  | { type: "submitCommand" }
+  | { type: "cancelCommand" }
   | { type: "noop" };
 
 export function initialState(preset: PresetId = DEFAULT_PRESET, toggles: Partial<ViewToggles> = {}): ViewState {
@@ -164,6 +186,7 @@ export function initialState(preset: PresetId = DEFAULT_PRESET, toggles: Partial
     query: "",
     preset,
     settingsCursor: 0,
+    command: { line: "", history: [], cursor: null, completion: null },
   };
 }
 
@@ -175,8 +198,7 @@ export function searchActive(state: ViewState): boolean {
 const NOOP: Action = { type: "noop" };
 
 /**
- * What each keymap action does in the matrix (S30). Actions whose feature
- * comes later (`:`) are bound but do nothing yet.
+ * What each keymap action does in the matrix (S30).
  */
 const NORMAL_ACTIONS: Readonly<Record<string, Action>> = {
   move_left: { type: "navigate", dir: "left" },
@@ -201,7 +223,7 @@ const NORMAL_ACTIONS: Readonly<Record<string, Action>> = {
   toggle_bullets: { type: "toggleBullets" },
   preview_down: { type: "scrollPreview", dir: 1 },
   preview_up: { type: "scrollPreview", dir: -1 },
-  command_line: NOOP,
+  command_line: { type: "openCommand" },
   settings: { type: "openSettings" },
   help: { type: "help" },
   quit: { type: "quit" },
@@ -263,6 +285,8 @@ export function keyToAction(state: ViewState, key: Key, keymap: Keymap = DEFAULT
       return searchKey(key);
     case "settings":
       return settingsKey(key);
+    case "command":
+      return commandKey(key);
     case "normal":
       return normalKey(key, searchActive(state), keymap);
   }
@@ -275,6 +299,19 @@ function searchKey(key: Key): Action {
   if (key.name === "backspace") return { type: "searchBackspace" };
   const text = printable(key);
   return text === null ? NOOP : { type: "searchInput", text };
+}
+
+/** A text input like search: no global key fires, nothing is rebindable (S30, S31). */
+function commandKey(key: Key): Action {
+  if (key.name === "escape") return { type: "cancelCommand" };
+  if (key.name === "return" || key.name === "enter") return { type: "submitCommand" };
+  if (key.name === "backspace") return { type: "commandBackspace" };
+  if (key.ctrl || key.meta) return NOOP;
+  if (key.name === "tab") return key.shift ? NOOP : { type: "commandComplete" };
+  if (key.name === "up") return { type: "commandHistory", dir: -1 };
+  if (key.name === "down") return { type: "commandHistory", dir: 1 };
+  const text = printable(key);
+  return text === null ? NOOP : { type: "commandInput", text };
 }
 
 /** Only the settings' own keys: nothing reaches the matrix (S21). */
@@ -368,6 +405,9 @@ export function reduce(
       return s.query.trim() === "" ? endSearch(s) : { ...s, mode: "normal" };
     case "clearSearch":
       return endSearch(s);
+    case "runSearch":
+      if (action.query.trim() === "") return endSearch(s);
+      return { ...s, mode: "normal", query: action.query, selected: { 1: 0, 2: 0, 3: 0, 4: 0, inbox: 0 } };
     case "openSettings":
       return { ...s, mode: "settings", settingsCursor: Math.max(0, PRESET_IDS.indexOf(s.preset)) };
     case "settingsMove": {
@@ -376,6 +416,27 @@ export function reduce(
     }
     case "saveSettings":
       return { ...s, mode: "normal", preset: PRESET_IDS[s.settingsCursor] ?? s.preset };
+    case "openCommand":
+      return { ...s, mode: "command", command: { ...s.command, line: "", cursor: null, completion: null } };
+    case "commandInput":
+      return { ...s, command: { ...s.command, line: s.command.line + action.text, cursor: null, completion: null } };
+    case "commandBackspace": {
+      if (s.command.line === "") return closeCommand(s, s.command.history);
+      const line = Array.from(s.command.line).slice(0, -1).join("");
+      return { ...s, command: { ...s.command, line, cursor: null, completion: null } };
+    }
+    case "commandComplete": {
+      const { line, completion } = completeCommand(s.command.line, s.command.completion);
+      return { ...s, command: { ...s.command, line, completion, cursor: null } };
+    }
+    case "commandHistory": {
+      const { line, cursor } = walkHistory(s.command.history, s.command.cursor, s.command.line, action.dir);
+      return { ...s, command: { ...s.command, line, cursor, completion: null } };
+    }
+    case "submitCommand":
+      return closeCommand(s, pushHistory(s.command.history, s.command.line));
+    case "cancelCommand":
+      return closeCommand(s, s.command.history);
     case "noop":
       return { ...s, status: state.status };
     case "moveTo":
@@ -389,6 +450,11 @@ export function reduce(
     case "scrollPreview":
       return s;
   }
+}
+
+/** The command line closed and emptied; its history kept. */
+function closeCommand(s: ViewState, history: readonly string[]): ViewState {
+  return { ...s, mode: "normal", command: { line: "", history, cursor: null, completion: null } };
 }
 
 /** Back to the unfiltered matrix; the Inbox strip stays (S24), and so does its focus. */

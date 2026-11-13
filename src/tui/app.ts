@@ -72,6 +72,7 @@ import {
   type PaneItems,
   type ViewState,
 } from "./state.ts";
+import { parseCommand, type ViewToggle } from "./commands.ts";
 import { buildKeymap, keysOf, type Keymap } from "./keymap.ts";
 import { previewInfo, previewLines, type PreviewInfo, type PreviewLineKind } from "./preview.ts";
 import { settingsHeight, settingsLines, settingsWidth, type SettingsLine } from "./settings.ts";
@@ -213,12 +214,21 @@ function helpRows(preset: PresetId, keymap: Keymap): [string, string][] {
     [all("edit"), "Edit in $EDITOR (a floating box; quit it to save)"],
     [all("triage"), `Triage the Inbox: ${triage}`],
     [all("search"), "Search every task: type to filter, Enter keep, Esc clear"],
+    [all("command_line"), "Command line: preview/done/bullets [on|off], add, search, triage, q (Tab completes)"],
     [all("settings"), "Settings: quadrant names"],
     [all("help"), "Help"],
     [all("quit"), "Quit"],
   ];
   return rows.filter(([keys]) => keys !== "");
 }
+
+/** What a `:` toggle command dispatches, and how its messages name it (S31). */
+const TOGGLE_ACTION: Record<ViewToggle, Action> = {
+  preview: { type: "togglePreview" },
+  donePanel: { type: "toggleDonePanel" },
+  bullets: { type: "toggleBullets" },
+};
+const TOGGLE_LABEL: Record<ViewToggle, string> = { preview: "Preview", donePanel: "Done panel", bullets: "Bullets" };
 
 /** The first start-up warning, plus `(+N more)` when there are several. */
 function startWarning(warnings: readonly string[]): string | null {
@@ -961,6 +971,20 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     switch (state.mode) {
       case "settings":
         return line(width, [fg(COLOR.focus)(bold(" Settings")), fg(COLOR.muted)("  │ j/k choose · Enter save · Esc cancel")]);
+      case "command": {
+        const prefix = " :";
+        const cycle = state.command.completion;
+        const after = cycle
+          ? `  ${cycle.candidates.map((c) => c.trim().split(/\s+/).at(-1)).join(" ")}`
+          : "  Tab complete · ↑↓ history · Enter run · Esc cancel";
+        const room = Math.max(1, width - Bun.stringWidth(prefix) - Math.min(Bun.stringWidth(after), 40) - 1);
+        return line(width, [
+          fg(COLOR.focus)(bold(prefix)),
+          plain(tail(state.command.line, room)),
+          fg(COLOR.focus)("█"),
+          fg(COLOR.muted)(after),
+        ]);
+      }
       case "search": {
         const prefix = " / ";
         const after = `  ${matchesText() ?? "type to search"} · Enter keep · Esc clear`;
@@ -1038,6 +1062,10 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
       state = next;
       const target: EditTarget = action.type === "newTask" ? { kind: "new", focus: addTarget(before) } : { kind: "edit", id: id! };
       editing = editorSession(target).finally(() => (editing = null));
+      return;
+    }
+    if (action.type === "submitCommand") {
+      runCommand(before.command.line, next);
       return;
     }
     try {
@@ -1151,10 +1179,55 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     const typing = action.type === "search" || action.type === "searchInput" || action.type === "searchBackspace";
     // Leaving the search keeps the selected match selected in the full view.
     if (action.type === "clearSearch" || action.type === "submitSearch") followId = id;
-    next = reload(next, !typing);
+    // Typing on the `:` line only redraws the status line: no read per keystroke.
+    const commandTyping = state.mode === "command" || action.type === "cancelCommand";
+    next = reload(next, !typing && !commandTyping);
     state = followId === null ? clamp(next, items()) : follow(next, items(), followId);
-    if (typing) state = focusMatches(state, items());
+    if (typing || action.type === "runSearch") state = focusMatches(state, items());
     draw();
+  }
+
+  /**
+   * S31: Enter on the `:` line. `closed` is the state with the line closed
+   * and recorded in the history. A parse error, or `on`/`off` that is already
+   * the value, changes nothing and saves nothing; everything else goes
+   * through the same action as its key (`p`, `.`, `A` + Enter, `/` + Enter…),
+   * so it is saved and reported the same way.
+   */
+  function runCommand(text: string, closed: ViewState): void {
+    state = closed;
+    const parsed = parseCommand(text);
+    if (!parsed.ok || parsed.command === null) {
+      if (!parsed.ok) state = { ...state, status: parsed.error };
+      draw();
+      return;
+    }
+    const command = parsed.command;
+    switch (command.kind) {
+      case "toggle": {
+        const current = state[command.view];
+        if (command.value === current) {
+          state = { ...state, status: `${TOGGLE_LABEL[command.view]} already ${current ? "on" : "off"}` };
+          draw();
+          return;
+        }
+        return dispatch(TOGGLE_ACTION[command.view]);
+      }
+      case "settings":
+        return dispatch({ type: "openSettings" });
+      case "help":
+        return dispatch({ type: "help" });
+      case "triage":
+        return dispatch({ type: "triage" });
+      case "quit":
+        return dispatch({ type: "quit" });
+      case "search":
+        return dispatch({ type: "runSearch", query: command.query });
+      case "add":
+        // The quick add's own path (`A`, S22): same target, `#tags` and messages.
+        state = { ...state, mode: "add", input: command.title };
+        return dispatch({ type: "submitAdd" });
+    }
   }
 
   /**

@@ -860,3 +860,40 @@ describe("preview panel keys (S25)", () => {
     expect(next.selected).toEqual(s.selected);
   });
 });
+
+describe("command line (S31)", () => {
+  const P = panes([1, 2]);
+  const typing = (line: string): ViewState => ({ ...initialState(), mode: "command", command: { ...initialState().command, line } });
+
+  test(": opens it; every printable key types, none fires a matrix action", () => {
+    expect(keyToAction(initialState(), key(":"))).toEqual({ type: "openCommand" });
+    const s = typing("");
+    for (const k of ["q", "x", "p", ":", "?", "/"]) expect(keyToAction(s, key(k))).toEqual({ type: "commandInput", text: k });
+    expect(keyToAction(s, upper("A"))).toEqual({ type: "commandInput", text: "A" });
+  });
+
+  test("Tab, ↑/↓, Enter, Esc, Backspace have fixed meanings; Ctrl+C still quits", () => {
+    const s = typing("pre");
+    expect(keyToAction(s, key("tab", { sequence: "\t" }))).toEqual({ type: "commandComplete" });
+    expect(keyToAction(s, key("up", { sequence: "\u001b[A" }))).toEqual({ type: "commandHistory", dir: -1 });
+    expect(keyToAction(s, key("down", { sequence: "\u001b[B" }))).toEqual({ type: "commandHistory", dir: 1 });
+    expect(keyToAction(s, key("return", { sequence: "\r" }))).toEqual({ type: "submitCommand" });
+    expect(keyToAction(s, key("escape", { sequence: "\u001b" }))).toEqual({ type: "cancelCommand" });
+    expect(keyToAction(s, key("backspace", { sequence: "\u007f" }))).toEqual({ type: "commandBackspace" });
+    expect(keyToAction(s, key("c", { ctrl: true }))).toEqual({ type: "quit" });
+  });
+
+  test("submit closes the line and keeps it in the history; cancel keeps the history only", () => {
+    let s = reduce(typing("preview"), { type: "submitCommand" }, P);
+    expect(s.mode).toBe("normal");
+    expect(s.command).toEqual({ line: "", history: ["preview"], cursor: null, completion: null });
+    s = reduce(reduce(s, { type: "openCommand" }, P), { type: "commandInput", text: "do" }, P);
+    s = reduce(s, { type: "cancelCommand" }, P);
+    expect(s.command.history).toEqual(["preview"]);
+  });
+
+  test("Backspace on an empty line closes it", () => {
+    expect(reduce(typing("a"), { type: "commandBackspace" }, P).mode).toBe("command");
+    expect(reduce(typing(""), { type: "commandBackspace" }, P).mode).toBe("normal");
+  });
+});

@@ -2798,3 +2798,233 @@ describe("preview panel (S25, S26)", () => {
     });
   });
 });
+
+describe("command line (S31)", () => {
+  let saved: Record<string, unknown>[];
+
+  beforeEach(() => {
+    saved = [];
+  });
+
+  function open(width = 140, height = 40, over: AppOptions = {}) {
+    return start(width, height, { view: { preview: true }, saveView: (patch) => void saved.push(patch), ...over });
+  }
+
+  async function type(text: string): Promise<string> {
+    await setup.mockInput.typeText(text);
+    return frame();
+  }
+
+  async function enter(): Promise<string> {
+    setup.mockInput.pressEnter();
+    return frame();
+  }
+
+  async function tab(): Promise<string> {
+    setup.mockInput.pressTab();
+    return frame();
+  }
+
+  async function escape(): Promise<string> {
+    setup.mockInput.pressEscape();
+    await Bun.sleep(30); // L11: an Escape followed at once by a key merges
+    return frame();
+  }
+
+  test(": opens a `:` input in the status line with a cursor; typed keys do not fire matrix actions", async () => {
+    await open();
+    let f = await type(":");
+    expect(app.state.mode).toBe("command");
+    expect(statusOf(f)).toContain(":█");
+    f = await type("xqp");
+    expect(statusOf(f)).toContain(":xqp█");
+    expect(app.state.quit).toBe(false);
+    expect(app.state.preview).toBe(true);
+    expect(byTitle("Pay rent")!.status).toBe("open");
+    expect(saved).toEqual([]);
+  });
+
+  test(":preview⏎ toggles the preview and the saver receives the patch", async () => {
+    await open();
+    await type(":preview");
+    let f = await enter();
+    expect(app.state.mode).toBe("normal");
+    expect(app.state.preview).toBe(false);
+    expect(saved).toEqual([{ preview: false }]);
+    expect(statusOf(f)).toContain("Preview off");
+    expect(grid(f)).not.toContain("Preview");
+    await type(":preview");
+    f = await enter();
+    expect(app.state.preview).toBe(true);
+    expect(saved).toEqual([{ preview: false }, { preview: true }]);
+  });
+
+  test(":done on / :bullets off set the value explicitly and save only when it changes", async () => {
+    await open(140, 40, { view: { preview: true, bullets: true } });
+    await type(":done on");
+    await enter();
+    expect(app.state.donePanel).toBe(true);
+    await type(":done on");
+    let f = await enter();
+    expect(app.state.donePanel).toBe(true);
+    expect(statusOf(f)).toContain("Done panel already on");
+    await type(":bullets off");
+    f = await enter();
+    expect(app.state.bullets).toBe(false);
+    expect(statusOf(f)).toContain("Bullets off");
+    expect(saved).toEqual([{ donePanel: true }, { bullets: false }]);
+  });
+
+  test(":pre⇥ completes to :preview, then Tab cycles on / off", async () => {
+    await open();
+    await type(":pre");
+    let f = await tab();
+    expect(app.state.mode).toBe("command");
+    expect(statusOf(f)).toContain(":preview █");
+    f = await tab();
+    expect(statusOf(f)).toContain(":preview on█");
+    f = await tab();
+    expect(statusOf(f)).toContain(":preview off█");
+    f = await tab();
+    expect(statusOf(f)).toContain(":preview on█");
+    expect(saved).toEqual([]);
+  });
+
+  test(":add Call bank #fin⏎ creates it in the focused quadrant with tag fin", async () => {
+    await open();
+    await keys("l"); // Q2
+    await type(":add Call bank #fin");
+    const f = await enter();
+    const task = byTitle("Call bank #fin")!;
+    expect(task).toBeDefined();
+    expect(bucketOf(task)).toBe(2);
+    expect(task.tags).toEqual(["fin"]);
+    expect(statusOf(f)).toContain("Added to Q2");
+    expect(app.state.mode).toBe("normal");
+  });
+
+  test(":add from the Inbox strip adds to the Inbox", async () => {
+    await open();
+    // Down Q1's rows, through Q3, into the strip.
+    for (let i = 0; i < 10 && app.state.focus !== "inbox"; i++) await keys("j");
+    expect(app.state.focus).toBe("inbox");
+    await type(":add Someday maybe");
+    await enter();
+    expect(bucketOf(byTitle("Someday maybe")!)).toBe("inbox");
+  });
+
+  // quit is rebound so a `q` leaking to the matrix cannot quit by itself.
+  test(":q⏎ quits", async () => {
+    await open(140, 40, { keys: { quit: ["Q"] } });
+    await type(":q");
+    expect(app.state.quit).toBe(false);
+    await enter();
+    expect(await settles(app.done)).toBe("done");
+  });
+
+  test(":quit⏎ quits", async () => {
+    await open(140, 40, { keys: { quit: ["Q"] } });
+    await type(":quit");
+    expect(app.state.quit).toBe(false);
+    await enter();
+    expect(await settles(app.done)).toBe("done");
+  });
+
+  test("an unknown command or a bad argument says so and changes nothing", async () => {
+    await open();
+    await type(":foo bar");
+    let f = await enter();
+    expect(statusOf(f)).toContain("Unknown command: foo");
+    expect(app.state.mode).toBe("normal");
+    await type(":preview maybe");
+    f = await enter();
+    expect(statusOf(f)).toContain("Usage: :preview [on|off]");
+    expect(app.state.preview).toBe(true);
+    expect(saved).toEqual([]);
+    expect(repo.list({ status: "all" })).toHaveLength(8);
+  });
+
+  test("Esc cancels without running anything; matrix keys work again afterwards", async () => {
+    await open();
+    await type(":preview");
+    let f = await escape();
+    expect(app.state.mode).toBe("normal");
+    expect(statusOf(f)).not.toContain(":preview");
+    expect(app.state.preview).toBe(true);
+    expect(saved).toEqual([]);
+    f = await keys("p");
+    expect(app.state.preview).toBe(false);
+  });
+
+  test("Backspace on an empty line closes it", async () => {
+    await open();
+    await type(":a");
+    setup.mockInput.pressBackspace();
+    let f = await frame();
+    expect(statusOf(f)).toContain(":█");
+    expect(app.state.mode).toBe("command");
+    setup.mockInput.pressBackspace();
+    f = await frame();
+    expect(app.state.mode).toBe("normal");
+  });
+
+  test("↑/↓ walk this session's history; Enter runs the recalled line", async () => {
+    await open();
+    await type(":bullets");
+    await enter();
+    await type(":done");
+    await enter();
+    await type(":x");
+    setup.mockInput.pressArrow("up");
+    let f = await frame();
+    expect(statusOf(f)).toContain(":done█");
+    setup.mockInput.pressArrow("up");
+    f = await frame();
+    expect(statusOf(f)).toContain(":bullets█");
+    setup.mockInput.pressArrow("down");
+    f = await frame();
+    expect(statusOf(f)).toContain(":done█");
+    setup.mockInput.pressArrow("down");
+    f = await frame();
+    expect(statusOf(f)).toContain(":x█");
+    setup.mockInput.pressArrow("up");
+    await enter();
+    expect(saved).toEqual([{ bullets: true }, { donePanel: true }, { donePanel: false }]);
+  });
+
+  test(":search bank⏎ filters like / bank Enter and keeps the filter", async () => {
+    await open();
+    await type(":search bank");
+    const f = await enter();
+    expect(app.state.mode).toBe("normal");
+    expect(app.state.query).toBe("bank");
+    expect(grid(f)).toContain("Call the bank");
+    expect(grid(f)).not.toContain("Pay rent");
+    expect(statusOf(f)).toContain("1 match");
+  });
+
+  test(":help, :settings and :triage open their modes", async () => {
+    await open();
+    await type(":help");
+    await enter();
+    expect(app.state.mode).toBe("help");
+    await escape();
+    await type(":settings");
+    await enter();
+    expect(app.state.mode).toBe("settings");
+    await escape();
+    await type(":triage");
+    await enter();
+    expect(app.state.mode).toBe("triage");
+  });
+
+  test("the help lists the command line under its current key (S30)", async () => {
+    await open(140, 40, { keys: { command_line: [";"] } });
+    let f = await keys("?");
+    expect(f).toContain("Command line");
+    expect(f.split("\n")[where(f, "Command line").row]).toMatch(/│\s*; +Command line/);
+    await escape();
+    f = await type(";");
+    expect(app.state.mode).toBe("command");
+  });
+});
