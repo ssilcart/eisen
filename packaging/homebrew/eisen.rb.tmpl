@@ -1,0 +1,31 @@
+# Homebrew formula for the tap ssilcart/homebrew-tap (`brew install ssilcart/tap/eisen`).
+# Rendered by scripts/render-formula.ts from the release's SHA256SUMS; copy the
+# rendered file to Formula/eisen.rb in the tap. Do not edit the rendered copy by hand.
+class Eisen < Formula
+  desc "Eisenhower matrix in your terminal"
+  homepage "https://github.com/ssilcart/eisen"
+  version "{{VERSION}}"
+  license "MIT"
+
+  on_macos do
+    on_arm do
+      url "https://github.com/ssilcart/eisen/releases/download/v{{VERSION}}/eisen-{{VERSION}}-darwin-arm64.tar.gz"
+      sha256 "{{SHA256_DARWIN_ARM64}}"
+    end
+  end
+
+  on_linux do
+    on_intel do
+      url "https://github.com/ssilcart/eisen/releases/download/v{{VERSION}}/eisen-{{VERSION}}-linux-x64.tar.gz"
+      sha256 "{{SHA256_LINUX_X64}}"
+    end
+  end
+
+  def install
+    bin.install "eisen"
+  end
+
+  test do
+    assert_match version.to_s, shell_output("#{bin}/eisen --version")
+  end
+end

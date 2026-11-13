@@ -1,0 +1,30 @@
+{
+  "name": "eisen",
+  "version": "0.1.0",
+  "description": "Eisenhower matrix in your terminal",
+  "license": "MIT",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ssilcart/eisen"
+  },
+  "bin": {
+    "eisen": "src/main.ts"
+  },
+  "engines": {
+    "bun": ">=1.3.14"
+  },
+  "scripts": {
+    "start": "bun src/main.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "build": "bun build --compile src/main.ts --outfile dist/eisen"
+  },
+  "dependencies": {
+    "@opentui/core": "0.8.4"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.4",
+    "typescript": "7.0.2"
+  }
+}
