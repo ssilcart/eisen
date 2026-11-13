@@ -1,5 +1,25 @@
 import { describe, expect, test } from "bun:test";
-import { fit, gridSizes, windowStart } from "../../src/tui/layout.ts";
+import { fit, gridSizes, windowStart, wrap } from "../../src/tui/layout.ts";
+
+describe("wrap", () => {
+  test("breaks on spaces to fit the width", () => {
+    expect(wrap("poder organizar los subitems", 12)).toEqual(["poder", "organizar", "los subitems"]);
+    expect(wrap("short", 20)).toEqual(["short"]);
+  });
+
+  test("keeps explicit newlines and blank lines", () => {
+    expect(wrap("one\n\ntwo three", 5)).toEqual(["one", "", "two", "three"]);
+  });
+
+  test("hard-breaks words longer than the width, by display width", () => {
+    expect(wrap("abcdefghij", 4)).toEqual(["abcd", "efgh", "ij"]);
+    for (const line of wrap("🔥🔥🔥 compañía", 4)) expect(Bun.stringWidth(line)).toBeLessThanOrEqual(4);
+  });
+
+  test("a zero or negative width gives no lines", () => {
+    expect(wrap("anything", 0)).toEqual([]);
+  });
+});
 
 describe("windowStart", () => {
   test("everything fits: start at 0", () => {

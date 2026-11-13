@@ -27,6 +27,51 @@ export function windowStart(selected: number, count: number, height: number): nu
 
 const ELLIPSIS = "…";
 
+const graphemes = (text: string): string[] =>
+  Array.from(new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(text), (s) => s.segment);
+
+/**
+ * Word-wraps `text` to `width` display columns. Explicit newlines start a new
+ * line (blank lines are kept); a word wider than the line is hard-broken.
+ */
+export function wrap(text: string, width: number): string[] {
+  if (width <= 0) return [];
+  const out: string[] = [];
+  for (const paragraph of text.split("\n")) {
+    let line = "";
+    let used = 0;
+    for (const word of paragraph.split(/\s+/).filter(Boolean)) {
+      const w = Bun.stringWidth(word);
+      if (used > 0 && used + 1 + w <= width) {
+        line += ` ${word}`;
+        used += 1 + w;
+        continue;
+      }
+      if (used > 0) out.push(line);
+      line = "";
+      used = 0;
+      if (w <= width) {
+        line = word;
+        used = w;
+        continue;
+      }
+      for (const g of graphemes(word)) {
+        const gw = Bun.stringWidth(g);
+        if (used + gw > width && used > 0) {
+          out.push(line);
+          line = "";
+          used = 0;
+        }
+        if (gw > width) continue; // a wide character on a 1-column line
+        line += g;
+        used += gw;
+      }
+    }
+    out.push(line);
+  }
+  return out;
+}
+
 /** Text padded or truncated (with an ellipsis) to exactly `width` display columns. */
 export function fit(text: string, width: number): string {
   if (width <= 0) return "";

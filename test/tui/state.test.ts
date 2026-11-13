@@ -1,11 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import {
   clamp,
+  currentId,
   follow,
   initialState,
   keyToAction,
+  offerTriage,
   reduce,
   selectedId,
+  syncTriage,
   type Action,
   type Key,
   type PaneItems,
@@ -237,8 +240,7 @@ describe("reduce: modes", () => {
     expect(s.showDone).toBe(false);
   });
 
-  test("i and / are hooks that say coming soon for now", () => {
-    expect(press(state(), key("i"), p).status).toMatch(/coming soon/);
+  test("/ is a hook that says coming soon for now", () => {
     expect(press(state(), key("/"), p).status).toMatch(/coming soon/);
   });
 
@@ -279,5 +281,161 @@ describe("selection helpers", () => {
     const p = panes([7, 8, 9]);
     expect(follow(state({ selected: { 1: 0, 2: 0, 3: 0, 4: 0 } }), p, 9).selected[1]).toBe(2);
     expect(follow(state({ selected: { 1: 5, 2: 0, 3: 0, 4: 0 } }), p, 42).selected[1]).toBe(2);
+  });
+});
+
+describe("triage (S12)", () => {
+  const p = panes([1, 2], [3], [], []);
+  const inbox = items(10, 11, 12);
+  const esc = key("escape", { sequence: "\u001b" });
+
+  // press() with the Inbox passed to the reducer.
+  function tpress(s: ViewState, k: Key, box = inbox): ViewState {
+    return reduce(s, keyToAction(s, k), p, box);
+  }
+  function startTriage(box = inbox): ViewState {
+    return tpress(state(), key("i"), box);
+  }
+
+  test("i starts a session over the Inbox, in order, at the first task", () => {
+    const s = startTriage();
+    expect(s.mode).toBe("triage");
+    expect(s.triage).toEqual({ queue: [10, 11, 12], index: 0, sorted: 0, skipped: 0, deleted: 0 });
+    expect(currentId(s, p)).toBe(10);
+  });
+
+  test("i with an empty Inbox stays in the matrix and says so", () => {
+    const s = startTriage([]);
+    expect(s.mode).toBe("normal");
+    expect(s.triage).toBeNull();
+    expect(s.status).toMatch(/Inbox is empty/);
+  });
+
+  test("keyToAction in triage mode", () => {
+    const s = startTriage();
+    const cases: [Key, Action][] = [
+      [key("1"), { type: "moveTo", quadrant: 1 }],
+      [key("2"), { type: "moveTo", quadrant: 2 }],
+      [key("3"), { type: "moveTo", quadrant: 3 }],
+      [key("4"), { type: "moveTo", quadrant: 4 }],
+      [key("s"), { type: "skip" }],
+      [key("e"), { type: "edit" }],
+      [key("d"), { type: "requestDelete" }],
+      [esc, { type: "exitTriage" }],
+      [key("q"), { type: "exitTriage" }],
+      [key("?"), { type: "help" }],
+      [key("c", { ctrl: true, sequence: "\u0003" }), { type: "quit" }],
+      // Matrix keys do nothing while a card is shown.
+      [key("j"), { type: "noop" }],
+      [key("x"), { type: "noop" }],
+      [key("a"), { type: "noop" }],
+      [key("i"), { type: "noop" }],
+      [upper("S"), { type: "noop" }],
+      [upper("J"), { type: "noop" }],
+    ];
+    for (const [k, action] of cases) expect(keyToAction(s, k)).toEqual(action);
+  });
+
+  test("1–4 count the task as sorted and show the next one", () => {
+    let s = startTriage();
+    s = tpress(s, key("2"));
+    expect(s.mode).toBe("triage");
+    expect(s.triage).toMatchObject({ index: 1, sorted: 1, skipped: 0 });
+    expect(currentId(s, p)).toBe(11);
+    s = tpress(s, key("4"));
+    expect(currentId(s, p)).toBe(12);
+    expect(s.triage!.sorted).toBe(2);
+  });
+
+  test("s skips to the next task without sorting it", () => {
+    const s = tpress(startTriage(), key("s"));
+    expect(s.triage).toMatchObject({ index: 1, sorted: 0, skipped: 1 });
+    expect(currentId(s, p)).toBe(11);
+  });
+
+  test("e keeps the current task and stays in triage", () => {
+    const s = tpress(startTriage(), key("e"));
+    expect(s.mode).toBe("triage");
+    expect(currentId(s, p)).toBe(10);
+  });
+
+  test("d asks; n and Esc go back to the same card; y deletes and shows the next", () => {
+    let s = tpress(startTriage(), key("d"));
+    expect(s.mode).toBe("confirmDelete");
+    expect(currentId(s, p)).toBe(10);
+    for (const cancel of [key("n"), esc]) {
+      const back = tpress(s, cancel);
+      expect(back.mode).toBe("triage");
+      expect(currentId(back, p)).toBe(10);
+      expect(back.triage!.deleted).toBe(0);
+    }
+    s = tpress(s, key("y"));
+    expect(s.mode).toBe("triage");
+    expect(s.triage).toMatchObject({ index: 1, deleted: 1 });
+    expect(currentId(s, p)).toBe(11);
+  });
+
+  test("? opens help; closing it returns to the card", () => {
+    let s = tpress(startTriage(), key("?"));
+    expect(s.mode).toBe("help");
+    s = tpress(s, esc);
+    expect(s.mode).toBe("triage");
+    expect(currentId(s, p)).toBe(10);
+  });
+
+  test("the last key ends the session with a summary, back in the matrix", () => {
+    let s = startTriage();
+    s = tpress(s, key("1"));
+    s = tpress(s, key("s"));
+    s = tpress(s, key("3"));
+    expect(s.mode).toBe("normal");
+    expect(s.triage).toBeNull();
+    expect(s.quit).toBe(false);
+    expect(s.status).toBe("Inbox triaged: 2 sorted, 1 skipped");
+    expect(currentId(s, p)).toBe(selectedId(s, p));
+  });
+
+  test("the summary mentions deletions when there were any", () => {
+    let s = startTriage(items(10));
+    s = tpress(s, key("d"), items(10));
+    s = tpress(s, key("y"), items(10));
+    expect(s.mode).toBe("normal");
+    expect(s.status).toBe("Inbox triaged: 0 sorted, 0 skipped, 1 deleted");
+  });
+
+  test("Esc and q leave triage early without quitting and say what is left", () => {
+    for (const k of [esc, key("q")]) {
+      let s = tpress(startTriage(), key("2"));
+      s = tpress(s, k);
+      expect(s.mode).toBe("normal");
+      expect(s.triage).toBeNull();
+      expect(s.quit).toBe(false);
+      expect(s.status).toBe("Triage stopped: 1 sorted, 0 skipped, 2 left in the Inbox");
+    }
+  });
+
+  test("a session visits each task at most once: tasks added later are not in the queue", () => {
+    let s = startTriage(items(10));
+    s = tpress(s, key("s"), items(10, 99));
+    expect(s.mode).toBe("normal");
+    expect(s.status).toBe("Inbox triaged: 0 sorted, 1 skipped");
+  });
+
+  test("syncTriage skips queued tasks that left the Inbox and ends when none remain", () => {
+    const s = startTriage();
+    expect(syncTriage(s, items(10, 11, 12))).toEqual(s);
+    const moved = syncTriage(s, items(12));
+    expect(currentId(moved, p)).toBe(12);
+    expect(moved.triage).toMatchObject({ index: 2, sorted: 0, skipped: 0 });
+    const gone = syncTriage(s, []);
+    expect(gone.mode).toBe("normal");
+    expect(gone.triage).toBeNull();
+    expect(gone.status).toBe("Inbox triaged: 0 sorted, 0 skipped");
+    expect(syncTriage(state(), [])).toEqual(state());
+  });
+
+  test("offerTriage puts the offer in the status line only when the Inbox has tasks", () => {
+    expect(offerTriage(state(), 8).status).toBe("press i to triage");
+    expect(offerTriage(state(), 0).status).toBeNull();
   });
 });

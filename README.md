@@ -62,6 +62,23 @@ date), a blank line, then the description. `#tags` in the title or
 description become tags. Save and quit to apply; a non-zero exit (`:cq` in
 Vim) discards the edit.
 
+### Triage
+
+New and imported tasks land in the Inbox. When it is not empty at start the
+status line says `press i to triage`; `i` shows its tasks one card at a time
+(title, description, tags, due date):
+
+| Key            | Action                                             |
+| -------------- | -------------------------------------------------- |
+| `1`–`4`        | Send the task to that quadrant, show the next      |
+| `s`            | Skip: the task stays in the Inbox                  |
+| `e`            | Edit the task in `$EDITOR`, stay on its card       |
+| `d`            | Delete (asks for confirmation)                     |
+| `Esc` / `q`    | Back to the matrix (does not quit)                 |
+
+A session visits each task once; when the last card is done you are back in
+the matrix with a summary such as `Inbox triaged: 6 sorted, 2 skipped`.
+
 ## Development
 
 ```sh

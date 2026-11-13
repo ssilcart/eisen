@@ -5,6 +5,7 @@ import { basename, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { createTestRenderer, type TestRendererSetup } from "@opentui/core/testing";
 import { bucketOf } from "../../src/domain/task.ts";
+import { importMarkdown } from "../../src/import/importer.ts";
 import { openDb } from "../../src/store/db.ts";
 import { TaskRepository } from "../../src/store/repository.ts";
 import { createMatrixApp, spawnEditor, startTui, type AppOptions, type MatrixApp } from "../../src/tui/app.ts";
@@ -505,6 +506,252 @@ describe("edit in $EDITOR (S11)", () => {
     expect(f).toContain("Nothing selected");
     expect(runs).toBe(0);
     expect(calls).toEqual([]);
+  });
+});
+
+describe("triage (S12) on the user's fixture", () => {
+  const fixture = readFileSync(join(import.meta.dir, "../../fixtures/import/user-tasks.md"), "utf8");
+  let inbox: { id: number; title: string; description: string | null }[];
+
+  beforeEach(() => {
+    // Only the fixture: 8 open tasks, all in the Inbox (S15).
+    db.close();
+    db = openDb(":memory:");
+    repo = new TaskRepository(db);
+    importMarkdown(repo, fixture);
+    inbox = repo.list({ bucket: "inbox" });
+    expect(inbox).toHaveLength(8);
+  });
+
+  function events(taskId: number, type: string): number {
+    const row = db.query("SELECT COUNT(*) AS n FROM events WHERE type = $type AND task_id = $id").get({ id: taskId, type }) as {
+      n: number;
+    };
+    return row.n;
+  }
+
+  async function escape(): Promise<string> {
+    setup.mockInput.pressEscape();
+    await Bun.sleep(30);
+    return frame();
+  }
+
+  test("on start a non-empty Inbox is offered for triage, without entering it", async () => {
+    const f = await start();
+    expect(f).toContain("Inbox: 8");
+    expect(f).toContain("press i to triage");
+    expect(app.state.mode).toBe("normal");
+    expect(f).toContain("Q1 · Do (0)");
+  });
+
+  test("an empty Inbox is not offered", async () => {
+    for (const t of inbox) repo.move(t.id, 2);
+    const f = await start();
+    expect(f).not.toContain("press i to triage");
+    expect(await keys("i")).toContain("Inbox is empty");
+  });
+
+  test("i shows a card for the first Inbox task with its description, tags and the key hints", async () => {
+    await start(120, 30);
+    const f = await keys("i");
+    expect(app.state.mode).toBe("triage");
+    expect(f).toContain("Triage 1/8");
+    expect(f).toContain(inbox[0]!.title);
+    expect(f).toContain("poder organizar los subitems");
+    expect(f).toContain("#todo");
+    expect(f).toContain("1 Do · 2 Schedule · 3 Delegate · 4 Delete · s skip · e edit · d delete · Esc exit");
+    // The card replaces the grid.
+    expect(f).not.toContain("Q2 · Schedule");
+  });
+
+  test("2 moves the task to Q2 with a moved event and shows the next one", async () => {
+    await start(120, 30);
+    await keys("i");
+    const f = await keys("2");
+    const first = repo.get(inbox[0]!.id)!;
+    expect(bucketOf(first)).toBe(2);
+    expect(first.important).toBe(true);
+    expect(first.urgent).toBe(false);
+    expect(events(first.id, "moved")).toBe(1);
+    expect(f).toContain("Triage 2/8");
+    expect(f).toContain(inbox[1]!.title.slice(0, 40));
+    expect(f).toContain("Moved to Q2 · Schedule");
+  });
+
+  test("s skips: the task stays in the Inbox and the next one is shown", async () => {
+    await start(120, 30);
+    const f = await keys("i", "s");
+    expect(bucketOf(repo.get(inbox[0]!.id)!)).toBe("inbox");
+    expect(events(inbox[0]!.id, "moved")).toBe(0);
+    expect(f).toContain("Triage 2/8");
+    expect(f).toContain(inbox[1]!.title.slice(0, 40));
+  });
+
+  test("d asks; n keeps the task on the card; d y deletes it and shows the next", async () => {
+    await start(120, 30);
+    const first = inbox[0]!;
+    let f = await keys("i", "d");
+    expect(f).toContain(`Delete "${first.title}"? y/n`);
+    f = await keys("n");
+    expect(app.state.mode).toBe("triage");
+    expect(f).toContain("Triage 1/8");
+    expect(repo.get(first.id)).not.toBeNull();
+    f = await keys("d", "y");
+    expect(repo.get(first.id)).toBeNull();
+    expect(events(first.id, "deleted")).toBe(1);
+    expect(app.state.mode).toBe("triage");
+    expect(f).toContain("Triage 2/8");
+    expect(f).toContain("Inbox: 7");
+  });
+
+  test("Esc in the delete confirmation goes back to the card", async () => {
+    await start(120, 30);
+    await keys("i", "d");
+    const f = await escape();
+    expect(app.state.mode).toBe("triage");
+    expect(f).toContain("Triage 1/8");
+    expect(repo.list({ bucket: "inbox" })).toHaveLength(8);
+  });
+
+  test("e edits the current task with the editor and stays on its card", async () => {
+    const first = inbox[0]!;
+    await start(120, 30, {
+      runEditor: async (path) => {
+        await Bun.write(path, "# Organise subitems in Delivra #delivra\n\nGroup them by epic\n");
+        return 0;
+      },
+    });
+    setup.renderer.suspend = async () => {};
+    setup.renderer.resume = async () => {};
+    await keys("i");
+    setup.mockInput.pressKey("e");
+    await app.idle();
+    const f = await frame();
+    const task = repo.get(first.id)!;
+    expect(task.title).toBe("Organise subitems in Delivra #delivra");
+    expect(task.description).toBe("Group them by epic");
+    expect(bucketOf(task)).toBe("inbox");
+    expect(events(first.id, "edited")).toBe(1);
+    expect(app.state.mode).toBe("triage");
+    expect(f).toContain("Triage 1/8");
+    expect(f).toContain("Organise subitems in Delivra #delivra");
+    expect(f).toContain("Group them by epic");
+    expect(f).toContain("Saved");
+    // Triage carries on from the edited task.
+    await keys("1");
+    expect(bucketOf(repo.get(first.id)!)).toBe(1);
+  });
+
+  test("finishing the queue returns to the matrix with a summary", async () => {
+    await start(120, 30);
+    let f = await keys("i", "1", "2", "3", "4", "s", "2", "s");
+    expect(f).toContain("Triage 8/8");
+    f = await keys("1");
+    expect(app.state.mode).toBe("normal");
+    expect(f).toContain("Inbox triaged: 6 sorted, 2 skipped");
+    expect(f).toContain("Inbox: 2");
+    expect(f).toContain("Q1 · Do (2)");
+    expect(f).toContain("Q2 · Schedule (2)");
+    expect(f).not.toContain("Triage 8/8");
+    // The matrix works again and nothing quit.
+    expect(await settles(app.done, 20)).toBe("stuck");
+    await keys("x");
+    expect(repo.list({ status: "all" }).filter((t) => t.status === "done").length).toBeGreaterThan(0);
+  });
+
+  test("Esc and q leave triage early without quitting", async () => {
+    await start(120, 30);
+    await keys("i", "2");
+    let f = await escape();
+    expect(app.state.mode).toBe("normal");
+    expect(f).toContain("Triage stopped: 1 sorted, 0 skipped, 7 left in the Inbox");
+    expect(f).toContain("Q2 · Schedule (1)");
+    f = await keys("i");
+    expect(f).toContain("Triage 1/7");
+    f = await keys("q");
+    expect(app.state.mode).toBe("normal");
+    expect(await settles(app.done, 20)).toBe("stuck");
+    // q in the matrix still quits.
+    setup.mockInput.pressKey("q");
+    expect(await settles(app.done)).toBe("done");
+  });
+
+  test("? shows the help over the card and Esc returns to it", async () => {
+    await start(120, 30);
+    let f = await keys("i", "?");
+    expect(f).toContain("Toggle done");
+    f = await escape();
+    expect(app.state.mode).toBe("triage");
+    expect(f).not.toContain("Toggle done");
+    expect(f).toContain("Triage 1/8");
+  });
+
+  test("the card reflows on resize, including a 30×10 screen, and keys keep working", async () => {
+    await start(120, 30);
+    await keys("i");
+    setup.resize(30, 10);
+    let f = await frame();
+    expect(f).toContain("Triage 1/8");
+    expect(f).toContain("Inbox: 8");
+    for (const row of f.split("\n")) expect(Bun.stringWidth(row)).toBeLessThanOrEqual(30);
+    f = await keys("3");
+    expect(bucketOf(repo.get(inbox[0]!.id)!)).toBe(3);
+    expect(f).toContain("Triage 2/8");
+    setup.resize(140, 40);
+    f = await frame();
+    expect(f).toContain("Triage 2/8");
+    expect(f).toContain("1 Do · 2 Schedule · 3 Delegate · 4 Delete · s skip · e edit · d delete · Esc exit");
+  });
+
+  test("starting triage on a 30×10 screen does not throw", async () => {
+    await start(30, 10);
+    const f = await keys("i");
+    expect(f).toContain("Triage 1/8");
+  });
+
+  test("a failed move keeps the same card and shows the error", async () => {
+    await start(120, 30);
+    await keys("i");
+    const move = repo.move.bind(repo);
+    let fail = true;
+    repo.move = (id, q) => {
+      if (fail) {
+        fail = false;
+        throw new Error("database is locked");
+      }
+      return move(id, q);
+    };
+    let f = await keys("2");
+    expect(f).toContain("Error: database is locked");
+    expect(f).toContain("Triage 1/8");
+    f = await keys("2");
+    expect(bucketOf(repo.get(inbox[0]!.id)!)).toBe(2);
+    expect(f).toContain("Triage 2/8");
+  });
+
+  test("Ctrl+C quits from triage even when every reload fails", async () => {
+    await start(120, 30);
+    await keys("i");
+    breakList(repo).failAlways();
+    try {
+      setup.mockInput.pressKey("c", { ctrl: true });
+    } catch {
+      // A reload error escaping the key handler is the bug; the assertion reports it.
+    }
+    expect(await settles(app.done)).toBe("done");
+  });
+
+  test("q leaves triage and q again quits even when every reload fails", async () => {
+    await start(120, 30);
+    await keys("i");
+    breakList(repo).failAlways();
+    try {
+      setup.mockInput.pressKey("q");
+      setup.mockInput.pressKey("q");
+    } catch {
+      // See above.
+    }
+    expect(await settles(app.done)).toBe("done");
   });
 });
 

@@ -3,7 +3,20 @@
 // app.ts runs the repository effects and reloads the panes.
 import type { Quadrant } from "../domain/task.ts";
 
-export type Mode = "normal" | "add" | "confirmDelete" | "help";
+export type Mode = "normal" | "add" | "confirmDelete" | "help" | "triage";
+
+/**
+ * A triage session (S12): the Inbox ids taken when it started, in order, and
+ * where it is. Each task is visited at most once; tasks that reach the Inbox
+ * later wait for the next session.
+ */
+export interface TriageSession {
+  queue: readonly number[];
+  index: number;
+  sorted: number;
+  skipped: number;
+  deleted: number;
+}
 
 export interface Key {
   name: string;
@@ -24,6 +37,8 @@ export interface ViewState {
   /** One-off message for the status line, cleared by the next key. */
   status: string | null;
   quit: boolean;
+  /** Set while triaging; `confirmDelete` and `help` return to it. */
+  triage: TriageSession | null;
 }
 
 /** What the panes show, in display order; only the ids matter here. */
@@ -48,8 +63,11 @@ export type Action =
   | { type: "quit" }
   /** Opens the selected task in $EDITOR (S11); the controller runs it. */
   | { type: "edit" }
-  // Hooks for later tasks: T8 (triage), T11 (search).
+  /** Starts triaging the Inbox (S12). */
   | { type: "triage" }
+  | { type: "skip" }
+  | { type: "exitTriage" }
+  // Hook for T11 (search).
   | { type: "search" }
   | { type: "noop" };
 
@@ -62,6 +80,7 @@ export function initialState(): ViewState {
     input: "",
     status: null,
     quit: false,
+    triage: null,
   };
 }
 
@@ -105,9 +124,38 @@ export function keyToAction(state: ViewState, key: Key): Action {
     case "help":
       if (key.name === "escape" || key.name === "?" || (key.name === "q" && !key.shift)) return { type: "cancel" };
       return NOOP;
+    case "triage":
+      return triageKey(key);
     case "normal":
       return normalKey(key);
   }
+}
+
+function triageKey(key: Key): Action {
+  if (key.ctrl || key.meta) return NOOP;
+  switch (key.name) {
+    case "1":
+    case "2":
+    case "3":
+    case "4":
+      return { type: "moveTo", quadrant: Number(key.name) as Quadrant };
+    case "?":
+      return { type: "help" };
+    case "escape":
+      return { type: "exitTriage" };
+  }
+  if (key.shift) return NOOP;
+  switch (key.name) {
+    case "s":
+      return { type: "skip" };
+    case "e":
+      return { type: "edit" };
+    case "d":
+      return { type: "requestDelete" };
+    case "q":
+      return { type: "exitTriage" };
+  }
+  return NOOP;
 }
 
 function addKey(key: Key): Action {
@@ -157,13 +205,16 @@ function normalKey(key: Key): Action {
   return NOOP;
 }
 
-const COMING_SOON: Record<"triage" | "search", string> = {
-  triage: "Triage: coming soon",
-  search: "Search: coming soon",
-};
-
-/** View-only transitions. Repository effects are the controller's job. */
-export function reduce(state: ViewState, action: Action, panes: PaneItems): ViewState {
+/**
+ * View-only transitions. Repository effects are the controller's job.
+ * `inbox` is the open Inbox in display order; only `triage` reads it.
+ */
+export function reduce(
+  state: ViewState,
+  action: Action,
+  panes: PaneItems,
+  inbox: readonly { id: number }[] = [],
+): ViewState {
   const s: ViewState = { ...state, selected: { ...state.selected }, status: null };
   switch (action.type) {
     case "navigate":
@@ -177,23 +228,33 @@ export function reduce(state: ViewState, action: Action, panes: PaneItems): View
     case "submitAdd":
       return { ...s, mode: "normal", input: "" };
     case "requestDelete":
-      if (selectedId(s, panes) === null) return { ...s, status: "Nothing selected" };
+      if (currentId(s, panes) === null) return { ...s, status: "Nothing selected" };
       return { ...s, mode: "confirmDelete" };
     case "confirmDelete":
+      return s.triage ? advance({ ...s, mode: "triage" }, "deleted") : { ...s, mode: "normal" };
     case "cancel":
-      return { ...s, mode: "normal", input: "" };
+      return { ...s, mode: s.triage ? "triage" : "normal", input: "" };
     case "toggleShowDone":
       return clamp({ ...s, showDone: !s.showDone }, panes);
     case "help":
       return { ...s, mode: "help" };
     case "quit":
       return { ...s, quit: true };
-    case "triage":
+    case "triage": {
+      if (inbox.length === 0) return { ...s, status: "Inbox is empty: nothing to triage" };
+      const queue = inbox.map((item) => item.id);
+      return { ...s, mode: "triage", triage: { queue, index: 0, sorted: 0, skipped: 0, deleted: 0 } };
+    }
+    case "skip":
+      return s.triage ? advance(s, "skipped") : s;
+    case "exitTriage":
+      return s.triage ? endTriage(s, s.triage) : s;
     case "search":
-      return { ...s, status: COMING_SOON[action.type] };
+      return { ...s, status: "Search: coming soon" };
     case "noop":
       return { ...s, status: state.status };
     case "moveTo":
+      return s.triage ? advance(s, "sorted") : s;
     case "toggleDone":
     case "reorder":
     case "edit":
@@ -247,4 +308,48 @@ export function follow(state: ViewState, panes: PaneItems, id: number): ViewStat
 
 export function selectedId(state: ViewState, panes: PaneItems): number | null {
   return panes[state.focus][state.selected[state.focus]]?.id ?? null;
+}
+
+/** The task the next action applies to: the triage card's, else the selected one. */
+export function currentId(state: ViewState, panes: PaneItems): number | null {
+  if (state.triage) return state.triage.queue[state.triage.index] ?? null;
+  return selectedId(state, panes);
+}
+
+/** Counts the current card as `outcome` and shows the next, or ends the session. */
+function advance(s: ViewState, outcome: "sorted" | "skipped" | "deleted"): ViewState {
+  const t = s.triage!;
+  const triage = { ...t, index: t.index + 1, [outcome]: t[outcome] + 1 };
+  return triage.index >= triage.queue.length ? endTriage(s, triage) : { ...s, triage };
+}
+
+/** Back to the matrix with a summary of the session. */
+function endTriage(s: ViewState, t: TriageSession): ViewState {
+  const counts = `${t.sorted} sorted, ${t.skipped} skipped`;
+  const left = t.queue.length - t.index;
+  const status =
+    left > 0
+      ? `Triage stopped: ${counts}${t.deleted ? `, ${t.deleted} deleted` : ""}, ${left} left in the Inbox`
+      : `Inbox triaged: ${counts}${t.deleted ? `, ${t.deleted} deleted` : ""}`;
+  return { ...s, mode: "normal", triage: null, status };
+}
+
+/**
+ * After a reload: skips queued tasks that are no longer in the Inbox (moved or
+ * deleted elsewhere) and ends the session when none are left.
+ */
+export function syncTriage(state: ViewState, inbox: readonly { id: number }[]): ViewState {
+  const t = state.triage;
+  if (!t) return state;
+  const present = new Set(inbox.map((item) => item.id));
+  let index = t.index;
+  while (index < t.queue.length && !present.has(t.queue[index]!)) index++;
+  if (index === t.index) return state;
+  const triage = { ...t, index };
+  return index >= t.queue.length ? endTriage(state, triage) : { ...state, triage };
+}
+
+/** S12: on start, a non-empty Inbox is offered in the status line, not forced. */
+export function offerTriage(state: ViewState, inboxCount: number): ViewState {
+  return inboxCount > 0 ? { ...state, status: "press i to triage" } : state;
 }

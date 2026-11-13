@@ -1,7 +1,8 @@
 // The matrix TUI (S9, S10): OpenTUI view + controller. View state and key
 // mapping live in state.ts; every change to tasks goes through TaskRepository,
 // and the panes are reloaded from it after each effect. `e` hands the terminal
-// to $EDITOR (S11); the edit file format lives in edit-file.ts.
+// to $EDITOR (S11); the edit file format lives in edit-file.ts. `i` triages
+// the Inbox one card at a time (S12); the card's layout is in triage-card.ts.
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -26,15 +27,18 @@ import { editChanges, editorCommand, parseTaskFile, serializeTask } from "./edit
 import { fit, gridSizes, windowStart } from "./layout.ts";
 import {
   clamp,
+  currentId,
   follow,
   initialState,
   keyToAction,
+  offerTriage,
   reduce,
-  selectedId,
+  syncTriage,
   type Action,
   type PaneItems,
   type ViewState,
 } from "./state.ts";
+import { cardLines, type CardLineKind } from "./triage-card.ts";
 
 export interface AppOptions {
   /** Today as YYYY-MM-DD, for due-date escalation (S7). Default: local date. */
@@ -85,7 +89,7 @@ const HELP: [string, string][] = [
   ["J / K", "Reorder inside the quadrant"],
   [".", "Show / hide done tasks"],
   ["e", "Edit in $EDITOR"],
-  ["i", "Triage the Inbox (coming soon)"],
+  ["i", "Triage the Inbox: 1-4 sort, s skip, Esc exit"],
   ["/", "Search (coming soon)"],
   ["?", "Help"],
   ["q", "Quit"],
@@ -117,6 +121,8 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
   let tasks: Record<Quadrant, Task[]> = { 1: [], 2: [], 3: [], 4: [] };
   let openCounts: Record<Quadrant, number> = { 1: 0, 2: 0, 3: 0, 4: 0 };
   let inboxCount = 0;
+  /** Open Inbox tasks in display order: the triage queue's source (S12). */
+  let inbox: Task[] = [];
   let currentDay = today();
   let resolveDone!: () => void;
   const done = new Promise<void>((resolve) => (resolveDone = resolve));
@@ -168,8 +174,26 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
   });
   const helpText = new TextRenderable(renderer, { id: "eisen-help-text", content: helpContent(), wrapMode: "none" });
   help.add(helpText);
+  // The triage card covers the grid (not the status line) while triaging.
+  const card = new BoxRenderable(renderer, {
+    id: "eisen-triage",
+    position: "absolute",
+    zIndex: 5,
+    visible: false,
+    border: true,
+    borderStyle: "rounded",
+    borderColor: COLOR.focus,
+    titleColor: COLOR.focus,
+    backgroundColor: COLOR.panel,
+    paddingLeft: 1,
+    paddingRight: 1,
+    overflow: "hidden",
+  });
+  const cardText = new TextRenderable(renderer, { id: "eisen-triage-text", content: "", wrapMode: "none" });
+  card.add(cardText);
   for (const row of rows) container.add(row);
   container.add(status);
+  container.add(card);
   container.add(help);
   renderer.root.add(container);
 
@@ -179,11 +203,11 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     const all = repo.list({ status: state.showDone ? "all" : "open" });
     const next: Record<Quadrant, Task[]> = { 1: [], 2: [], 3: [], 4: [] };
     const counts: Record<Quadrant, number> = { 1: 0, 2: 0, 3: 0, 4: 0 };
-    inboxCount = 0;
+    const nextInbox: Task[] = [];
     for (const task of all) {
       const bucket = displayBucket(task, currentDay, within);
       if (bucket === "inbox") {
-        if (task.status === "open") inboxCount++;
+        if (task.status === "open") nextInbox.push(task);
         continue;
       }
       next[bucket].push(task);
@@ -193,9 +217,27 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     for (const q of QUADRANTS) next[q].sort((a, b) => Number(a.status === "done") - Number(b.status === "done"));
     tasks = next;
     openCounts = counts;
+    inbox = nextInbox;
+    inboxCount = nextInbox.length;
   }
 
   const items = (): PaneItems => tasks;
+
+  function taskById(id: number | null): Task | undefined {
+    if (id === null) return undefined;
+    return inbox.find((t) => t.id === id) ?? QUADRANTS.map((q) => tasks[q].find((t) => t.id === id)).find(Boolean);
+  }
+
+  /** Reload, then drop triage cards whose task left the Inbox meanwhile. */
+  function reload(next: ViewState): ViewState {
+    try {
+      load();
+    } catch (error) {
+      // Keep the last loaded tasks on screen and say why they may be stale.
+      next = { ...next, status: errorMessage(error) };
+    }
+    return syncTriage(next, inbox);
+  }
 
   // ── Drawing ──────────────────────────────────────────────────────────────
   function layout(): void {
@@ -215,6 +257,35 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     help.height = helpHeight;
     help.left = Math.max(0, Math.floor((width - helpWidth) / 2));
     help.top = Math.max(0, Math.floor((height - 1 - helpHeight) / 2));
+    card.left = 0;
+    card.top = 0;
+    card.width = width;
+    card.height = Math.max(0, height - 1);
+  }
+
+  /** Inner size of the card: border (2) and padding (2) across, border (2) down. */
+  function cardInner(): { width: number; height: number } {
+    return { width: Math.max(0, renderer.width - 4), height: Math.max(0, renderer.height - 1 - 2) };
+  }
+
+  function drawCard(): void {
+    const t = state.triage;
+    card.visible = t !== null;
+    if (!t) return;
+    const task = taskById(t.queue[t.index] ?? null);
+    const label = ` Triage ${t.index + 1}/${t.queue.length} `;
+    card.title = Bun.stringWidth(label) + 2 <= renderer.width ? label : undefined;
+    const inner = cardInner();
+    if (!task) {
+      cardText.content = new StyledText([fg(COLOR.muted)(fit("Task not found", inner.width))]);
+      return;
+    }
+    const chunks: TextChunk[] = [];
+    cardLines(task, inner.width, inner.height).forEach((l, i) => {
+      if (i > 0) chunks.push(plain("\n"));
+      chunks.push(CARD_STYLE[l.kind](l.text));
+    });
+    cardText.content = new StyledText(chunks);
   }
 
   function draw(): void {
@@ -240,6 +311,7 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
       pane.text.content = paneContent(visible, start, inner.width, focused ? state.selected[q] : -1);
     }
     status.content = statusContent(renderer.width);
+    drawCard();
     help.visible = state.mode === "help";
     renderer.requestRender();
   }
@@ -283,9 +355,17 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
         ]);
       }
       case "confirmDelete": {
-        const id = selectedId(state, items());
-        const task = id === null ? undefined : tasks[state.focus].find((t) => t.id === id);
+        const task = taskById(currentId(state, items()));
         return line(width, [fg(COLOR.escalated)(bold(` Delete "${task?.title ?? ""}"? y/n`))]);
+      }
+      case "triage": {
+        const t = state.triage;
+        const where = t ? `Triage ${t.index + 1}/${t.queue.length}` : "Triage";
+        return line(width, [
+          bold(` Inbox: ${inboxCount}`),
+          fg(COLOR.muted)("  │ "),
+          state.status ? fg(COLOR.due)(state.status) : fg(COLOR.muted)(`${where} · ? help`),
+        ]);
       }
       case "help":
         return line(width, [bold(` Inbox: ${inboxCount}`), fg(COLOR.muted)("  │ Esc close help")]);
@@ -317,10 +397,11 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
   // ── Controller ───────────────────────────────────────────────────────────
   function dispatch(action: Action): void {
     const before = state;
-    const id = selectedId(before, items());
-    let next = reduce(before, action, items());
+    const id = currentId(before, items());
+    let next = reduce(before, action, items(), inbox);
     let followId: number | null = null;
     let message: string | null = null;
+    let failed = false;
     if (action.type === "edit" && id !== null) {
       // The editor owns the terminal from here; editTask redraws when it is back.
       state = next;
@@ -382,8 +463,12 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
       }
     } catch (error) {
       message = errorMessage(error);
+      failed = true;
     }
-    if (message !== null) next = { ...next, status: message };
+    // A failed effect keeps the triage card where it was.
+    if (failed && before.triage) next = { ...next, mode: "triage", triage: before.triage };
+    // The end-of-triage summary wins over the last move's message, not over an error.
+    if (message !== null && (failed || next.status === null)) next = { ...next, status: message };
     state = next; // load() reads showDone from the new state
     // Quitting never depends on the repository: a failing reload must not
     // keep the user in the alternate screen.
@@ -391,12 +476,7 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
       resolveDone();
       return;
     }
-    try {
-      load();
-    } catch (error) {
-      // Keep the last loaded tasks on screen and say why they may be stale.
-      next = { ...next, status: errorMessage(error) };
-    }
+    next = reload(next);
     state = followId === null ? clamp(next, items()) : follow(next, items(), followId);
     draw();
   }
@@ -435,13 +515,7 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
       }
     }
     if (destroyed) return;
-    let next: ViewState = { ...state, status: message };
-    try {
-      load();
-    } catch (error) {
-      next = { ...next, status: errorMessage(error) };
-    }
-    state = follow(next, items(), id);
+    state = follow(reload({ ...state, status: message }), items(), id);
     try {
       draw();
     } catch {
@@ -478,6 +552,7 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
   renderer.keyInput.on("keypress", onKey);
   renderer.on("resize", onResize);
   load();
+  state = offerTriage(state, inboxCount);
   layout();
   draw();
 
@@ -491,7 +566,7 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     },
     refresh() {
       load();
-      state = clamp(state, items());
+      state = clamp(syncTriage(state, inbox), items());
       draw();
     },
     destroy() {
@@ -504,6 +579,14 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     },
   };
 }
+
+const CARD_STYLE: Record<CardLineKind, (text: string) => TextChunk> = {
+  title: (text) => fg(COLOR.text)(bold(text)),
+  text: (text) => fg(COLOR.text)(text),
+  meta: (text) => fg(COLOR.due)(text),
+  hint: (text) => fg(COLOR.focus)(text),
+  blank: (text) => plain(text),
+};
 
 const HELP_KEY_WIDTH = Math.max(...HELP.map(([k]) => k.length)) + 2;
 
