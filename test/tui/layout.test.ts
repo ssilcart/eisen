@@ -1,5 +1,15 @@
 import { describe, expect, test } from "bun:test";
-import { editorBox, editorFits, fit, gridSizes, stripHeight, windowStart, wrap } from "../../src/tui/layout.ts";
+import {
+  SIDEBAR_MIN_COLUMNS,
+  editorBox,
+  editorFits,
+  fit,
+  gridSizes,
+  sidebarLayout,
+  stripHeight,
+  windowStart,
+  wrap,
+} from "../../src/tui/layout.ts";
 
 describe("wrap", () => {
   test("breaks on spaces to fit the width", () => {
@@ -134,5 +144,58 @@ describe("floating editor box (S22)", () => {
     expect(editorFits(120, 40)).toBe(true);
     expect(editorFits(39, 40)).toBe(false);
     expect(editorFits(120, 11)).toBe(false);
+  });
+});
+
+describe("sidebarLayout (S26)", () => {
+  const both = { preview: true, done: true };
+  const previewOnly = { preview: true, done: false };
+  const doneOnly = { preview: false, done: true };
+  const none = { preview: false, done: false };
+
+  test("width: round(35%) of the terminal, clamped to 32-60 columns", () => {
+    expect(sidebarLayout(160, 40, both)?.width).toBe(56);
+    expect(sidebarLayout(120, 40, both)?.width).toBe(42);
+    expect(sidebarLayout(100, 40, both)?.width).toBe(35);
+    expect(sidebarLayout(200, 40, both)?.width).toBe(60);
+    expect(sidebarLayout(400, 40, doneOnly)?.width).toBe(60);
+  });
+
+  test("hidden under 100 columns, whatever is on", () => {
+    expect(SIDEBAR_MIN_COLUMNS).toBe(100);
+    for (const panels of [both, previewOnly, doneOnly, none]) expect(sidebarLayout(99, 40, panels)).toBeNull();
+    expect(sidebarLayout(60, 16, both)).toBeNull();
+  });
+
+  test("hidden when no panel is on", () => {
+    for (const w of [160, 120, 100, 99]) expect(sidebarLayout(w, 40, none)).toBeNull();
+  });
+
+  test("both: preview on top ~60%, done panel below, full height above the status line", () => {
+    for (const w of [160, 120, 100]) {
+      expect(sidebarLayout(w, 40, both)).toMatchObject({ preview: 23, done: 16 });
+    }
+    expect(sidebarLayout(120, 30, both)).toMatchObject({ preview: 17, done: 12 });
+  });
+
+  test("one panel takes the whole height", () => {
+    for (const w of [160, 120, 100]) {
+      expect(sidebarLayout(w, 40, previewOnly)).toMatchObject({ preview: 39, done: 0 });
+      expect(sidebarLayout(w, 40, doneOnly)).toMatchObject({ preview: 0, done: 39 });
+    }
+  });
+
+  test("both but either under 5 rows: the done panel collapses to its title line", () => {
+    expect(sidebarLayout(120, 13, both)).toMatchObject({ preview: 7, done: 5 });
+    expect(sidebarLayout(120, 12, both)).toMatchObject({ preview: 10, done: 1 });
+    expect(sidebarLayout(120, 10, both)).toMatchObject({ preview: 8, done: 1 });
+  });
+
+  test("at every size the rows add up to the area above the status line", () => {
+    for (let h = 2; h <= 80; h++) {
+      const s = sidebarLayout(120, h, both)!;
+      expect(s.preview + s.done).toBe(h - 1);
+      expect(s.done === 1 || (s.done >= 5 && s.preview >= 5)).toBe(true);
+    }
   });
 });

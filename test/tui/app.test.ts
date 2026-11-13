@@ -298,7 +298,7 @@ describe("keys (S10)", () => {
     expect(bucketOf(byTitle("Pay rent")!)).toBe(1);
   });
 
-  test("x toggles done; . shows done tasks dimmed with ✓", async () => {
+  test("x toggles done; . shows the done panel (S27), never done tasks in the quadrants", async () => {
     await start();
     let f = await keys("x");
     expect(byTitle("Pay rent")!.status).toBe("done");
@@ -308,6 +308,8 @@ describe("keys (S10)", () => {
     f = await keys(".");
     const row = f.split("\n").find((line) => line.includes("Pay rent"))!;
     expect(row).toContain("✓");
+    expect(f).toContain("✓ Done (1)");
+    expect(where(f, "Pay rent").col).toBeGreaterThan(where(f, "Q2 · 📅 Schedule").col);
     expect(f).toContain("Q1 · ✅ Do (2)");
   });
 
@@ -1440,9 +1442,9 @@ describe("search (S19) on the user's fixture", () => {
     expect(grid(f)).toContain(META);
   });
 
-  test("done tasks appear dimmed with ✓ even while . hides them", async () => {
+  test("done tasks appear dimmed with ✓ in their quadrant while the done panel is off", async () => {
     await start(120, 30);
-    expect(app.state.showDone).toBe(false);
+    expect(app.state.donePanel).toBe(false);
     await keys("/");
     const f = await type("api calls");
     expect(f).toContain("Q4 · 🧹 Delete (1/1)");
@@ -1659,7 +1661,7 @@ describe("presets and settings (S20, S21)", () => {
     expect(bucketOf(rent)).toBe(1);
     expect(repo.list({ status: "all" })).toHaveLength(8);
     expect(app.state.focus).toBe(1);
-    expect(app.state.showDone).toBe(false);
+    expect(app.state.donePanel).toBe(false);
     expect(existsSync(configEnv.EISEN_CONFIG!)).toBe(false);
   });
 
@@ -1978,7 +1980,7 @@ describe("Inbox strip always visible (S24) on the user's fixture", () => {
     expect(bucketOf(repo.get(inbox[6]!.id)!)).toBe(1);
   });
 
-  test("x marks the selected Inbox task done; . shows it dimmed with ✓ in the strip; x reopens it", async () => {
+  test("x marks the selected Inbox task done; . shows it in the done panel, not the strip; x there reopens it", async () => {
     await start(120, 30);
     await enterStrip();
     for (let i = 0; i < 7; i++) setup.mockInput.pressKey("j");
@@ -1992,10 +1994,12 @@ describe("Inbox strip always visible (S24) on the user's fixture", () => {
     const row = f.split("\n").find((line) => line.includes(title(7)))!;
     expect(row).toContain("✓");
     expect(f).toContain("📥 Inbox (7)"); // the count is of open tasks
-    const span = setup.captureSpans().lines.flatMap((l) => l.spans).find((s) => s.text.includes(title(7)))!;
-    expect(span.attributes & TextAttributes.DIM).toBeTruthy();
-    await keys("j");
-    expect(app.state.selected.inbox).toBe(7);
+    expect(f).toContain("✓ Done (1)");
+    expect(where(f, title(7)).row).toBeLessThan(where(f, "📥 Inbox (7)").row); // in the sidebar, not the strip
+    // Up out of the strip to the bottom pane it came from, then right into the panel (via Q4).
+    for (let i = 0; i < 20 && app.state.focus === "inbox"; i++) await keys("k");
+    await keys("l", "l");
+    expect(app.state.focus).toBe("done");
     f = await keys("x");
     expect(repo.get(last.id)!.status).toBe("open");
     expect(f).toContain("📥 Inbox (8)");
@@ -2249,5 +2253,294 @@ describe("rebindable keys (S30)", () => {
     expect(statusOf(await frame())).toContain("Config: keys is not an object");
     setup.mockInput.pressKey("q");
     await run;
+  });
+});
+
+// Hex of an OpenTUI RGBA, lowercase.
+const hexOf = (c: { toInts(): number[] }) =>
+  `#${c
+    .toInts()
+    .slice(0, 3)
+    .map((n) => n.toString(16).padStart(2, "0"))
+    .join("")}`;
+
+// The span right before the one holding `title` on its row: the row's mark.
+function markOf(title: string) {
+  for (const line of setup.captureSpans().lines) {
+    const i = line.spans.findIndex((s) => s.text.includes(title));
+    if (i > 0) return line.spans[i - 1]!;
+  }
+  throw new Error(`"${title}" not in the frame`);
+}
+
+describe("done panel in the sidebar (S26, S27)", () => {
+  let saved: Record<string, unknown>[];
+
+  beforeEach(() => {
+    saved = [];
+    // One second per repository write, from noon UTC: completion order is deterministic.
+    let t = Date.parse("2026-11-12T12:00:00Z");
+    repo = new TaskRepository(db, () => new Date((t += 1000)));
+    repo.toggleDone(byTitle("Watch TV")!.id);
+  });
+
+  function open(width = 140, height = 40, over: AppOptions = {}) {
+    return start(width, height, { view: { donePanel: true }, saveView: (patch) => void saved.push(patch), ...over });
+  }
+
+  // The row holding `text`, from the done panel's left border on.
+  function panelRow(f: string, text: string): string {
+    const col = where(f, "✓ Done").col;
+    return f.split("\n").find((line) => line.includes(text))!.slice(col - 2);
+  }
+
+  test("at 140×40 the done panel is a right sidebar titled ✓ Done (n), the grid and the strip to its left", async () => {
+    const f = await open();
+    expect(f).toContain("✓ Done (1)");
+    const panel = where(f, "✓ Done (1)");
+    expect(panel.row).toBe(where(f, "Q1 · ✅ Do").row);
+    expect(panel.col).toBeGreaterThan(where(f, "Q2 · 📅 Schedule").col);
+    expect(where(f, "Watch TV").col).toBeGreaterThan(panel.col - 2);
+    expect(f).toContain("Q4 · 🧹 Delete (0)");
+    // The sidebar runs the full height above the status line; the strip stops at its left.
+    expect(where(f, "📥 Inbox (2)").col).toBeLessThan(panel.col);
+    const last = grid(f).split("\n").at(-1)!.trimEnd();
+    expect(last.endsWith("╯")).toBe(true);
+    expect((last.match(/╰/g) ?? []).length).toBe(2); // the strip's corner and the panel's
+  });
+
+  test("done panel off (the default here): no sidebar, the done task is not in the grid", async () => {
+    const f = await start(140, 40);
+    expect(f).not.toContain("✓ Done");
+    expect(grid(f)).not.toContain("Watch TV");
+  });
+
+  test("x on a Q1 task removes it from Q1 and puts it at the top of the panel", async () => {
+    await open();
+    const f = await keys("x");
+    expect(byTitle("Pay rent")!.status).toBe("done");
+    expect(f).toContain("Q1 · ✅ Do (2)");
+    expect(f).toContain("✓ Done (2)");
+    const panel = where(f, "✓ Done (2)");
+    expect(where(f, "Pay rent").col).toBeGreaterThan(panel.col - 2);
+    expect(where(f, "Pay rent").row).toBe(panel.row + 1);
+    expect(where(f, "Watch TV").row).toBe(panel.row + 2);
+  });
+
+  test("x in the panel reopens the task back in Q1", async () => {
+    repo.toggleDone(byTitle("Pay rent")!.id);
+    let f = await open();
+    expect(f).toContain("Q1 · ✅ Do (2)");
+    await keys("l", "l");
+    expect(app.state.focus).toBe("done");
+    f = await keys("x");
+    expect(byTitle("Pay rent")!.status).toBe("open");
+    expect(f).toContain("Reopened: Pay rent");
+    expect(f).toContain("Q1 · ✅ Do (3)");
+    expect(f).toContain("✓ Done (1)");
+    expect(where(f, "Pay rent").col).toBeLessThan(where(f, "Q2 · 📅 Schedule").col);
+    // The focus stays in the panel, on what is left there; h goes back to Q2.
+    expect(app.state.focus).toBe("done");
+    await keys("h");
+    expect(app.state.focus).toBe(2);
+  });
+
+  test("rows: ✓ in the task's quadrant colour (Inbox grey), the title, MM-DD on the right", async () => {
+    repo.toggleDone(byTitle("Unsorted idea")!.id);
+    const f = await open();
+    const day = (iso: string) => {
+      const d = new Date(iso);
+      return `${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+    };
+    const tv = byTitle("Watch TV")!;
+    const row = panelRow(f, "Watch TV");
+    expect(row).toContain("✓ Watch TV");
+    expect(row.trimEnd().replace(/│$/, "").trimEnd().endsWith(day(tv.completedAt!))).toBe(true);
+    expect(markOf("Watch TV").text).toBe("✓ ");
+    expect(hexOf(markOf("Watch TV").fg)).toBe(BUCKET_COLOR[4].toLowerCase());
+    expect(hexOf(markOf("Unsorted idea").fg)).toBe(BUCKET_COLOR.inbox.toLowerCase());
+  });
+
+  test("J/K in the panel say the order is by completion; 1 moves the task, still done; d deletes after y", async () => {
+    repo.toggleDone(byTitle("Plan the trip")!.id);
+    await open();
+    await keys("l", "l");
+    setup.mockInput.pressKey("J", { shift: true });
+    let f = await frame();
+    expect(statusOf(f)).toContain("Done tasks are ordered by completion");
+    f = await keys("1");
+    const trip = byTitle("Plan the trip")!;
+    expect(bucketOf(trip)).toBe(1);
+    expect(trip.status).toBe("done");
+    expect(f).toContain("✓ Done (2)");
+    f = await keys("d");
+    expect(f).toContain('Delete "Plan the trip"? y/n');
+    f = await keys("y");
+    expect(byTitle("Plan the trip")).toBeUndefined();
+    expect(f).toContain("✓ Done (1)");
+  });
+
+  test("a search with a done match lists it only in the panel, matches/total in its title", async () => {
+    await open();
+    await keys("/");
+    await setup.mockInput.typeText("watch");
+    const f = await frame();
+    expect(f).toContain("✓ Done (1/1)");
+    expect(f).toContain("Q4 · 🧹 Delete (0/0)");
+    expect(f.split("\n").filter((line) => line.includes("Watch TV"))).toHaveLength(1);
+    expect(where(f, "Watch TV").col).toBeGreaterThan(where(f, "✓ Done").col - 2);
+    // The keys act on the match in the panel.
+    expect(app.state.focus).toBe("done");
+  });
+
+  test("with the panel on but the sidebar hidden (under 100 columns), done matches show in their quadrant with ✓", async () => {
+    await open(90, 30);
+    await keys("/");
+    await setup.mockInput.typeText("watch");
+    const f = await frame();
+    expect(f).not.toContain("✓ Done");
+    expect(f).toContain("Q4 · 🧹 Delete (1/1)");
+    expect(f.split("\n").find((line) => line.includes("Watch TV"))!).toContain("✓");
+  });
+
+  test("under 100 columns the sidebar hides once with a message, focus returns, and it comes back on resize", async () => {
+    await open(140, 40);
+    await keys("l", "l");
+    expect(app.state.focus).toBe("done");
+    setup.resize(90, 30);
+    let f = await frame();
+    expect(f).not.toContain("✓ Done");
+    expect(statusOf(f)).toContain("Sidebar hidden: needs 100 columns");
+    expect(app.state.focus).toBe(2);
+    f = await keys("j");
+    expect(statusOf(f)).not.toContain("Sidebar hidden");
+    setup.resize(95, 30);
+    f = await frame();
+    expect(statusOf(f)).not.toContain("Sidebar hidden");
+    setup.resize(140, 40);
+    f = await frame();
+    expect(f).toContain("✓ Done (1)");
+  });
+
+  test(". toggles the panel and persists donePanel through the injected saver, never with undefined fields", async () => {
+    let f = await open(140, 40, { view: { donePanel: false } });
+    expect(f).not.toContain("✓ Done");
+    f = await keys(".");
+    expect(f).toContain("✓ Done (1)");
+    expect(statusOf(f)).toContain("Done panel on");
+    f = await keys(".");
+    expect(f).not.toContain("✓ Done");
+    expect(saved).toEqual([{ donePanel: true }, { donePanel: false }]);
+    for (const patch of saved) expect(Object.values(patch)).not.toContain(undefined);
+  });
+
+  test(". under 100 columns still toggles and saves, and says the sidebar is hidden", async () => {
+    await open(90, 30, { view: { donePanel: false } });
+    const f = await keys(".");
+    expect(app.state.donePanel).toBe(true);
+    expect(saved).toEqual([{ donePanel: true }]);
+    expect(statusOf(f)).toContain("Sidebar hidden: needs 100 columns");
+  });
+
+  test("a save error shows in the status line and the session keeps the new value", async () => {
+    await open(140, 40, {
+      view: { donePanel: false },
+      saveView: () => {
+        throw new Error("EACCES: permission denied");
+      },
+    });
+    const f = await keys(".");
+    expect(statusOf(f)).toContain("EACCES: permission denied");
+    expect(f).toContain("✓ Done (1)");
+    expect(app.state.donePanel).toBe(true);
+  });
+
+  test("the help and the hints describe . as the done panel", async () => {
+    await open();
+    let f = await keys("j"); // past the start-up triage offer
+    expect(statusOf(f)).toContain(". done panel");
+    f = await keys("?");
+    expect(f).toContain("Show / hide the done panel");
+    expect(f).not.toContain("Show / hide done tasks");
+  });
+
+  describe("startTui (S29)", () => {
+    let dir: string;
+    let env: Record<string, string>;
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), "eisen-view-"));
+      env = { EISEN_CONFIG: join(dir, "config.json") };
+    });
+    afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+    test("reads view.donePanel and bullets from the config; . saves donePanel there, other keys kept", async () => {
+      writeFileSync(env.EISEN_CONFIG!, '{"preset": "classic", "view": {"donePanel": true, "bullets": false}, "extra": 1}');
+      setup = await createTestRenderer({ width: 140, height: 40, exitOnCtrlC: false });
+      const run = startTui(repo, { today: () => TODAY }, { createRenderer: async () => setup.renderer, env });
+      await Bun.sleep(20);
+      let f = await frame();
+      expect(f).toContain("✓ Done (1)");
+      expect(f.split("\n").find((line) => line.includes("Call the bank"))!).toContain("  Call the bank");
+      f = await keys(".");
+      expect(f).not.toContain("✓ Done");
+      setup.mockInput.pressKey("q");
+      await run;
+      expect(JSON.parse(readFileSync(env.EISEN_CONFIG!, "utf8"))).toEqual({
+        preset: "classic",
+        view: { donePanel: false, bullets: false },
+        extra: 1,
+      });
+    });
+
+    test("defaults with no file: done panel off, bullets on, nothing written", async () => {
+      setup = await createTestRenderer({ width: 140, height: 40, exitOnCtrlC: false });
+      const run = startTui(repo, { today: () => TODAY }, { createRenderer: async () => setup.renderer, env });
+      await Bun.sleep(20);
+      const f = await frame();
+      expect(f).not.toContain("✓ Done");
+      expect(f).toContain("• Call the bank");
+      setup.mockInput.pressKey("q");
+      await run;
+      expect(existsSync(env.EISEN_CONFIG!)).toBe(false);
+    });
+  });
+});
+
+describe("bullets (S28)", () => {
+  test("open rows start with • in the pane's colour, escalated ones with !, in the quadrants and the strip", async () => {
+    const f = await start(120, 30, { view: { bullets: true } });
+    for (const title of ["Pay rent", "Call the bank", "Plan the trip", "Reply to email", "Watch TV", "Unsorted idea", "Another idea"]) {
+      expect(f.split("\n").find((line) => line.includes(title))!).toContain(`• ${title}`);
+    }
+    expect(f.split("\n").find((line) => line.includes("Renew passport"))!).toContain("! Renew passport");
+    expect(markOf("Call the bank").text).toBe("• ");
+    expect(hexOf(markOf("Call the bank").fg)).toBe(BUCKET_COLOR[1].toLowerCase());
+    expect(hexOf(markOf("Plan the trip").fg)).toBe(BUCKET_COLOR[2].toLowerCase());
+    expect(hexOf(markOf("Unsorted idea").fg)).toBe(BUCKET_COLOR.inbox.toLowerCase());
+  });
+
+  test("the selected row keeps its highlight across the bullet", async () => {
+    await start(120, 30, { view: { bullets: true } });
+    const mark = markOf("Pay rent");
+    expect(mark.text).toBe("• ");
+    expect(hexOf(mark.bg)).toBe(paneStyle(1, true).selectBg.toLowerCase());
+  });
+
+  test("bullets off (the default here) keeps the blank mark", async () => {
+    const f = await start(120, 30);
+    expect(f).not.toContain("•");
+    expect(f.split("\n").find((line) => line.includes("Call the bank"))!).toContain("  Call the bank");
+  });
+
+  test("toggle_bullets (no default key) toggles them and saves bullets through the saver", async () => {
+    const saved: unknown[] = [];
+    let f = await start(120, 30, { view: { bullets: true }, keys: { toggle_bullets: ["b"] }, saveView: (p) => void saved.push(p) });
+    expect(f).toContain("• Call the bank");
+    f = await keys("b");
+    expect(f).not.toContain("•");
+    expect(statusOf(f)).toContain("Bullets off");
+    f = await keys("b");
+    expect(f).toContain("• Call the bank");
+    expect(saved).toEqual([{ bullets: false }, { bullets: true }]);
   });
 });

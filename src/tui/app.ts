@@ -11,7 +11,11 @@
 // entered with `j` from Q3/Q4, where every matrix action works on its
 // selected task. Pane titles and messages use the active quadrant preset
 // (S20), which `,` changes and saves (S21); each pane has its colour (S23,
-// theme.ts).
+// theme.ts). A right sidebar (S26, layout.ts) holds the done panel (S27): a
+// sixth pane entered with `l` from Q2/Q4, toggled with `.`; done tasks never
+// show in the quadrants or the strip, except in a search while the panel is
+// off screen (S19). Rows start with a bullet in the pane's colour (S28).
+// The view toggles are saved through `saveView` (S29).
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -34,13 +38,23 @@ import {
 import { displayBucket, isEscalated, localToday, DEFAULT_URGENT_WITHIN_DAYS } from "../domain/escalation.ts";
 import { prepareSearch, search, type SearchIndex } from "../domain/search.ts";
 import { parseTags } from "../domain/tags.ts";
-import { loadConfig, loadSettings, saveConfig } from "../config.ts";
+import { loadConfig, loadSettings, saveConfig, saveSettings, type ViewSettings } from "../config.ts";
 import { getPreset, headingFor, labelFor, type PresetId } from "../domain/presets.ts";
-import { QUADRANTS, bucketOf, type Quadrant, type Task } from "../domain/task.ts";
+import { QUADRANTS, bucketOf, type Bucket, type Quadrant, type Task } from "../domain/task.ts";
 import type { TaskRepository } from "../store/repository.ts";
 import { NEW_TASK_FILE, editChanges, editorCommand, parseNewTask, parseTaskFile, serializeTask } from "./edit-file.ts";
 import { spawnEditorPty, type EditorPty, type LaunchEditorPty } from "./editor-pty.ts";
-import { editorBox, editorFits, fit, gridSizes, stripHeight, windowStart } from "./layout.ts";
+import {
+  SIDEBAR_MIN_COLUMNS,
+  editorBox,
+  editorFits,
+  fit,
+  gridSizes,
+  sidebarLayout,
+  stripHeight,
+  windowStart,
+  type Sidebar,
+} from "./layout.ts";
 import {
   clamp,
   currentId,
@@ -58,7 +72,7 @@ import {
 } from "./state.ts";
 import { buildKeymap, keysOf, type Keymap } from "./keymap.ts";
 import { settingsHeight, settingsLines, settingsWidth, type SettingsLine } from "./settings.ts";
-import { BUCKET_COLOR, COLOR, paneStyle } from "./theme.ts";
+import { BUCKET_COLOR, COLOR, DONE_COLOR, paneStyle } from "./theme.ts";
 import { cardLines, triageHints, type CardLineKind } from "./triage-card.ts";
 
 export type { EditorPty, LaunchEditorPty } from "./editor-pty.ts";
@@ -100,7 +114,22 @@ export interface AppOptions {
    * previous preset and shows the error. Default: applied for this session only.
    */
   savePreset?: (preset: PresetId) => void;
+  /**
+   * The view toggles to start with (S29). A missing field is off here (so
+   * embedders and tests opt in); `startTui` passes the saved settings, whose
+   * defaults are done panel off and bullets on. `preview` is read by the
+   * preview panel (S25), not yet.
+   */
+  view?: Partial<ViewSettings>;
+  /**
+   * Persists a toggled view setting (S29): the patch holds only the field that
+   * changed. Throwing shows the error; the session keeps the new value.
+   * Default: applied for this session only.
+   */
+  saveView?: (patch: Partial<ViewSettings>) => void;
 }
+
+const SIDEBAR_HIDDEN = `Sidebar hidden: needs ${SIDEBAR_MIN_COLUMNS} columns`;
 
 export interface MatrixApp {
   /** Resolves when the user quits. */
@@ -141,7 +170,7 @@ function statusHints(keymap: Keymap): string {
     ...one("delete", "delete"),
     ...one("search", "search"),
     ...item([firstKey(keymap, "order_down"), firstKey(keymap, "order_up")].filter(Boolean).join("/"), "order"),
-    ...one("toggle_done_panel", "done"),
+    ...one("toggle_done_panel", "done panel"),
     ...one("settings", "settings"),
     ...one("help", "help"),
     ...one("quit", "quit"),
@@ -174,7 +203,8 @@ function helpRows(preset: PresetId, keymap: Keymap): [string, string][] {
     [all("toggle_done"), "Toggle done"],
     [all("delete"), "Delete (y/n)"],
     [[all("order_down"), all("order_up")].filter(Boolean).join(" / "), "Reorder inside the quadrant or the Inbox"],
-    [all("toggle_done_panel"), "Show / hide done tasks"],
+    [all("toggle_done_panel"), "Show / hide the done panel (l from Q2/Q4 enters it)"],
+    [all("toggle_bullets"), "Show / hide the bullets"],
     [all("edit"), "Edit in $EDITOR (a floating box; quit it to save)"],
     [all("triage"), `Triage the Inbox: ${triage}`],
     [all("search"), "Search every task: type to filter, Enter keep, Esc clear"],
@@ -214,9 +244,40 @@ function stripTitle(preset: PresetId, count: string, width: number): string {
   return ` (${count}) `;
 }
 
-/** `Q1 · ✅ Do` or `📥 Inbox`, for messages. */
+/**
+ * ` ✓ Done (n) ` (S27), `matches/total` while searching; ` Done (n) `, then
+ * ` (n) `, as the panel narrows.
+ */
+function doneTitle(count: string, width: number): string {
+  for (const title of [` ✓ Done (${count}) `, ` Done (${count}) `]) {
+    if (Bun.stringWidth(title) + 4 <= width) return title;
+  }
+  return ` (${count}) `;
+}
+
+/** `Q1 · ✅ Do`, `📥 Inbox` or `✓ Done`, for messages. */
 function focusLabel(preset: PresetId, focus: Focus): string {
-  return headingFor(preset, focus);
+  return focus === "done" ? "✓ Done" : headingFor(preset, focus);
+}
+
+/** Where `a`/`A` add a task: the focused pane, or beside the done panel when it is focused (S27). */
+function addTarget(state: ViewState): Bucket {
+  return state.focus === "done" ? state.besideDone : state.focus;
+}
+
+/** `MM-DD` of an ISO timestamp, in local time. */
+function monthDay(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  return `${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+/** Most recently completed first (S27); ties by id, newest first. */
+function byCompletion(a: Task, b: Task): number {
+  const ca = a.completedAt ?? "";
+  const cb = b.completedAt ?? "";
+  if (ca !== cb) return ca < cb ? 1 : -1;
+  return b.id - a.id;
 }
 
 interface Pane {
@@ -240,8 +301,8 @@ interface FloatingEditor {
   rows: number;
 }
 
-/** What the editor is opened for: a new task in a pane, or an existing task. */
-type EditTarget = { kind: "new"; focus: Focus } | { kind: "edit"; id: number };
+/** What the editor is opened for: a new task in a quadrant or the Inbox, or an existing task. */
+type EditTarget = { kind: "new"; focus: Bucket } | { kind: "edit"; id: number };
 
 /** ` {title} ` fitted between the box's corners, or nothing when it is too narrow. */
 function editorTitle(title: string, boxWidth: number): string | undefined {
@@ -259,13 +320,17 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
   const launchEditorPty: LaunchEditorPty =
     options.launchEditorPty ?? ((cmd, path, cols, rows) => spawnEditorPty(cmd, path, cols, rows, env));
   const savePreset = options.savePreset ?? (() => {});
+  const saveView = options.saveView ?? (() => {});
   /** The running editor session; keys are ignored while it is set. */
   let editing: Promise<void> | null = null;
   /** The floating editor while it is open (S22): every key goes to it. */
   let floating: FloatingEditor | null = null;
   let destroyed = false;
 
-  let state = initialState(options.preset);
+  let state = initialState(options.preset, {
+    donePanel: options.view?.donePanel ?? false,
+    bullets: options.view?.bullets ?? false,
+  });
   // S30: the keys of the matrix and triage actions; bad overrides are warned at start.
   const { keymap, warnings: keyWarnings } = buildKeymap(options.keys);
   const hints = statusHints(keymap);
@@ -278,8 +343,14 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
   let inboxCount = 0;
   /** Open Inbox tasks in display order: the triage queue's source (S12). */
   let inbox: Task[] = [];
-  /** What the Inbox strip lists (S24): the open Inbox, done ones with `.`, or the Inbox matches (S19). */
+  /** What the Inbox strip lists (S24): the open Inbox, or the Inbox matches (S19). */
   let strip: Task[] = [];
+  /** What the done panel lists (S27): done tasks (or done matches), most recently completed first. */
+  let doneList: Task[] = [];
+  /** Every done task, for the panel's title. */
+  let doneCount = 0;
+  /** The sidebar as last sized; null while it is hidden (S26). */
+  let sidebar: Sidebar | null = null;
   /** Set while a non-blank query filters: matches and totals per pane. */
   let filter: { matches: number; total: Record<Focus, number> } | null = null;
   let currentDay = today();
@@ -288,6 +359,10 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
 
   // ── View tree ────────────────────────────────────────────────────────────
   const container = new BoxRenderable(renderer, { id: "eisen", flexDirection: "column", width: "100%", height: "100%" });
+  // S26: the grid and the Inbox strip on the left, the sidebar on the right.
+  const main = new BoxRenderable(renderer, { id: "eisen-main", flexDirection: "row", flexShrink: 0 });
+  const left = new BoxRenderable(renderer, { id: "eisen-left", flexDirection: "column", flexShrink: 0 });
+  const side = new BoxRenderable(renderer, { id: "eisen-sidebar", flexDirection: "column", flexShrink: 0, visible: false });
   const rows = [0, 1].map(
     (i) => new BoxRenderable(renderer, { id: `eisen-row-${i}`, flexDirection: "row", flexShrink: 0 }),
   );
@@ -338,6 +413,22 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
   );
   const stripText = new TextRenderable(renderer, { id: "eisen-inbox-list", content: "", wrapMode: "none", fg: COLOR.text });
   stripBox.add(stripText);
+  // S27: the done panel, in the sidebar (the preview panel, S25, goes above it).
+  const doneBox = withBoldTitle(
+    new BoxRenderable(renderer, {
+      id: "eisen-done",
+      border: true,
+      borderStyle: "rounded",
+      borderColor: COLOR.border,
+      titleColor: DONE_COLOR,
+      flexShrink: 0,
+      overflow: "hidden",
+      visible: false,
+    }),
+  );
+  const doneText = new TextRenderable(renderer, { id: "eisen-done-list", content: "", wrapMode: "none", fg: COLOR.text });
+  doneBox.add(doneText);
+  side.add(doneBox);
   const status = new TextRenderable(renderer, {
     id: "eisen-status",
     content: "",
@@ -398,8 +489,11 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
   });
   const cardText = new TextRenderable(renderer, { id: "eisen-triage-text", content: "", wrapMode: "none" });
   card.add(cardText);
-  for (const row of rows) container.add(row);
-  container.add(stripBox);
+  for (const row of rows) left.add(row);
+  left.add(stripBox);
+  main.add(left);
+  main.add(side);
+  container.add(main);
   container.add(status);
   container.add(card);
   container.add(help);
@@ -407,48 +501,71 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
   renderer.root.add(container);
 
   // ── Data ─────────────────────────────────────────────────────────────────
-  /** Reads every task; done ones are needed by `.` and by search (S19). */
+  /** Reads every task; done ones are needed by the done panel (S27) and by search (S19). */
   function fetch(): void {
     currentDay = today();
     all = repo.list({ status: "all" });
     searchIndex = null;
   }
 
-  /** Splits `all` into the panes (and the Inbox strip) for view state `s`. */
+  /** The sidebar for view state `s` at the current size, or null while hidden (S26). */
+  function sidebarFor(s: ViewState): Sidebar | null {
+    // The preview panel (S25) is not built yet: only the done panel takes room.
+    return sidebarLayout(renderer.width, renderer.height, { preview: false, done: s.donePanel });
+  }
+
+  /**
+   * Splits `all` into the panes, the Inbox strip and the done panel for view
+   * state `s`. Done tasks go to the done panel while it is on screen (S27);
+   * otherwise they show only as search matches, in their quadrant (S19).
+   */
   function build(s: ViewState): void {
     let rank: Map<number, number> | null = null;
     if (s.query.trim() !== "") {
       searchIndex ??= prepareSearch(all);
       rank = new Map(search(searchIndex, s.query).map((m, i) => [m.task.id, i]));
     }
+    sidebar = sidebarFor(s);
+    const panel = sidebar !== null && sidebar.done > 0;
     const next: Record<Quadrant, Task[]> = { 1: [], 2: [], 3: [], 4: [] };
     const counts: Record<Quadrant, number> = { 1: 0, 2: 0, 3: 0, 4: 0 };
-    const total: Record<Focus, number> = { 1: 0, 2: 0, 3: 0, 4: 0, inbox: 0 };
+    const total: Record<Focus, number> = { 1: 0, 2: 0, 3: 0, 4: 0, inbox: 0, done: 0 };
     const nextInbox: Task[] = [];
     const nextStrip: Task[] = [];
+    const nextDone: Task[] = [];
+    let dones = 0;
     for (const task of all) {
       const bucket = displayBucket(task, currentDay, within);
       const open = task.status === "open";
+      if (!open) dones++;
+      if (open && bucket === "inbox") nextInbox.push(task);
+      if (open && bucket !== "inbox") counts[bucket]++;
+      const matched = rank ? rank.has(task.id) : true;
+      if (!open && panel) {
+        total.done++;
+        if (matched) nextDone.push(task);
+        continue;
+      }
       total[bucket]++;
-      if (bucket === "inbox" && open) nextInbox.push(task);
-      if (bucket !== "inbox" && open) counts[bucket]++;
-      // A query shows its matches, done ones included; otherwise `.` decides.
-      const shown = rank ? rank.has(task.id) : open || s.showDone;
-      if (!shown) continue;
+      // A query shows its matches, done ones included (the panel is off screen);
+      // without one, only open tasks.
+      if (!(rank ? matched : open)) continue;
       if (bucket === "inbox") nextStrip.push(task);
       else next[bucket].push(task);
     }
-    const order = rank
-      ? (a: Task, b: Task) => rank.get(a.id)! - rank.get(b.id)!
-      : // Open tasks first, done ones after (stable: keeps the repository order).
-        (a: Task, b: Task) => Number(a.status === "done") - Number(b.status === "done");
-    for (const q of QUADRANTS) next[q].sort(order);
-    nextStrip.sort(order);
+    if (rank) {
+      const order = (a: Task, b: Task) => rank.get(a.id)! - rank.get(b.id)!;
+      for (const q of QUADRANTS) next[q].sort(order);
+      nextStrip.sort(order);
+    }
+    nextDone.sort(byCompletion);
     tasks = next;
     openCounts = counts;
     inbox = nextInbox;
     inboxCount = nextInbox.length;
     strip = nextStrip;
+    doneList = nextDone;
+    doneCount = dones;
     filter = rank ? { matches: rank.size, total } : null;
   }
 
@@ -457,7 +574,12 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     build(state);
   }
 
-  const items = (): PaneItems => ({ ...tasks, inbox: strip });
+  /** The panes' lists; `done` only while the done panel is on screen (S27). */
+  const items = (): PaneItems => ({
+    ...tasks,
+    inbox: strip,
+    ...(sidebar !== null && sidebar.done > 0 ? { done: doneList } : {}),
+  });
 
   function taskById(id: number | null): Task | undefined {
     if (id === null) return undefined;
@@ -480,16 +602,32 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
   }
 
   // ── Drawing ──────────────────────────────────────────────────────────────
-  /** Grid sizes and the Inbox strip's height (1: a title line without a border; S24). */
+  /**
+   * Grid sizes, the Inbox strip's height (1: a title line without a border;
+   * S24) and the width left of the sidebar (S26).
+   */
   function sizes() {
     const stripRows = stripHeight(renderer.height);
-    return { g: gridSizes(renderer.width, renderer.height, stripRows), stripRows };
+    const leftWidth = Math.max(0, renderer.width - (sidebar?.width ?? 0));
+    return { g: gridSizes(leftWidth, renderer.height, stripRows), stripRows, leftWidth };
   }
 
   function layout(): void {
     const width = renderer.width;
     const height = renderer.height;
-    const { g, stripRows } = sizes();
+    const { g, stripRows, leftWidth } = sizes();
+    const above = Math.max(0, height - 1);
+    main.width = width;
+    main.height = above;
+    left.width = leftWidth;
+    left.height = above;
+    side.visible = sidebar !== null;
+    side.width = sidebar?.width ?? 0;
+    side.height = above;
+    doneBox.visible = (sidebar?.done ?? 0) > 0;
+    doneBox.border = (sidebar?.done ?? 0) > 1;
+    doneBox.width = sidebar?.width ?? 0;
+    doneBox.height = sidebar?.done ?? 0;
     rows[0]!.height = g.top;
     rows[1]!.height = g.bottom;
     for (const q of QUADRANTS) {
@@ -502,7 +640,7 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     }
     stripBox.visible = stripRows > 0;
     stripBox.border = stripRows > 1;
-    stripBox.width = width;
+    stripBox.width = leftWidth;
     stripBox.height = stripRows;
     status.width = width;
     const rowsOfHelp = helpRows(state.preset, keymap);
@@ -599,7 +737,7 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
   function draw(): void {
     // The Inbox strip comes and goes with the search: size the grid first.
     layout();
-    const { g, stripRows } = sizes();
+    const { g, stripRows, leftWidth } = sizes();
     for (const q of QUADRANTS) {
       const pane = panes[q];
       const inner = {
@@ -612,9 +750,10 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     const stripCount = filter ? `${strip.length}/${filter.total.inbox}` : `${inboxCount}`;
     if (stripRows === 1) drawStripLine(stripCount);
     else if (stripRows > 1) {
-      const inner = { width: Math.max(0, renderer.width - 2), height: Math.max(0, stripRows - 2) };
-      drawList(stripBox, stripText, strip, "inbox", inner, stripTitle(state.preset, stripCount, renderer.width));
+      const inner = { width: Math.max(0, leftWidth - 2), height: Math.max(0, stripRows - 2) };
+      drawList(stripBox, stripText, strip, "inbox", inner, stripTitle(state.preset, stripCount, leftWidth));
     }
+    drawDonePanel();
     status.content = statusContent(renderer.width);
     drawCard();
     help.visible = state.mode === "help";
@@ -635,6 +774,24 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     boldTitles.delete(stripBox);
     const title = fg(style.title)(` ${labelFor(state.preset, "inbox")} (${count})`);
     stripText.content = line(renderer.width, [style.bold ? bold(title) : title]);
+  }
+
+  /** The done panel (S27): a bordered list, or its title line alone when collapsed (S26). */
+  function drawDonePanel(): void {
+    const rowsOfPanel = sidebar?.done ?? 0;
+    if (rowsOfPanel === 0 || !sidebar) return;
+    const count = filter ? `${doneList.length}/${filter.total.done}` : `${doneCount}`;
+    if (rowsOfPanel === 1) {
+      const style = paneStyle("done", state.focus === "done");
+      doneBox.title = undefined;
+      doneBox.bottomTitle = undefined;
+      boldTitles.delete(doneBox);
+      const title = fg(style.title)(` ✓ Done (${count})`);
+      doneText.content = line(sidebar.width, [style.bold ? bold(title) : title]);
+      return;
+    }
+    const inner = { width: Math.max(0, sidebar.width - 2), height: Math.max(0, rowsOfPanel - 2) };
+    drawList(doneBox, doneText, doneList, "done", inner, doneTitle(count, sidebar.width));
   }
 
   /** One pane: title, focus colour, the window of rows around its selection. */
@@ -659,31 +816,67 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     box.bottomTitle =
       list.length > inner.height && inner.height > 0 ? ` ${start + 1}-${start + visible.length} of ${list.length} ` : undefined;
     box.bottomTitleAlignment = "right";
-    text.content = paneContent(visible, start, inner.width, focused ? selected : -1, style.selectBg);
+    text.content = paneContent(visible, start, inner.width, focused ? selected : -1, style.selectBg, id);
   }
 
-  function paneContent(visible: Task[], start: number, width: number, selected: number, selectBg: string): StyledText {
-    if (visible.length === 0) return new StyledText([fg(COLOR.muted)(fit(filter ? "  No matches" : "  No tasks", width))]);
+  function paneContent(
+    visible: Task[],
+    start: number,
+    width: number,
+    selected: number,
+    selectBg: string,
+    pane: Focus,
+  ): StyledText {
+    if (visible.length === 0) {
+      const empty = filter ? "  No matches" : pane === "done" ? "  Nothing done yet" : "  No tasks";
+      return new StyledText([fg(COLOR.muted)(fit(empty, width))]);
+    }
     const chunks: TextChunk[] = [];
     visible.forEach((task, i) => {
       if (i > 0) chunks.push(plain("\n"));
-      chunks.push(...rowChunks(task, width, start + i === selected ? selectBg : null));
+      const highlight = start + i === selected ? selectBg : null;
+      chunks.push(...(pane === "done" ? doneRowChunks(task, width, highlight) : rowChunks(task, width, highlight, pane)));
     });
     return new StyledText(chunks);
   }
 
-  /** One task row; `selectBg` is the highlight of the selected row (S23), null for the others. */
-  function rowChunks(task: Task, width: number, selectBg: string | null): TextChunk[] {
+  /** The 2-column mark, clipped to `width`. */
+  const markText = (mark: string, width: number) => `${mark} `.slice(0, Math.min(2, width));
+
+  /**
+   * One task row in a quadrant or the strip; `selectBg` is the highlight of
+   * the selected row (S23), null for the others. The mark: `✓` done, `!`
+   * escalated (S7), else `•` in the pane's colour with bullets on (S28) or blank.
+   */
+  function rowChunks(task: Task, width: number, selectBg: string | null, pane: Bucket): TextChunk[] {
     const isDone = task.status === "done";
     const escalated = isEscalated(task, currentDay, within);
-    const mark = isDone ? "✓" : escalated ? "!" : " ";
+    const mark = isDone ? "✓" : escalated ? "!" : state.bullets ? "•" : " ";
+    const markColor = isDone ? COLOR.ok : escalated || !state.bullets ? COLOR.escalated : BUCKET_COLOR[pane];
     const due = task.dueDate && width >= 28 ? ` ${task.dueDate}` : "";
     const titleWidth = Math.max(0, width - 2 - due.length);
     const parts: TextChunk[] = [
-      fg(isDone ? COLOR.ok : COLOR.escalated)(bold(`${mark} `.slice(0, Math.min(2, width)))),
+      fg(markColor)(bold(markText(mark, width))),
       isDone ? dim(fg(COLOR.done)(fit(task.title, titleWidth))) : fg(COLOR.text)(fit(task.title, titleWidth)),
     ];
     if (due) parts.push(fg(escalated ? COLOR.escalated : isDone ? COLOR.done : COLOR.due)(due));
+    return selectBg ? parts.map((chunk) => bg(selectBg)(chunk)) : parts;
+  }
+
+  /**
+   * One row of the done panel (S27): `✓` in the task's quadrant colour (Inbox
+   * grey), the title, and the completion date `MM-DD` on the right when the
+   * panel is wide enough.
+   */
+  function doneRowChunks(task: Task, width: number, selectBg: string | null): TextChunk[] {
+    const day = task.completedAt && width >= 20 ? monthDay(task.completedAt) : "";
+    const date = day ? ` ${day}` : "";
+    const titleWidth = Math.max(0, width - 2 - date.length);
+    const parts: TextChunk[] = [
+      fg(BUCKET_COLOR[bucketOf(task)])(bold(markText("✓", width))),
+      fg(COLOR.text)(fit(task.title, titleWidth)),
+    ];
+    if (date) parts.push(fg(COLOR.muted)(date));
     return selectBg ? parts.map((chunk) => bg(selectBg)(chunk)) : parts;
   }
 
@@ -707,7 +900,7 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
         fg(COLOR.muted)("  │ save and quit to finish · quit without saving to cancel"),
       ]);
     }
-    const quadrant = focusLabel(state.preset, state.focus);
+    const quadrant = focusLabel(state.preset, addTarget(state));
     switch (state.mode) {
       case "settings":
         return line(width, [fg(COLOR.focus)(bold(" Settings")), fg(COLOR.muted)("  │ j/k choose · Enter save · Esc cancel")]);
@@ -786,7 +979,7 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     if ((action.type === "edit" && id !== null) || action.type === "newTask") {
       // The editor owns the keys from here; the session redraws when it is over.
       state = next;
-      const target: EditTarget = action.type === "newTask" ? { kind: "new", focus: before.focus } : { kind: "edit", id: id! };
+      const target: EditTarget = action.type === "newTask" ? { kind: "new", focus: addTarget(before) } : { kind: "edit", id: id! };
       editing = editorSession(target).finally(() => (editing = null));
       return;
     }
@@ -824,7 +1017,8 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
           message = "Nothing selected";
           break;
         case "reorder":
-          if (id !== null) {
+          // S27: the done panel keeps the completion order (the reducer said so).
+          if (id !== null && before.focus !== "done") {
             repo.reorder(id, action.dir);
             followId = id;
           }
@@ -835,12 +1029,23 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
             message = "Empty title: nothing added";
             break;
           }
-          const quadrant = before.focus === "inbox" ? null : before.focus;
-          const task = repo.create({ title, quadrant, tags: parseTags(title) });
+          const target = addTarget(before);
+          const task = repo.create({ title, quadrant: target === "inbox" ? null : target, tags: parseTags(title) });
           followId = task.id;
-          message = `Added to ${focusLabel(before.preset, before.focus)}`;
+          message = `Added to ${focusLabel(before.preset, target)}`;
           break;
         }
+        case "toggleDonePanel": {
+          // S29: the session keeps the new value even when it cannot be saved.
+          message = `Done panel ${next.donePanel ? "on" : "off"}`;
+          if (next.donePanel && sidebarFor(next) === null) message += ` · ${SIDEBAR_HIDDEN}`;
+          saveView({ donePanel: next.donePanel });
+          break;
+        }
+        case "toggleBullets":
+          message = `Bullets ${next.bullets ? "on" : "off"}`;
+          saveView({ bullets: next.bullets });
+          break;
         case "saveSettings": {
           // S21: the reducer applied the choice; keep it only if it is saved.
           const name = getPreset(next.preset).name;
@@ -865,7 +1070,7 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     if (failed && action.type === "saveSettings") next = { ...next, preset: before.preset };
     // The end-of-triage summary wins over the last move's message, not over an error.
     if (message !== null && (failed || next.status === null)) next = { ...next, status: message };
-    state = next; // load() reads showDone from the new state
+    state = next; // build() reads the done panel toggle from the new state
     // Quitting never depends on the repository: a failing reload must not
     // keep the user in the alternate screen.
     if (state.quit) {
@@ -1047,7 +1252,7 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
   }
 
   /** `a` (S22): the new task from the editor's file, in `focus`'s quadrant or the Inbox. */
-  function createFromFile(focus: Focus, text: string): { message: string; id: number | null } {
+  function createFromFile(focus: Bucket, text: string): { message: string; id: number | null } {
     const parsed = parseNewTask(text);
     if (!parsed.ok) return { message: parsed.cancelled ? "Cancelled" : `${parsed.error} (nothing created)`, id: null };
     const { title, dueDate, description, tags } = parsed.value;
@@ -1082,9 +1287,23 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     dispatch(action);
   }
 
+  /**
+   * S26: the sidebar comes and goes with the width. When it gets hidden the
+   * status line says so once and a focused done panel hands the focus back to
+   * the pane it was entered from (clamp); it comes back on a wider resize.
+   */
   function onResize(): void {
+    const wasShown = sidebar !== null;
+    build(state);
+    state = clamp(state, items());
+    if (wasShown && sidebar === null && sidebarWanted(state)) state = { ...state, status: SIDEBAR_HIDDEN };
     layout();
     draw();
+  }
+
+  /** Some sidebar panel is on (only the done panel until the preview, S25, exists). */
+  function sidebarWanted(s: ViewState): boolean {
+    return s.donePanel;
   }
 
   renderer.keyInput.on("keypress", onKey);
@@ -1095,6 +1314,9 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
   // to the triage offer: the first warning, plus how many more.
   const warning = startWarning([...(options.warning ? [options.warning] : []), ...(options.warnings ?? []), ...keyWarnings]);
   if (warning) state = { ...state, status: state.status ? `${warning} · ${state.status}` : warning };
+  // S26: a panel that is on but does not fit says why it is missing.
+  if (sidebarWanted(state) && sidebar === null)
+    state = { ...state, status: state.status ? `${state.status} · ${SIDEBAR_HIDDEN}` : SIDEBAR_HIDDEN };
   layout();
   draw();
 
@@ -1231,9 +1453,13 @@ export async function startTui(repo: TaskRepository, options: AppOptions = {}, d
   options = {
     preset: config.preset,
     warning,
-    warnings: loaded.warnings.filter((w) => w.startsWith("Config: keys")),
+    warnings: loaded.warnings.filter((w) => w.startsWith("Config: keys") || w.startsWith("Config: view")),
     keys: loaded.settings.keys,
     savePreset: (preset) => void saveConfig(env, { preset }),
+    // S29: the view toggles start from the file (defaults: done panel off,
+    // bullets on) and each toggle saves only its own field.
+    view: loaded.settings.view,
+    saveView: (patch) => void saveSettings(env, { view: patch }),
     // $EDITOR and EISEN_EDITOR_MODE (S22) come from the same environment.
     env,
     ...options,

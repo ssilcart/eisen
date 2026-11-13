@@ -7,8 +7,24 @@ import { DEFAULT_KEYMAP, actionFor, keysOf, type Keymap } from "./keymap.ts";
 
 export type Mode = "normal" | "add" | "confirmDelete" | "help" | "triage" | "search" | "settings";
 
-/** A pane: a quadrant, or the Inbox strip always shown under the grid (S24). */
-export type Focus = Quadrant | "inbox";
+/**
+ * A pane: a quadrant, the Inbox strip always shown under the grid (S24), or
+ * the done panel in the sidebar (S27).
+ */
+export type Focus = Quadrant | "inbox" | "done";
+
+/** The view toggles kept in the state (S27, S28); persisted by the controller (S29). */
+export interface ViewToggles {
+  /** The completed-tasks panel in the sidebar (S27). */
+  donePanel: boolean;
+  /** `•` at the start of open rows (S28). */
+  bullets: boolean;
+}
+
+/** S29 defaults: done panel off, bullets on. */
+export const DEFAULT_TOGGLES: Readonly<ViewToggles> = { donePanel: false, bullets: true };
+
+export const DONE_ORDER_MESSAGE = "Done tasks are ordered by completion";
 
 /**
  * A triage session (S12): the Inbox ids taken when it started, in order, and
@@ -33,15 +49,23 @@ export interface Key {
 
 export interface ViewState {
   focus: Focus;
-  /** Selected row per pane; `inbox` is the Inbox strip's (S24). */
-  selected: Record<Quadrant, number> & { inbox?: number };
+  /** Selected row per pane; `inbox` is the Inbox strip's (S24), `done` the done panel's (S27). */
+  selected: Record<Quadrant, number> & { inbox?: number; done?: number };
   /**
    * The bottom pane the Inbox strip was entered from with `j`: `k` at the
    * strip's top goes back there (S24). Q3 until the strip is entered from Q4.
    */
   aboveStrip: 3 | 4;
+  /**
+   * The pane the done panel was entered from with `l`: `h` goes back there,
+   * and so does the focus when the panel goes away (S27). Q2 until entered from Q4.
+   */
+  besideDone: 2 | 4;
   mode: Mode;
-  showDone: boolean;
+  /** The done panel is on (S27); it shows only while the sidebar fits (S26). */
+  donePanel: boolean;
+  /** Bullets in the rows' mark column (S28). */
+  bullets: boolean;
   /** Text typed in the add input. */
   input: string;
   /** One-off message for the status line, cleared by the next key. */
@@ -63,9 +87,14 @@ export interface ViewState {
 /**
  * What the panes show, in display order; only the ids matter here. The app
  * always passes `inbox`, the Inbox strip's list (S24); without it the strip
- * cannot be entered and its focus falls back to Q1.
+ * cannot be entered and its focus falls back to Q1. `done` is the done
+ * panel's list, given only while the panel is on screen (S27); without it the
+ * panel cannot be entered and its focus goes back to `besideDone`.
  */
-export type PaneItems = Record<Quadrant, readonly { id: number }[]> & { inbox?: readonly { id: number }[] };
+export type PaneItems = Record<Quadrant, readonly { id: number }[]> & {
+  inbox?: readonly { id: number }[];
+  done?: readonly { id: number }[];
+};
 
 export type Direction = "left" | "right" | "up" | "down";
 
@@ -83,7 +112,10 @@ export type Action =
   | { type: "requestDelete" }
   | { type: "confirmDelete" }
   | { type: "reorder"; dir: -1 | 1 }
-  | { type: "toggleShowDone" }
+  /** `.`: the done panel on/off (S27); the controller saves it. */
+  | { type: "toggleDonePanel" }
+  /** Bullets on/off (S28, no default key); the controller saves it. */
+  | { type: "toggleBullets" }
   | { type: "help" }
   | { type: "cancel" }
   | { type: "quit" }
@@ -107,13 +139,15 @@ export type Action =
   | { type: "saveSettings" }
   | { type: "noop" };
 
-export function initialState(preset: PresetId = DEFAULT_PRESET): ViewState {
+export function initialState(preset: PresetId = DEFAULT_PRESET, toggles: Partial<ViewToggles> = {}): ViewState {
   return {
     focus: 1,
     selected: { 1: 0, 2: 0, 3: 0, 4: 0 },
     aboveStrip: 3,
+    besideDone: 2,
     mode: "normal",
-    showDone: false,
+    donePanel: toggles.donePanel ?? DEFAULT_TOGGLES.donePanel,
+    bullets: toggles.bullets ?? DEFAULT_TOGGLES.bullets,
     input: "",
     status: null,
     quit: false,
@@ -133,8 +167,7 @@ const NOOP: Action = { type: "noop" };
 
 /**
  * What each keymap action does in the matrix (S30). Actions whose feature
- * comes later (preview, bullets, `:`) are bound but do nothing yet; `.` still
- * shows/hides done tasks until the done panel replaces it (S27).
+ * comes later (preview, `:`) are bound but do nothing yet.
  */
 const NORMAL_ACTIONS: Readonly<Record<string, Action>> = {
   move_left: { type: "navigate", dir: "left" },
@@ -154,9 +187,9 @@ const NORMAL_ACTIONS: Readonly<Record<string, Action>> = {
   order_up: { type: "reorder", dir: -1 },
   search: { type: "search" },
   triage: { type: "triage" },
-  toggle_done_panel: { type: "toggleShowDone" },
+  toggle_done_panel: { type: "toggleDonePanel" },
   toggle_preview: NOOP,
-  toggle_bullets: NOOP,
+  toggle_bullets: { type: "toggleBullets" },
   preview_down: NOOP,
   preview_up: NOOP,
   command_line: NOOP,
@@ -293,8 +326,10 @@ export function reduce(
       return s.triage ? advance({ ...s, mode: "triage" }, "deleted") : { ...s, mode: "normal" };
     case "cancel":
       return { ...s, mode: s.triage ? "triage" : "normal", input: "" };
-    case "toggleShowDone":
-      return clamp({ ...s, showDone: !s.showDone }, panes);
+    case "toggleDonePanel":
+      return { ...s, donePanel: !s.donePanel };
+    case "toggleBullets":
+      return { ...s, bullets: !s.bullets };
     case "help":
       return { ...s, mode: "help" };
     case "quit":
@@ -334,8 +369,10 @@ export function reduce(
       return { ...s, status: state.status };
     case "moveTo":
       return s.triage ? advance(s, "sorted") : s;
-    case "toggleDone":
     case "reorder":
+      // S27: the panel's order is the completion order; the controller does not reorder there.
+      return s.focus === "done" ? { ...s, status: DONE_ORDER_MESSAGE } : s;
+    case "toggleDone":
     case "edit":
     case "newTask":
       return s;
@@ -349,6 +386,17 @@ function endSearch(s: ViewState): ViewState {
 
 const RIGHT_OF: Partial<Record<Focus, Quadrant>> = { 1: 2, 3: 4 };
 const LEFT_OF: Partial<Record<Focus, Quadrant>> = { 2: 1, 4: 3 };
+
+/** The pane right of `focus`: Q2 and Q4 lead into the done panel while it is shown (S27). */
+function rightOf(s: ViewState, panes: PaneItems): Focus | undefined {
+  if ((s.focus === 2 || s.focus === 4) && panes.done) return "done";
+  return RIGHT_OF[s.focus];
+}
+
+/** The pane left of `focus`: the done panel goes back to the pane it was entered from. */
+function leftOf(s: ViewState): Focus | undefined {
+  return s.focus === "done" ? s.besideDone : LEFT_OF[s.focus];
+}
 
 /** The pane above `focus`: the strip goes back to the pane it was entered from (S24). */
 function above(s: ViewState): Quadrant | undefined {
@@ -380,11 +428,14 @@ function navigate(s: ViewState, dir: Direction, panes: PaneItems): ViewState {
   switch (dir) {
     case "left":
     case "right": {
-      const target = (dir === "left" ? LEFT_OF : RIGHT_OF)[s.focus];
-      return target ? clamp({ ...s, focus: target }, panes) : s;
+      const target = dir === "left" ? leftOf(s) : rightOf(s, panes);
+      if (!target) return s;
+      const next = { ...s, focus: target };
+      return clamp(target === "done" && (s.focus === 2 || s.focus === 4) ? { ...next, besideDone: s.focus } : next, panes);
     }
     case "down": {
       if (index < count - 1) return { ...s, selected: { ...s.selected, [s.focus]: index + 1 } };
+      if (s.focus === "done") return s;
       const target = below(s.focus, panes);
       if (!target) return s;
       const next = { ...s, focus: target, selected: { ...s.selected, [target]: 0 } };
@@ -392,6 +443,7 @@ function navigate(s: ViewState, dir: Direction, panes: PaneItems): ViewState {
     }
     case "up": {
       if (index > 0 && count > 0) return { ...s, selected: { ...s.selected, [s.focus]: index - 1 } };
+      if (s.focus === "done") return s;
       const target = above(s);
       if (!target) return s;
       return { ...s, focus: target, selected: { ...s.selected, [target]: Math.max(0, panes[target].length - 1) } };
@@ -406,8 +458,12 @@ export function clamp(state: ViewState, panes: PaneItems): ViewState {
     selected[q] = Math.max(0, Math.min(selected[q], panes[q].length - 1));
   }
   if (panes.inbox) selected.inbox = Math.max(0, Math.min(selected.inbox ?? 0, panes.inbox.length - 1));
-  // No strip list was given: its focus moves back to the grid.
-  const focus = state.focus === "inbox" && !panes.inbox ? 1 : state.focus;
+  if (panes.done) selected.done = Math.max(0, Math.min(selected.done ?? 0, panes.done.length - 1));
+  // No strip list was given: its focus moves back to the grid. No done panel
+  // on screen (toggled off, or the sidebar hidden): back to where it was entered from.
+  let focus = state.focus;
+  if (focus === "inbox" && !panes.inbox) focus = 1;
+  if (focus === "done" && !panes.done) focus = state.besideDone;
   return { ...state, focus, selected };
 }
 
@@ -422,11 +478,11 @@ export function selectedId(state: ViewState, panes: PaneItems): number | null {
   return paneList(panes, state.focus)[selectedIn(state, state.focus)]?.id ?? null;
 }
 
-const SEARCH_ORDER: readonly Focus[] = [1, 2, 3, 4, "inbox"];
+const SEARCH_ORDER: readonly Focus[] = [1, 2, 3, 4, "inbox", "done"];
 
 /**
  * While searching, an empty focused pane hands the focus to the first pane
- * with matches (Q1..Q4, then the Inbox strip), so the keys act on a match.
+ * with matches (Q1..Q4, the Inbox strip, then the done panel), so the keys act on a match.
  */
 export function focusMatches(state: ViewState, panes: PaneItems): ViewState {
   if (paneList(panes, state.focus).length > 0) return state;

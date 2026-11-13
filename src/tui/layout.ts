@@ -76,6 +76,57 @@ export function stripHeight(height: number): number {
   return spare >= STRIP_MIN ? Math.min(wanted, spare) : 1;
 }
 
+/** Below this many columns the sidebar is hidden (S26). */
+export const SIDEBAR_MIN_COLUMNS = 100;
+/** Bounds of the sidebar's width, in columns (S26). */
+export const SIDEBAR_MIN_WIDTH = 32;
+export const SIDEBAR_MAX_WIDTH = 60;
+/** Share of the terminal's width the sidebar takes (S26). */
+const SIDEBAR_SHARE = 0.35;
+/** Share of the sidebar's rows the preview takes when both panels are on (S26). */
+const PREVIEW_SHARE = 0.6;
+/** Fewest rows each stacked panel keeps; below it the done panel collapses (S26). */
+export const SIDEBAR_PANEL_MIN = 5;
+
+export interface SidebarPanels {
+  /** The preview panel (S25). */
+  preview: boolean;
+  /** The completed-tasks panel (S27). */
+  done: boolean;
+}
+
+/**
+ * The right sidebar (S26): its width and the rows of each panel, top to
+ * bottom (preview, then done), border included; 0 means not shown, and a
+ * done panel of 1 row is collapsed to its title line. The rows add up to the
+ * height above the status line. The grid and the Inbox strip take the
+ * `width - sidebar.width` columns to its left.
+ */
+export interface Sidebar {
+  width: number;
+  preview: number;
+  done: number;
+}
+
+/**
+ * Sizes the sidebar for a `width` x `height` terminal (S26), or null when it
+ * is hidden: no panel on, or fewer than SIDEBAR_MIN_COLUMNS columns. Width
+ * round(35%) clamped to 32-60. Both panels: preview ~60% on top, the done
+ * panel below, each at least 5 rows, else the done panel collapses to 1 row.
+ */
+export function sidebarLayout(width: number, height: number, panels: SidebarPanels): Sidebar | null {
+  if (!panels.preview && !panels.done) return null;
+  if (width < SIDEBAR_MIN_COLUMNS) return null;
+  const w = Math.min(SIDEBAR_MAX_WIDTH, Math.max(SIDEBAR_MIN_WIDTH, Math.round(width * SIDEBAR_SHARE)));
+  const rows = Math.max(0, height - STATUS_HEIGHT);
+  if (!panels.done) return { width: w, preview: rows, done: 0 };
+  if (!panels.preview) return { width: w, preview: 0, done: rows };
+  const preview = Math.round(rows * PREVIEW_SHARE);
+  const done = rows - preview;
+  if (preview >= SIDEBAR_PANEL_MIN && done >= SIDEBAR_PANEL_MIN) return { width: w, preview, done };
+  return { width: w, preview: Math.max(0, rows - 1), done: Math.min(1, rows) };
+}
+
 /** First row to show so `selected` is visible in `height` rows (roughly centred). */
 export function windowStart(selected: number, count: number, height: number): number {
   if (height <= 0 || count <= height) return 0;

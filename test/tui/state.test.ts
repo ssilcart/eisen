@@ -57,7 +57,7 @@ describe("keyToAction in normal mode (S10)", () => {
     ["d", key("d"), { type: "requestDelete" }],
     ["J", upper("J"), { type: "reorder", dir: 1 }],
     ["K", upper("K"), { type: "reorder", dir: -1 }],
-    [".", key("."), { type: "toggleShowDone" }],
+    [".", key("."), { type: "toggleDonePanel" }],
     ["?", key("?"), { type: "help" }],
     ["q", key("q"), { type: "quit" }],
     ["ctrl+c", key("c", { ctrl: true, sequence: "\u0003" }), { type: "quit" }],
@@ -243,11 +243,11 @@ describe("reduce: modes", () => {
     expect(s.mode).toBe("normal");
   });
 
-  test(". toggles showDone", () => {
+  test(". toggles the done panel (S27)", () => {
     let s = press(state(), key("."), p);
-    expect(s.showDone).toBe(true);
+    expect(s.donePanel).toBe(true);
     s = press(s, key("."), p);
-    expect(s.showDone).toBe(false);
+    expect(s.donePanel).toBe(false);
   });
 
   test("/ opens the search input (S19)", () => {
@@ -737,5 +737,102 @@ describe("settings (S21)", () => {
     s = press(s, key(","), p);
     s = press(s, esc, p);
     expect(s).toMatchObject({ mode: "normal", query: "zoho" });
+  });
+});
+
+describe("done panel as a pane (S27)", () => {
+  /** Q2 has 20, Q4 has 40; the done panel lists 7, 8, 9 (most recently completed first). */
+  const withDone: PaneItems = { ...panes([10], [20], [30], [40]), inbox: items(50), done: items(7, 8, 9) };
+  const noPanel: PaneItems = { ...panes([10], [20], [30], [40]), inbox: items(50) };
+
+  test("initial state: no showDone; done panel off, bullets on by default, Q2 is beside the panel", () => {
+    const s = initialState();
+    expect("showDone" in s).toBe(false);
+    expect(s.donePanel).toBe(false);
+    expect(s.bullets).toBe(true);
+    expect(s.besideDone).toBe(2);
+    expect(initialState("classic", { donePanel: true, bullets: false })).toMatchObject({ donePanel: true, bullets: false });
+  });
+
+  test("l from Q2 enters the panel and h goes back to Q2", () => {
+    let s = press(state({ focus: 2 }), key("l"), withDone);
+    expect(s.focus).toBe("done");
+    expect(s.besideDone).toBe(2);
+    expect(selectedId(s, withDone)).toBe(7);
+    s = press(s, key("h"), withDone);
+    expect(s.focus).toBe(2);
+  });
+
+  test("l from Q4 enters the panel and h goes back to Q4 (it remembers which)", () => {
+    let s = press(state({ focus: 4 }), key("l"), withDone);
+    expect(s).toMatchObject({ focus: "done", besideDone: 4 });
+    s = press(s, key("h"), withDone);
+    expect(s.focus).toBe(4);
+  });
+
+  test("l from Q1/Q3 still goes right inside the grid; l from Q2 without the panel does nothing", () => {
+    expect(press(state({ focus: 1 }), key("l"), withDone).focus).toBe(2);
+    expect(press(state({ focus: 3 }), key("l"), withDone).focus).toBe(4);
+    expect(press(state({ focus: 2 }), key("l"), noPanel).focus).toBe(2);
+    expect(press(state({ focus: 4 }), key("right", { sequence: "\u001b[C" }), noPanel).focus).toBe(4);
+  });
+
+  test("j/k move inside the panel and stop at its ends; l does nothing there", () => {
+    let s = press(state({ focus: 2 }), key("l"), withDone);
+    s = press(s, key("j"), withDone);
+    s = press(s, key("j"), withDone);
+    expect(selectedId(s, withDone)).toBe(9);
+    s = press(s, key("j"), withDone);
+    expect(s.focus).toBe("done");
+    expect(selectedId(s, withDone)).toBe(9);
+    s = press(s, key("k"), withDone);
+    s = press(s, key("k"), withDone);
+    s = press(s, key("k"), withDone);
+    expect(s.focus).toBe("done");
+    expect(selectedId(s, withDone)).toBe(7);
+    expect(press(s, key("l"), withDone).focus).toBe("done");
+  });
+
+  test("J/K in the panel do not reorder: they say why", () => {
+    const s = press(state({ focus: 2 }), key("l"), withDone);
+    for (const k of [upper("J"), upper("K")]) {
+      const next = press(s, k, withDone);
+      expect(next.status).toBe("Done tasks are ordered by completion");
+      expect(next.focus).toBe("done");
+    }
+  });
+
+  test("x, e, d, 1-4 act on the selected done task", () => {
+    let s = press(state({ focus: 4 }), key("l"), withDone);
+    s = press(s, key("j"), withDone);
+    expect(currentId(s, withDone)).toBe(8);
+    expect(press(s, key("d"), withDone).mode).toBe("confirmDelete");
+  });
+
+  test("when the panel goes away (toggled off or the sidebar hidden) the focus returns to the pane it came from", () => {
+    let s = press(state({ focus: 4 }), key("l"), withDone);
+    s = clamp(s, noPanel);
+    expect(s.focus).toBe(4);
+    s = press(state({ focus: 2 }), key("l"), withDone);
+    expect(follow(s, noPanel, 7).focus).toBe(2);
+  });
+
+  test("the selection is clamped inside the panel's list", () => {
+    let s = press(state({ focus: 2 }), key("l"), withDone);
+    s = press(s, key("j"), withDone);
+    s = press(s, key("j"), withDone);
+    s = clamp(s, { ...withDone, done: items(7) });
+    expect(s.selected.done).toBe(0);
+  });
+
+  test("while searching, an empty focus moves to the done panel last", () => {
+    const only: PaneItems = { ...panes([], [], [], []), inbox: [], done: items(9) };
+    expect(focusMatches(state({ query: "x" }), only).focus).toBe("done");
+  });
+
+  test("bullets toggle (S28)", () => {
+    const s = reduce(state(), { type: "toggleBullets" }, withDone);
+    expect(s.bullets).toBe(false);
+    expect(reduce(s, { type: "toggleBullets" }, withDone).bullets).toBe(true);
   });
 });

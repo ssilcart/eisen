@@ -25,6 +25,9 @@ export const BUCKET_COLOR: Readonly<Record<Bucket, string>> = {
   inbox: "#8B949E",
 };
 
+/** The done panel's own colour (S27): its border and title while focused. */
+export const DONE_COLOR = COLOR.ok;
+
 /** How much of the pane's colour tints the selected row's background. */
 const SELECT_TINT = 0.35;
 
@@ -42,8 +45,8 @@ export interface PaneStyle {
  * its selected row on a tint of it; the others keep a dim border with the
  * title in their colour.
  */
-export function paneStyle(bucket: Bucket, focused: boolean): PaneStyle {
-  const color = BUCKET_COLOR[bucket];
+export function paneStyle(bucket: Bucket | "done", focused: boolean): PaneStyle {
+  const color = bucket === "done" ? DONE_COLOR : BUCKET_COLOR[bucket];
   return {
     border: focused ? color : COLOR.border,
     title: color,

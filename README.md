@@ -104,7 +104,7 @@ quadrant (it leaves the strip and the count drops), `x`, `d`, `e`, `J`/`K`
 | `J` / `K`      | Reorder inside the quadrant or the Inbox           |
 | `/`            | Global search (quadrants, Inbox and done tasks)    |
 | `i`            | Triage the Inbox                                   |
-| `.`            | Show / hide done tasks                             |
+| `.`            | Show / hide the done panel (right sidebar; `l` from Q2/Q4 enters it) |
 | `,`            | Settings: pick the quadrant names (preset)         |
 | `?`            | Help                                               |
 | `q`            | Quit                                               |
@@ -144,8 +144,9 @@ the matrix with a summary such as `Inbox triaged: 6 sorted, 2 skipped`.
 ### Search
 
 `/` opens a search input in the status line and filters on every keystroke,
-over every task: the four quadrants, the Inbox and done tasks (done ones are
-shown dimmed with `✓` even when `.` hides them).
+over every task: the four quadrants, the Inbox and done tasks. Done matches
+are listed in the done panel when it is on screen; otherwise they show in
+their quadrant, dimmed with `✓`.
 
 - Accents and case are ignored (`compañía` finds `compania`) and typos are
   tolerated: one for words of 4–7 letters, two for 8 or more (`delvira`
