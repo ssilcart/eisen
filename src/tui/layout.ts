@@ -21,6 +21,39 @@ export function gridSizes(width: number, height: number, strip = 0): GridSizes {
   return { left, right: w - left, top, bottom: h - top };
 }
 
+export interface Rect {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
+
+/** The smallest terminal the floating editor opens in (S22); below it the editor runs full screen. */
+export const EDITOR_MIN_SCREEN = { width: 40, height: 12 } as const;
+
+/** The floating editor box is never smaller than this while the screen allows it. */
+const EDITOR_MIN_BOX = { width: 40, height: 10 } as const;
+
+/** Share of the area above the status line the floating editor box takes. */
+const EDITOR_SHARE = 0.7;
+
+export function editorFits(width: number, height: number): boolean {
+  return width >= EDITOR_MIN_SCREEN.width && height >= EDITOR_MIN_SCREEN.height;
+}
+
+/**
+ * The floating editor box (S22), border included: about 70% x 70% of the
+ * area above the status line, centred, at least 40 x 10 while that fits and
+ * never past the area (a resize may shrink it below the minimum).
+ */
+export function editorBox(width: number, height: number): Rect {
+  const areaW = Math.max(0, width);
+  const areaH = Math.max(0, height - STATUS_HEIGHT);
+  const w = Math.min(areaW, Math.max(EDITOR_MIN_BOX.width, Math.round(areaW * EDITOR_SHARE)));
+  const h = Math.min(areaH, Math.max(EDITOR_MIN_BOX.height, Math.round(areaH * EDITOR_SHARE)));
+  return { left: Math.floor((areaW - w) / 2), top: Math.floor((areaH - h) / 2), width: w, height: h };
+}
+
 /** Rows the grid keeps before the strip gives up its border: two pane rows of border + one task. */
 export const GRID_MIN_ROWS = 6;
 

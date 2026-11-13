@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { fit, gridSizes, stripHeight, windowStart, wrap } from "../../src/tui/layout.ts";
+import { editorBox, editorFits, fit, gridSizes, stripHeight, windowStart, wrap } from "../../src/tui/layout.ts";
 
 describe("wrap", () => {
   test("breaks on spaces to fit the width", () => {
@@ -114,5 +114,25 @@ describe("stripHeight (S24)", () => {
       const g = gridSizes(300, h, strip);
       expect(g.top + g.bottom + strip).toBe(rows);
     }
+  });
+});
+
+describe("floating editor box (S22)", () => {
+  test("about 70% x 70% of the area above the status line, centred", () => {
+    expect(editorBox(100, 30)).toEqual({ left: 15, top: 4, width: 70, height: 20 });
+    expect(editorBox(200, 60)).toEqual({ left: 30, top: 9, width: 140, height: 41 });
+  });
+
+  test("never smaller than 40 x 10 while that fits, never over the status line", () => {
+    expect(editorBox(50, 14)).toEqual({ left: 5, top: 1, width: 40, height: 10 });
+    expect(editorBox(40, 12)).toEqual({ left: 0, top: 0, width: 40, height: 10 });
+    expect(editorBox(30, 6)).toEqual({ left: 0, top: 0, width: 30, height: 5 });
+  });
+
+  test("terminals under 40 x 12 are too small for the floating editor", () => {
+    expect(editorFits(40, 12)).toBe(true);
+    expect(editorFits(120, 40)).toBe(true);
+    expect(editorFits(39, 40)).toBe(false);
+    expect(editorFits(120, 11)).toBe(false);
   });
 });

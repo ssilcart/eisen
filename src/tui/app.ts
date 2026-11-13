@@ -1,7 +1,10 @@
 // The matrix TUI (S9, S10): OpenTUI view + controller. View state and key
 // mapping live in state.ts; every change to tasks goes through TaskRepository,
-// and the panes are reloaded from it after each effect. `e` hands the terminal
-// to $EDITOR (S11); the edit file format lives in edit-file.ts. `i` triages
+// and the panes are reloaded from it after each effect. `a` (new task) and
+// `e` (edit) run $EDITOR in a floating box over the matrix, on a PTY (S22,
+// editor-pty.ts); when that cannot start, the screen is too small or
+// EISEN_EDITOR_MODE=fullscreen, the editor takes the whole terminal (S11).
+// The edit file format lives in edit-file.ts; `A` is the inline quick-add. `i` triages
 // the Inbox one card at a time (S12); the card's layout is in triage-card.ts.
 // `/` filters every pane live with the domain's search (S19), the Inbox
 // strip included. The strip is always under the grid (S24): a fifth pane,
@@ -14,6 +17,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   BoxRenderable,
+  EmbeddedTerminalRenderable,
   RGBA,
   StyledText,
   TextAttributes,
@@ -34,8 +38,9 @@ import { loadConfig, saveConfig } from "../config.ts";
 import { getPreset, headingFor, labelFor, type PresetId } from "../domain/presets.ts";
 import { QUADRANTS, bucketOf, type Quadrant, type Task } from "../domain/task.ts";
 import type { TaskRepository } from "../store/repository.ts";
-import { editChanges, editorCommand, parseTaskFile, serializeTask } from "./edit-file.ts";
-import { fit, gridSizes, stripHeight, windowStart } from "./layout.ts";
+import { NEW_TASK_FILE, editChanges, editorCommand, parseNewTask, parseTaskFile, serializeTask } from "./edit-file.ts";
+import { spawnEditorPty, type EditorPty, type LaunchEditorPty } from "./editor-pty.ts";
+import { editorBox, editorFits, fit, gridSizes, stripHeight, windowStart } from "./layout.ts";
 import {
   clamp,
   currentId,
@@ -52,18 +57,32 @@ import {
   type ViewState,
 } from "./state.ts";
 import { settingsHeight, settingsLines, settingsWidth, type SettingsLine } from "./settings.ts";
-import { COLOR, paneStyle } from "./theme.ts";
+import { BUCKET_COLOR, COLOR, paneStyle } from "./theme.ts";
 import { cardLines, triageHints, type CardLineKind } from "./triage-card.ts";
+
+export type { EditorPty, LaunchEditorPty } from "./editor-pty.ts";
 
 export interface AppOptions {
   /** Today as YYYY-MM-DD, for due-date escalation (S7). Default: local date. */
   today?: () => string;
   urgentWithinDays?: number;
   /**
-   * Runs the editor on `path` with the terminal and resolves with its exit
-   * code. Default: `spawnEditor` ($VISUAL, $EDITOR or vi).
+   * The full-screen editor (S11, the S22 fallback): runs the editor on `path`
+   * with the terminal and resolves with its exit code. Default: `spawnEditor`
+   * ($VISUAL, $EDITOR or vi).
    */
   runEditor?: (path: string) => Promise<number>;
+  /**
+   * Starts the editor command on `path` in a `cols` x `rows` PTY for the
+   * floating editor (S22); throwing falls back to `runEditor`. Default:
+   * `spawnEditorPty` (Bun's PTY).
+   */
+  launchEditorPty?: LaunchEditorPty;
+  /**
+   * Where $VISUAL/$EDITOR and EISEN_EDITOR_MODE (`fullscreen` skips the
+   * floating editor) are read, and the editor's environment. Default: process.env.
+   */
+  env?: Record<string, string | undefined>;
   /** The quadrant labels to start with (S20). Default: classic. */
   preset?: PresetId;
   /** Shown in the status line at start, e.g. a config file that could not be used (S21). */
@@ -88,7 +107,7 @@ export interface MatrixApp {
 }
 
 const HINTS =
-  "h/j/k/l move · 1-4 send · a add · e edit · x done · d delete · / search · J/K order · . done · , settings · ? help · q quit";
+  "h/j/k/l move · 1-4 send · a new · A quick add · e edit · x done · d delete · / search · J/K order · . done · , settings · ? help · q quit";
 
 /** The help's rows; `1`–`4` name the quadrants with the active preset (S20). */
 function helpRows(preset: PresetId): [string, string][] {
@@ -100,12 +119,13 @@ function helpRows(preset: PresetId): [string, string][] {
 }
 
 const HELP_REST: [string, string][] = [
-  ["a", "Add a task here, or to the Inbox from its strip (#tags work)"],
+  ["a", "New task in $EDITOR, here or in the Inbox from its strip"],
+  ["A", "Quick add: type a title here (#tags work)"],
   ["x", "Toggle done"],
   ["d", "Delete (y/n)"],
   ["J / K", "Reorder inside the quadrant or the Inbox"],
   [".", "Show / hide done tasks"],
-  ["e", "Edit in $EDITOR"],
+  ["e", "Edit in $EDITOR (a floating box; quit it to save)"],
   ["i", "Triage the Inbox: 1-4 sort, s skip, Esc exit"],
   ["/", "Search every task: type to filter, Enter keep, Esc clear"],
   [",", "Settings: quadrant names"],
@@ -146,14 +166,45 @@ interface Pane {
   text: TextRenderable;
 }
 
+/** The floating editor box (S22) and the editor running in it. */
+interface FloatingEditor {
+  box: BoxRenderable;
+  term: EmbeddedTerminalRenderable;
+  pty: EditorPty;
+  /** `New task · ✅ Do` or `Edit · {title}`, before fitting it to the box. */
+  title: string;
+  /** The target quadrant's colour (S23). */
+  color: string;
+  /** The editor's name, for the status line. */
+  name: string;
+  /** The PTY's size as last set. */
+  cols: number;
+  rows: number;
+}
+
+/** What the editor is opened for: a new task in a pane, or an existing task. */
+type EditTarget = { kind: "new"; focus: Focus } | { kind: "edit"; id: number };
+
+/** ` {title} ` fitted between the box's corners, or nothing when it is too narrow. */
+function editorTitle(title: string, boxWidth: number): string | undefined {
+  const room = boxWidth - 4;
+  if (room < 3) return undefined;
+  return Bun.stringWidth(title) + 2 <= room ? ` ${title} ` : ` ${fit(title, room - 2)} `;
+}
+
 /** Builds the matrix on `renderer` (a real one or `createTestRenderer`'s). */
 export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, options: AppOptions = {}): MatrixApp {
   const today = options.today ?? (() => localToday());
   const within = options.urgentWithinDays ?? DEFAULT_URGENT_WITHIN_DAYS;
-  const runEditor = options.runEditor ?? ((path: string) => spawnEditor(path));
+  const env = options.env ?? process.env;
+  const runEditor = options.runEditor ?? ((path: string) => spawnEditor(path, env));
+  const launchEditorPty: LaunchEditorPty =
+    options.launchEditorPty ?? ((cmd, path, cols, rows) => spawnEditorPty(cmd, path, cols, rows, env));
   const savePreset = options.savePreset ?? (() => {});
   /** The running editor session; keys are ignored while it is set. */
   let editing: Promise<void> | null = null;
+  /** The floating editor while it is open (S22): every key goes to it. */
+  let floating: FloatingEditor | null = null;
   let destroyed = false;
 
   let state = initialState(options.preset);
@@ -409,6 +460,31 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     settings.height = settingsH;
     settings.left = Math.max(0, Math.floor((width - settingsW) / 2));
     settings.top = Math.max(0, Math.floor((height - 1 - settingsH) / 2));
+    layoutEditor();
+  }
+
+  /** The floating editor follows the screen (S22): its box, the embedded terminal and the PTY. */
+  function layoutEditor(): void {
+    const f = floating;
+    if (!f) return;
+    const rect = editorBox(renderer.width, renderer.height);
+    f.box.left = rect.left;
+    f.box.top = rect.top;
+    f.box.width = rect.width;
+    f.box.height = rect.height;
+    f.box.title = editorTitle(f.title, rect.width);
+    const cols = Math.max(1, rect.width - 2);
+    const rows = Math.max(1, rect.height - 2);
+    f.term.width = cols;
+    f.term.height = rows;
+    if (cols === f.cols && rows === f.rows) return;
+    f.cols = cols;
+    f.rows = rows;
+    try {
+      f.pty.resize(cols, rows);
+    } catch {
+      // The editor is exiting: its PTY is already closed.
+    }
   }
 
   /** The settings box: its lines plus border (2) and padding (2), never over the status line. */
@@ -558,6 +634,12 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
   }
 
   function statusContent(width: number): StyledText {
+    if (floating) {
+      return line(width, [
+        fg(floating.color)(bold(` ${floating.name}`)),
+        fg(COLOR.muted)("  │ save and quit to finish · quit without saving to cancel"),
+      ]);
+    }
     const quadrant = focusLabel(state.preset, state.focus);
     switch (state.mode) {
       case "settings":
@@ -632,10 +714,11 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     let followId: number | null = null;
     let message: string | null = null;
     let failed = false;
-    if (action.type === "edit" && id !== null) {
-      // The editor owns the terminal from here; editTask redraws when it is back.
+    if ((action.type === "edit" && id !== null) || action.type === "newTask") {
+      // The editor owns the keys from here; the session redraws when it is over.
       state = next;
-      editing = editTask(id).finally(() => (editing = null));
+      const target: EditTarget = action.type === "newTask" ? { kind: "new", focus: before.focus } : { kind: "edit", id: id! };
+      editing = editorSession(target).finally(() => (editing = null));
       return;
     }
     try {
@@ -731,45 +814,176 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
   }
 
   /**
-   * S11: write the task to a temp file, hand the terminal to the editor, read
-   * the file back and save it if it changed. Never rejects: every outcome ends
-   * in the status line. Since OpenTUI 0.6 suspend()/resume() throw while
-   * another transition is pending, so keys are ignored until this settles.
+   * S22 (S11 for the full-screen fallback): write the task, or the new-task
+   * template, to a 0600 temp file, run the editor on it, read it back, then
+   * create the task (`a`) or save what changed (`e`). Never rejects: every
+   * outcome ends in the status line, and the temp file is always deleted.
+   * Keys go to the editor (floating) or are ignored (full screen) until this
+   * settles.
    */
-  async function editTask(id: number): Promise<void> {
+  async function editorSession(target: EditTarget): Promise<void> {
     let message: string;
     let path: string | null = null;
+    let followId = target.kind === "edit" ? target.id : null;
+    /** The pane a new task goes to; null when editing. */
+    const newIn = target.kind === "new" ? target.focus : null;
+    // A crash or exit while the editor is open: no editor left running, no task text left in /tmp.
+    const onExit = () => {
+      floating?.pty.kill();
+      if (path !== null) removeQuietly(path);
+    };
+    process.on("exit", onExit);
     try {
-      const task = repo.get(id);
-      if (!task) throw new Error(`Task ${id} not found`);
-      path = join(tmpdir(), `eisen-${id}-${crypto.randomUUID().slice(0, 8)}.md`);
-      writeFileSync(path, serializeTask(task), { flag: "wx", mode: 0o600 });
-      await renderer.suspend();
-      let code: number;
-      try {
-        code = await runEditor(path);
-      } finally {
-        await renderer.resume();
+      const task = target.kind === "edit" ? repo.get(target.id) : null;
+      if (target.kind === "edit" && !task) throw new Error(`Task ${target.id} not found`);
+      path = join(tmpdir(), `eisen-${task ? task.id : "new"}-${crypto.randomUUID().slice(0, 8)}.md`);
+      writeFileSync(path, task ? serializeTask(task) : NEW_TASK_FILE, { flag: "wx", mode: 0o600 });
+      const bucket = task ? displayBucket(task, currentDay, within) : (newIn ?? "inbox");
+      const title = task ? `Edit · ${task.title}` : `New task · ${labelFor(state.preset, bucket)}`;
+      const code = await runInEditor(path, title, BUCKET_COLOR[bucket]);
+      if (destroyed) return;
+      if (code !== 0) message = `Editor exited with code ${code}`;
+      else if (task) message = saveEdit(task, readFileSync(path, "utf8"));
+      else {
+        const created = createFromFile(newIn ?? "inbox", readFileSync(path, "utf8"));
+        message = created.message;
+        followId = created.id;
       }
-      message = code === 0 ? saveEdit(task, readFileSync(path, "utf8")) : `Editor exited with code ${code}`;
     } catch (error) {
       message = errorMessage(error);
     } finally {
-      if (path !== null) {
-        try {
-          rmSync(path, { force: true });
-        } catch {
-          // A leftover temp file is not worth an error over the edit's result.
-        }
-      }
+      process.off("exit", onExit);
+      if (path !== null) removeQuietly(path);
     }
     if (destroyed) return;
-    state = follow(reload({ ...state, status: message }), items(), id);
+    const next = reload({ ...state, status: message });
+    state = followId === null ? clamp(next, items()) : follow(next, items(), followId);
     try {
       draw();
     } catch {
       // Same as a key handler's draw failing: the next key redraws.
     }
+  }
+
+  /**
+   * Runs the editor on `path`: in the floating box when the screen is big
+   * enough, EISEN_EDITOR_MODE is not `fullscreen` and the PTY starts;
+   * otherwise full screen. Resolves with the editor's exit code.
+   */
+  async function runInEditor(path: string, title: string, color: string): Promise<number> {
+    const wanted = env.EISEN_EDITOR_MODE !== "fullscreen" && editorFits(renderer.width, renderer.height);
+    const session = wanted ? openFloating(path, title, color) : null;
+    if (session) {
+      try {
+        return await session.pty.exited;
+      } finally {
+        closeFloating(session);
+      }
+    }
+    // S11: since OpenTUI 0.6 suspend()/resume() throw while another transition is pending.
+    await renderer.suspend();
+    try {
+      return await runEditor(path);
+    } finally {
+      await renderer.resume();
+    }
+  }
+
+  /**
+   * Opens the floating box with the editor running in it, focused; null when
+   * the embedded terminal or the PTY cannot start (the caller falls back).
+   */
+  function openFloating(path: string, title: string, color: string): FloatingEditor | null {
+    const rect = editorBox(renderer.width, renderer.height);
+    const cols = Math.max(1, rect.width - 2);
+    const rows = Math.max(1, rect.height - 2);
+    let box: BoxRenderable | null = null;
+    let term: EmbeddedTerminalRenderable;
+    let pty: EditorPty;
+    // Keys and the box's replies to terminal queries go to the editor once it runs.
+    let toEditor: ((data: Uint8Array) => void) | null = null;
+    try {
+      box = new BoxRenderable(renderer, {
+        id: "eisen-editor",
+        position: "absolute",
+        zIndex: 20,
+        border: true,
+        borderStyle: "rounded",
+        borderColor: color,
+        titleColor: color,
+        backgroundColor: COLOR.panel,
+        overflow: "hidden",
+      });
+      term = new EmbeddedTerminalRenderable(renderer, {
+        id: "eisen-editor-terminal",
+        cols,
+        rows,
+        width: cols,
+        height: rows,
+        onData: (data) => toEditor?.(data),
+      });
+      box.add(term);
+      pty = launchEditorPty(editorCommand(env), path, cols, rows);
+    } catch {
+      box?.destroyRecursively();
+      return null;
+    }
+    const cmd = editorCommand(env);
+    const session: FloatingEditor = {
+      box,
+      term,
+      pty,
+      title,
+      color,
+      name: cmd[0]!.split("/").at(-1) || cmd[0]!,
+      cols,
+      rows,
+    };
+    toEditor = (data) => {
+      if (floating === session) pty.write(data);
+    };
+    pty.onData((data) => {
+      if (floating === session && !term.isDestroyed) term.write(data);
+    });
+    try {
+      container.add(box);
+      term.focus();
+    } catch {
+      // The box never showed: stop the editor and let the caller fall back.
+      pty.kill();
+      if (!box.isDestroyed) box.destroyRecursively();
+      return null;
+    }
+    floating = session;
+    try {
+      draw();
+    } catch {
+      // The editor runs anyway; the next output or resize redraws.
+    }
+    return session;
+  }
+
+  /** Takes the box down and gives the matrix its keys back. */
+  function closeFloating(session: FloatingEditor): void {
+    if (floating === session) floating = null;
+    try {
+      session.term.blur();
+    } catch {
+      // Blurring only tells the editor it lost focus; it has exited.
+    }
+    if (!session.box.isDestroyed) {
+      container.remove(session.box);
+      session.box.destroyRecursively();
+    }
+  }
+
+  /** `a` (S22): the new task from the editor's file, in `focus`'s quadrant or the Inbox. */
+  function createFromFile(focus: Focus, text: string): { message: string; id: number | null } {
+    const parsed = parseNewTask(text);
+    if (!parsed.ok) return { message: parsed.cancelled ? "Cancelled" : `${parsed.error} (nothing created)`, id: null };
+    const { title, dueDate, description, tags } = parsed.value;
+    const task = repo.create({ title, description, dueDate, tags, quadrant: focus === "inbox" ? null : focus });
+    return { message: `Added to ${focusLabel(state.preset, focus)}`, id: task.id };
   }
 
   function saveEdit(task: Task, text: string): string {
@@ -783,6 +997,12 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
 
   function onKey(key: KeyEvent): void {
     if (key.eventType === "release") return;
+    // S22: while the floating editor is open every key is the editor's, q and Ctrl+C included.
+    if (floating) {
+      floating.term.handleKeyPress(key);
+      key.preventDefault();
+      return;
+    }
     if (editing !== null) {
       key.preventDefault();
       return;
@@ -821,7 +1041,17 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
       draw();
     },
     destroy() {
+      if (destroyed) return;
       destroyed = true;
+      // Quitting with the editor open ends it; its session deletes the temp file.
+      if (floating) {
+        try {
+          floating.pty.kill();
+        } catch {
+          // Already exited.
+        }
+        closeFloating(floating);
+      }
       renderer.keyInput.off("keypress", onKey);
       renderer.off("resize", onResize);
       resolveDone();
@@ -885,6 +1115,15 @@ function tail(text: string, width: number): string {
   return `…${out}`;
 }
 
+/** Deletes a temp file; a leftover is not worth an error over the edit's result. */
+function removeQuietly(path: string): void {
+  try {
+    rmSync(path, { force: true });
+  } catch {
+    // Nothing more to do.
+  }
+}
+
 function errorMessage(error: unknown): string {
   return `Error: ${error instanceof Error ? error.message : String(error)}`;
 }
@@ -919,6 +1158,8 @@ export async function startTui(repo: TaskRepository, options: AppOptions = {}, d
     preset: config.preset,
     warning,
     savePreset: (preset) => void saveConfig(env, { preset }),
+    // $EDITOR and EISEN_EDITOR_MODE (S22) come from the same environment.
+    env,
     ...options,
   };
   const renderer = await createRenderer();

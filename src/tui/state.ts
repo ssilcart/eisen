@@ -71,6 +71,9 @@ export type Direction = "left" | "right" | "up" | "down";
 export type Action =
   | { type: "navigate"; dir: Direction }
   | { type: "moveTo"; quadrant: Quadrant }
+  /** `a`: a new task in the floating editor (S22); the controller runs it. */
+  | { type: "newTask" }
+  /** `A`: the inline quick-add in the status line. */
   | { type: "startAdd" }
   | { type: "inputChar"; text: string }
   | { type: "inputBackspace" }
@@ -235,6 +238,7 @@ function normalKey(key: Key, searching: boolean): Action {
   if (key.ctrl || key.meta) return NOOP;
   if (isShifted(key, "j")) return { type: "reorder", dir: 1 };
   if (isShifted(key, "k")) return { type: "reorder", dir: -1 };
+  if (isShifted(key, "a")) return { type: "startAdd" };
   if (key.name === "escape") return searching ? { type: "clearSearch" } : { type: "cancel" };
   // Symbols arrive with name = the character.
   switch (key.name) {
@@ -257,7 +261,7 @@ function normalKey(key: Key, searching: boolean): Action {
   if (dir) return { type: "navigate", dir };
   switch (key.name) {
     case "a":
-      return { type: "startAdd" };
+      return { type: "newTask" };
     case "x":
       return { type: "toggleDone" };
     case "d":
@@ -345,6 +349,7 @@ export function reduce(
     case "toggleDone":
     case "reorder":
     case "edit":
+    case "newTask":
       return s;
   }
 }

@@ -96,7 +96,8 @@ quadrant (it leaves the strip and the count drops), `x`, `d`, `e`, `J`/`K`
 | -------------- | -------------------------------------------------- |
 | `h j k l`, arrows | Move between quadrants, the Inbox strip and tasks |
 | `1`–`4`        | Move the selected task to that quadrant            |
-| `a`            | Add a task in the focused quadrant, or to the Inbox from its strip (`#tags` work) |
+| `a`            | New task in `$EDITOR`, in the focused quadrant or the Inbox from its strip |
+| `A`            | Quick add: type a title in the status line (`#tags` work) |
 | `e`            | Edit the task in `$EDITOR`                         |
 | `x`            | Toggle done                                        |
 | `d`            | Delete (asks for confirmation)                     |
@@ -108,12 +109,19 @@ quadrant (it leaves the strip and the count drops), `x`, `d`, `e`, `J`/`K`
 | `?`            | Help                                               |
 | `q`            | Quit                                               |
 
-`e` opens `$VISUAL`, else `$EDITOR`, else `vi` (arguments work, e.g.
-`EDITOR="code --wait"`) on a Markdown file: `# Title` on the first line,
-an optional `due: YYYY-MM-DD` line (leave it empty or remove it to clear the
-date), a blank line, then the description. `#tags` in the title or
-description become tags. Save and quit to apply; a non-zero exit (`:cq` in
-Vim) discards the edit.
+`a` and `e` open `$VISUAL`, else `$EDITOR`, else `vi` (arguments work, e.g.
+`EDITOR="code --wait"`) in a floating box over the matrix, titled
+`New task · {quadrant}` or `Edit · {title}` in the quadrant's colour. While
+it is open every key goes to the editor (`q` and `Ctrl+C` included), and the
+box follows terminal resizes. The editor works on a Markdown file: `# Title`
+on the first line, an optional `due: YYYY-MM-DD` line (leave it empty or
+remove it to clear the date), a blank line, then the description. `#tags` in
+the title or description become tags. Save and quit to apply; a non-zero exit
+(`:cq` in Vim) discards it, and a new task with an empty title is cancelled.
+
+The editor takes the whole terminal instead when the terminal is smaller
+than 40×12, when a pseudo-terminal cannot be started, or when
+`EISEN_EDITOR_MODE=fullscreen` is set.
 
 ### Triage
 
@@ -126,7 +134,7 @@ status line says `press i to triage`; `i` shows its tasks one card at a time
 | -------------- | -------------------------------------------------- |
 | `1`–`4`        | Send the task to that quadrant, show the next      |
 | `s`            | Skip: the task stays in the Inbox                  |
-| `e`            | Edit the task in `$EDITOR`, stay on its card       |
+| `e`            | Edit the task in the floating editor, stay on its card |
 | `d`            | Delete (asks for confirmation)                     |
 | `Esc` / `q`    | Back to the matrix (does not quit)                 |
 

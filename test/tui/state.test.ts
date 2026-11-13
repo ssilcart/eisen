@@ -50,7 +50,9 @@ describe("keyToAction in normal mode (S10)", () => {
     ["2", key("2"), { type: "moveTo", quadrant: 2 }],
     ["3", key("3"), { type: "moveTo", quadrant: 3 }],
     ["4", key("4"), { type: "moveTo", quadrant: 4 }],
-    ["a", key("a"), { type: "startAdd" }],
+    ["a", key("a"), { type: "newTask" }],
+    ["A", upper("A"), { type: "startAdd" }],
+    ["A by sequence", key("A"), { type: "startAdd" }],
     ["x", key("x"), { type: "toggleDone" }],
     ["d", key("d"), { type: "requestDelete" }],
     ["J", upper("J"), { type: "reorder", dir: 1 }],
@@ -189,8 +191,14 @@ describe("reduce: navigation", () => {
 describe("reduce: modes", () => {
   const p = panes([1, 2], [], [], []);
 
-  test("a opens the add input; typing, Backspace and Esc", () => {
-    let s = press(state(), key("a"), p);
+  test("a asks the controller for the floating editor (S22) and changes no mode", () => {
+    const s = press(state({ status: "old" }), key("a"), p);
+    expect(s.mode).toBe("normal");
+    expect(s.status).toBeNull();
+  });
+
+  test("A opens the inline add input; typing, Backspace and Esc", () => {
+    let s = press(state(), upper("A"), p);
     expect(s.mode).toBe("add");
     expect(s.input).toBe("");
     for (const ch of "Pay #rent") s = press(s, key(ch === " " ? "space" : ch, { sequence: ch }), p);
@@ -643,12 +651,13 @@ describe("Inbox strip as a fifth pane, without a search (S24)", () => {
       [key("e"), "edit"],
       [upper("J"), "reorder"],
       [upper("K"), "reorder"],
-      [key("a"), "startAdd"],
+      [key("a"), "newTask"],
+      [upper("A"), "startAdd"],
     ] as const) {
       expect(keyToAction(s, k).type).toBe(type);
     }
     expect(press(s, key("d"), p).mode).toBe("confirmDelete");
-    expect(press(s, key("a"), p)).toMatchObject({ mode: "add", focus: "inbox" });
+    expect(press(s, upper("A"), p)).toMatchObject({ mode: "add", focus: "inbox" });
   });
 
   test("after the selected Inbox task leaves, the selection clamps and the focus stays on the strip", () => {

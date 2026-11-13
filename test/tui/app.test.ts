@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { Database } from "bun:sqlite";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { TextAttributes } from "@opentui/core";
@@ -10,7 +10,14 @@ import { loadConfig, saveConfig } from "../../src/config.ts";
 import { importMarkdown } from "../../src/import/importer.ts";
 import { openDb } from "../../src/store/db.ts";
 import { TaskRepository } from "../../src/store/repository.ts";
-import { createMatrixApp, spawnEditor, startTui, type AppOptions, type MatrixApp } from "../../src/tui/app.ts";
+import {
+  createMatrixApp,
+  spawnEditor,
+  startTui,
+  type AppOptions,
+  type EditorPty,
+  type MatrixApp,
+} from "../../src/tui/app.ts";
 import { BUCKET_COLOR, COLOR, paneStyle } from "../../src/tui/theme.ts";
 
 const TODAY = "2026-11-12";
@@ -23,7 +30,18 @@ let app: MatrixApp;
 async function start(width = 100, height = 30, options: AppOptions = {}) {
   // exitOnCtrlC: false like startTui's renderer, so Ctrl+C reaches the app.
   setup = await createTestRenderer({ width, height, exitOnCtrlC: false });
-  app = createMatrixApp(setup.renderer, repo, { today: () => TODAY, ...options });
+  app = createMatrixApp(setup.renderer, repo, {
+    today: () => TODAY,
+    // Never start a real editor by accident: tests that need one pass their own.
+    env: {},
+    launchEditorPty: () => {
+      throw new Error("no PTY in this test");
+    },
+    runEditor: async () => {
+      throw new Error("no editor in this test");
+    },
+    ...options,
+  });
   return frame();
 }
 
@@ -88,6 +106,75 @@ function where(f: string, text: string): { row: number; col: number } {
   const rows = f.split("\n");
   const row = rows.findIndex((line) => line.includes(text));
   return { row, col: row < 0 ? -1 : rows[row]!.indexOf(text) };
+}
+
+/**
+ * A fake editor process on a PTY (S22): records what the app writes to it
+ * and the sizes it asks for; the test plays the editor with `emit` (screen
+ * output), by writing `path`, and with `exit(code)`.
+ */
+class FakePty implements EditorPty {
+  readonly written: string[] = [];
+  readonly resizes: [number, number][] = [];
+  killed = false;
+  readonly exited: Promise<number>;
+  private finish!: (code: number) => void;
+  private listener: ((data: Uint8Array) => void) | null = null;
+
+  constructor(
+    readonly cmd: string[],
+    readonly path: string,
+    readonly cols: number,
+    readonly rows: number,
+  ) {
+    this.exited = new Promise((resolve) => (this.finish = resolve));
+  }
+  onData(listener: (data: Uint8Array) => void): void {
+    this.listener = listener;
+  }
+  write(data: string | Uint8Array): void {
+    this.written.push(typeof data === "string" ? data : new TextDecoder().decode(data));
+  }
+  resize(cols: number, rows: number): void {
+    this.resizes.push([cols, rows]);
+  }
+  kill(): void {
+    this.killed = true;
+    this.finish(143);
+  }
+  emit(text: string): void {
+    this.listener?.(new TextEncoder().encode(text));
+  }
+  exit(code: number): void {
+    this.finish(code);
+  }
+  /** Everything the app sent to the editor, as text. */
+  get typed(): string {
+    return this.written.join("");
+  }
+}
+
+/**
+ * A `launchEditorPty` that hands out FakePtys; `play` (if any) runs as the
+ * editor once the app has subscribed to the output.
+ */
+function fakeLauncher(play?: (pty: FakePty) => unknown) {
+  const ptys: FakePty[] = [];
+  const launch = (cmd: string[], path: string, cols: number, rows: number) => {
+    const pty = new FakePty(cmd, path, cols, rows);
+    ptys.push(pty);
+    if (play) setTimeout(() => void play(pty), 0);
+    return pty;
+  };
+  return { launch, ptys };
+}
+
+/** An editor that writes `text` to the file and exits with `code`. */
+function writes(text: string, code = 0) {
+  return async (pty: FakePty) => {
+    await Bun.write(pty.path, text);
+    pty.exit(code);
+  };
 }
 
 beforeEach(() => {
@@ -236,9 +323,9 @@ describe("keys (S10)", () => {
     expect(f).toContain("Q1 · ✅ Do (2)");
   });
 
-  test("a + typing + Enter adds a task in the focused quadrant with #tags", async () => {
+  test("A + typing + Enter adds a task in the focused quadrant with #tags (inline quick-add, S22)", async () => {
     await start();
-    await keys("l", "a");
+    await keys("l", "A");
     await setup.mockInput.typeText("Book flights #travel");
     let f = await frame();
     expect(f).toContain("Book flights #travel");
@@ -252,7 +339,7 @@ describe("keys (S10)", () => {
 
   test("Esc cancels the add input without creating anything", async () => {
     await start();
-    await keys("a");
+    await keys("A");
     await setup.mockInput.typeText("nope");
     setup.mockInput.pressEscape();
     await Bun.sleep(30);
@@ -370,7 +457,7 @@ describe("repository failures", () => {
   });
 });
 
-describe("edit in $EDITOR (S11)", () => {
+describe("edit in $EDITOR, full screen (S11, the S22 fallback)", () => {
   // The test renderer has no real terminal, so its suspend()/resume() throw:
   // replace them with recorders. Returns the call log.
   function stubTerminal(): string[] {
@@ -389,7 +476,7 @@ describe("edit in $EDITOR (S11)", () => {
 
   // Starts the app with a fake editor and stubbed suspend/resume.
   async function startEditing(runEditor: (path: string) => Promise<number>) {
-    await start(100, 30, { runEditor });
+    await start(100, 30, { runEditor, env: { EISEN_EDITOR_MODE: "fullscreen" } });
     return stubTerminal();
   }
 
@@ -521,6 +608,388 @@ describe("edit in $EDITOR (S11)", () => {
   });
 });
 
+describe("floating editor (S22)", () => {
+  function events(taskId: number, type: string): number {
+    const row = db.query("SELECT COUNT(*) AS n FROM events WHERE type = $type AND task_id = $id").get({ id: taskId, type }) as {
+      n: number;
+    };
+    return row.n;
+  }
+
+  /** Hex of an OpenTUI RGBA. */
+  const hex = (c: { toInts(): number[] }) =>
+    `#${c
+      .toInts()
+      .slice(0, 3)
+      .map((n) => n.toString(16).padStart(2, "0"))
+      .join("")}`;
+
+  function spanWith(text: string) {
+    for (const line of setup.captureSpans().lines) {
+      const span = line.spans.find((s) => s.text.includes(text));
+      if (span) return span;
+    }
+    throw new Error(`"${text}" not in the frame`);
+  }
+
+  /** Presses `name` and waits for the editor session to settle. */
+  async function run(...names: string[]): Promise<string> {
+    for (const name of names) setup.mockInput.pressKey(name);
+    await app.idle();
+    return frame();
+  }
+
+  test("a in Q2 opens the editor in a PTY on a 0600 temp file and creates the task there with title, description, due date and tags", async () => {
+    let seen = "";
+    let mode = 0;
+    const { launch, ptys } = fakeLauncher(async (pty) => {
+      seen = await Bun.file(pty.path).text();
+      mode = statSync(pty.path).mode & 0o777;
+      await Bun.write(pty.path, "# Book flights #travel\ndue: 2026-12-01\n\nWindow seat #cheap\n");
+      pty.exit(0);
+    });
+    await start(100, 30, { launchEditorPty: launch, env: { VISUAL: "nvim -u NONE", EDITOR: "vi" } });
+    const before = repo.list({ status: "all" }).length;
+    const f = await run("l", "a");
+    const pty = ptys[0]!;
+    expect(ptys).toHaveLength(1);
+    expect(pty.cmd).toEqual(["nvim", "-u", "NONE"]);
+    expect(dirname(pty.path)).toBe(tmpdir().replace(/\/$/, ""));
+    expect(basename(pty.path)).toMatch(/^eisen-new-.+\.md$/);
+    // The box is 70 x 20 at 100 x 30: the editor gets its inside.
+    expect([pty.cols, pty.rows]).toEqual([68, 18]);
+    expect(seen).toBe("# \ndue: \n\n");
+    expect(mode).toBe(0o600);
+    expect(existsSync(pty.path)).toBe(false);
+    const task = byTitle("Book flights #travel")!;
+    expect(bucketOf(task)).toBe(2);
+    expect(task.description).toBe("Window seat #cheap");
+    expect(task.dueDate).toBe("2026-12-01");
+    expect(task.tags).toEqual(["travel", "cheap"]);
+    expect(events(task.id, "created")).toBe(1);
+    expect(repo.list({ status: "all" })).toHaveLength(before + 1);
+    expect(f).toContain("Added to Q2 · 📅 Schedule");
+    expect(f).toContain("Q2 · 📅 Schedule (2)");
+    expect(f).not.toContain("New task ·");
+    expect(app.state.focus).toBe(2);
+    expect(app.state.selected[2]).toBe(1); // the new task, after Plan the trip
+  });
+
+  test("a with the Inbox strip focused creates the task in the Inbox", async () => {
+    const { launch } = fakeLauncher(writes("# Call the plumber\n"));
+    await start(100, 30, { launchEditorPty: launch });
+    await keys("j", "j", "j", "j"); // Q1 (3 tasks) → Q3 (1 task) → the strip
+    expect(app.state.focus).toBe("inbox");
+    const f = await run("a");
+    const task = byTitle("Call the plumber")!;
+    expect(bucketOf(task)).toBe("inbox");
+    expect(f).toContain("Added to 📥 Inbox");
+    expect(f).toContain("📥 Inbox (3)");
+    expect(app.state.focus).toBe("inbox");
+  });
+
+  test("an empty title creates nothing and says Cancelled", async () => {
+    for (const text of ["# \ndue: \n\n", "", "#\n\nonly a description\n"]) {
+      const { launch } = fakeLauncher(writes(text));
+      await start(100, 30, { launchEditorPty: launch });
+      const before = repo.list({ status: "all" }).length;
+      const f = await run("a");
+      expect(repo.list({ status: "all" })).toHaveLength(before);
+      expect(statusOf(f)).toContain("Cancelled");
+      app.destroy();
+      await setup.dispose();
+    }
+  });
+
+  test("a non-zero exit creates nothing and says so", async () => {
+    const { launch } = fakeLauncher(writes("# Should not exist\n", 1));
+    await start(100, 30, { launchEditorPty: launch });
+    const f = await run("a");
+    expect(byTitle("Should not exist")).toBeUndefined();
+    expect(statusOf(f)).toContain("Editor exited with code 1");
+  });
+
+  test("a file that does not parse creates nothing and shows the error", async () => {
+    const { launch } = fakeLauncher(writes("# Buy milk\ndue: soon\n"));
+    await start(100, 30, { launchEditorPty: launch });
+    const before = repo.list({ status: "all" }).length;
+    const f = await run("a");
+    expect(repo.list({ status: "all" })).toHaveLength(before);
+    expect(statusOf(f)).toContain("Invalid due date");
+    expect(statusOf(f)).toContain("nothing created");
+  });
+
+  test("e edits in the box: only what changed is saved, as one edited event, and a section tag stays", async () => {
+    const payRent = byTitle("Pay rent")!;
+    repo.update(payRent.id, { description: "Before the 5th", tags: ["todo"] });
+    const editsBefore = events(payRent.id, "edited");
+    let seen = "";
+    const { launch, ptys } = fakeLauncher(async (pty) => {
+      seen = await Bun.file(pty.path).text();
+      await Bun.write(pty.path, "# Pay the rent #home\n\nBefore the 5th\n");
+      pty.exit(0);
+    });
+    await start(100, 30, { launchEditorPty: launch });
+    const f = await run("e");
+    expect(seen).toBe("# Pay rent\n\nBefore the 5th\n");
+    expect(basename(ptys[0]!.path)).toMatch(new RegExp(`^eisen-${payRent.id}-.+\\.md$`));
+    expect(existsSync(ptys[0]!.path)).toBe(false);
+    const task = repo.get(payRent.id)!;
+    expect(task.title).toBe("Pay the rent #home");
+    expect(task.description).toBe("Before the 5th");
+    expect(task.tags).toEqual(["todo", "home"]);
+    expect(events(payRent.id, "edited")).toBe(editsBefore + 1);
+    expect(f).toContain("Saved");
+    expect(app.state.selected[1]).toBe(0);
+  });
+
+  test("e: a non-zero exit or a parse error saves nothing", async () => {
+    const id = byTitle("Pay rent")!.id;
+    let { launch } = fakeLauncher(writes("# Changed\n", 2));
+    await start(100, 30, { launchEditorPty: launch });
+    let f = await run("e");
+    expect(statusOf(f)).toContain("Editor exited with code 2");
+    app.destroy();
+    await setup.dispose();
+    ({ launch } = fakeLauncher(writes("# Pay rent\ndue: someday\n")));
+    await start(100, 30, { launchEditorPty: launch });
+    f = await run("e");
+    expect(statusOf(f)).toContain('Invalid due date "someday"');
+    expect(repo.get(id)!.title).toBe("Pay rent");
+    expect(repo.get(id)!.dueDate).toBeNull();
+    expect(events(id, "edited")).toBe(0);
+  });
+
+  test("the box is drawn over the matrix, titled in the target's colour, with the editor's screen inside", async () => {
+    const { launch, ptys } = fakeLauncher((pty) => pty.emit("\u001b[H# Hello from the editor"));
+    await start(100, 30, { launchEditorPty: launch });
+    await keys("l", "a");
+    await Bun.sleep(10);
+    let f = await frame();
+    expect(f).toContain("New task · 📅 Schedule");
+    expect(hex(spanWith("New task · 📅 Schedule").fg)).toBe(BUCKET_COLOR[2].toLowerCase());
+    expect(f).toContain("# Hello from the editor");
+    // Centred: the title's row is the box's top, 4 rows down at 100 x 30.
+    expect(where(f, "New task · 📅 Schedule").row).toBe(4);
+    expect(statusOf(f)).toContain("save and quit");
+    ptys[0]!.exit(0);
+    await app.idle();
+    f = await frame();
+    expect(f).not.toContain("New task ·");
+    expect(f).not.toContain("Hello from the editor");
+    expect(statusOf(f)).toContain("Cancelled");
+
+    // e is titled with the task, in the colour of the pane it is shown in.
+    const edit = fakeLauncher();
+    app.destroy();
+    await setup.dispose();
+    await start(100, 30, { launchEditorPty: edit.launch });
+    await keys("e");
+    f = await frame();
+    expect(f).toContain("Edit · Pay rent");
+    expect(hex(spanWith("Edit · Pay rent").fg)).toBe(BUCKET_COLOR[1].toLowerCase());
+    edit.ptys[0]!.exit(0);
+    await app.idle();
+  });
+
+  test("every key goes to the editor while it is open: q, d, 1, x, Esc and Ctrl+C never reach the matrix", async () => {
+    const { launch, ptys } = fakeLauncher();
+    await start(100, 30, { launchEditorPty: launch });
+    await keys("a");
+    await Bun.sleep(10);
+    for (const name of ["q", "d", "1", "x", "j"]) setup.mockInput.pressKey(name);
+    setup.mockInput.pressKey("c", { ctrl: true });
+    setup.mockInput.pressEscape();
+    await Bun.sleep(30);
+    setup.mockInput.pressEnter();
+    await frame();
+    const pty = ptys[0]!;
+    expect(pty.typed).toContain("qd1xj");
+    expect(pty.typed).toContain("\u0003");
+    expect(pty.typed).toContain("\u001b");
+    expect(pty.typed).toContain("\r");
+    expect(await settles(app.done, 50)).toBe("stuck");
+    expect(byTitle("Pay rent")!.status).toBe("open");
+    expect(bucketOf(byTitle("Pay rent")!)).toBe(1);
+    expect(app.state.mode).toBe("normal");
+    expect(app.state.selected[1]).toBe(0);
+    pty.exit(0);
+    await app.idle();
+    // Back to the matrix: keys act on it again.
+    await keys("x");
+    expect(byTitle("Pay rent")!.status).toBe("done");
+    expect(pty.typed).not.toContain("qd1xjx");
+  });
+
+  test("a resize while the editor is open resizes the box and the PTY", async () => {
+    const { launch, ptys } = fakeLauncher();
+    await start(100, 30, { launchEditorPty: launch });
+    await keys("a");
+    setup.resize(120, 40);
+    let f = await frame();
+    const pty = ptys[0]!;
+    // 120 x 40: the box is 84 x 27, the editor 82 x 25.
+    expect(pty.resizes.at(-1)).toEqual([82, 25]);
+    expect(where(f, "New task · ✅ Do").row).toBe(6);
+    setup.resize(60, 20);
+    f = await frame();
+    expect(pty.resizes.at(-1)).toEqual([40, 11]);
+    expect(f).toContain("New task · ✅ Do");
+    pty.exit(0);
+    await app.idle();
+  });
+
+  test("when the PTY cannot start, the full-screen editor is used instead", async () => {
+    const calls: string[] = [];
+    await start(100, 30, {
+      launchEditorPty: () => {
+        calls.push("launch");
+        throw new Error("PTY unsupported");
+      },
+      runEditor: async (path) => {
+        calls.push("editor");
+        await Bun.write(path, "# From the fallback\n");
+        return 0;
+      },
+    });
+    setup.renderer.suspend = async () => void calls.push("suspend");
+    setup.renderer.resume = async () => void calls.push("resume");
+    const f = await run("a");
+    expect(calls).toEqual(["launch", "suspend", "editor", "resume"]);
+    expect(bucketOf(byTitle("From the fallback")!)).toBe(1);
+    expect(f).not.toContain("New task ·");
+  });
+
+  test("a terminal under 40 x 12 or EISEN_EDITOR_MODE=fullscreen uses the full-screen editor", async () => {
+    for (const [width, height, env] of [
+      [39, 30, {}],
+      [100, 11, {}],
+      [100, 30, { EISEN_EDITOR_MODE: "fullscreen" }],
+    ] as const) {
+      const { launch, ptys } = fakeLauncher();
+      let runs = 0;
+      await start(width, height, {
+        launchEditorPty: launch,
+        env,
+        runEditor: async (path) => {
+          runs++;
+          await Bun.write(path, `# Full screen ${width}x${height}\n`);
+          return 0;
+        },
+      });
+      setup.renderer.suspend = async () => {};
+      setup.renderer.resume = async () => {};
+      await run("a");
+      expect(ptys).toHaveLength(0);
+      expect(runs).toBe(1);
+      expect(byTitle(`Full screen ${width}x${height}`)).toBeDefined();
+      app.destroy();
+      await setup.dispose();
+    }
+  });
+
+  test("startTui passes its environment on: EISEN_EDITOR_MODE=fullscreen there picks the full-screen editor", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "eisen-mode-"));
+    try {
+      setup = await createTestRenderer({ width: 100, height: 30, exitOnCtrlC: false });
+      setup.renderer.suspend = async () => {};
+      setup.renderer.resume = async () => {};
+      const { launch, ptys } = fakeLauncher();
+      let ran = false;
+      const run = startTui(
+        repo,
+        {
+          today: () => TODAY,
+          launchEditorPty: launch,
+          runEditor: async (path) => {
+            ran = true;
+            await Bun.write(path, "# Via startTui\n");
+            return 0;
+          },
+        },
+        {
+          createRenderer: async () => setup.renderer,
+          env: { EISEN_CONFIG: join(dir, "config.json"), EISEN_EDITOR_MODE: "fullscreen" },
+        },
+      );
+      await Bun.sleep(20);
+      setup.mockInput.pressKey("a");
+      for (let i = 0; i < 50 && !byTitle("Via startTui"); i++) await Bun.sleep(10);
+      setup.mockInput.pressKey("q");
+      expect(await settles(run, 2000)).toBe("done");
+      expect(ran).toBe(true);
+      expect(ptys).toHaveLength(0);
+      expect(byTitle("Via startTui")).toBeDefined();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("the hints and the help name a (new task in the editor) and A (quick add)", async () => {
+    await start(140, 30);
+    let f = await keys("j"); // clears the triage offer
+    expect(statusOf(f)).toContain("a new · A quick add · e edit");
+    f = await keys("?");
+    expect(f).toContain("New task in $EDITOR, here or in the Inbox from its strip");
+    expect(f).toContain("Quick add: type a title here (#tags work)");
+  });
+
+  test("destroying the app while the editor is open kills the editor and deletes the temp file", async () => {
+    const { launch, ptys } = fakeLauncher();
+    await start(100, 30, { launchEditorPty: launch });
+    await keys("a");
+    const pty = ptys[0]!;
+    expect(existsSync(pty.path)).toBe(true);
+    app.destroy();
+    expect(await settles(app.idle())).toBe("done");
+    expect(pty.killed).toBe(true);
+    expect(existsSync(pty.path)).toBe(false);
+    expect(repo.list({ status: "all" })).toHaveLength(8);
+  });
+
+  test("a failing reload after the editor closes is shown, and q still quits", async () => {
+    const { launch, ptys } = fakeLauncher();
+    await start(100, 30, { launchEditorPty: launch });
+    await keys("a");
+    const broken = breakList(repo);
+    broken.failAlways();
+    ptys[0]!.exit(0);
+    await app.idle();
+    const f = await frame();
+    expect(statusOf(f)).toContain("Error: database is locked");
+    setup.mockInput.pressKey("q");
+    expect(await settles(app.done)).toBe("done");
+  });
+
+  test.skipIf(typeof Bun.Terminal !== "function")(
+    "with a real PTY, a $EDITOR script that writes the file creates the task (skipped where Bun has no PTY)",
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), "eisen-pty-"));
+      try {
+        const script = join(dir, "editor.sh");
+        // Writes the task with its terminal size (rows cols: the box's inside) and exits.
+        writeFileSync(script, '#!/bin/sh\nprintf "# From a real PTY #pty\\n\\nWritten by sh in %s\\n" "$(stty size)" > "$1"\nexit 0\n');
+        chmodSync(script, 0o755);
+        setup = await createTestRenderer({ width: 100, height: 30, exitOnCtrlC: false });
+        app = createMatrixApp(setup.renderer, repo, { today: () => TODAY, env: { ...process.env, VISUAL: "", EDITOR: script } });
+        setup.mockInput.pressKey("l");
+        setup.mockInput.pressKey("a");
+        expect(await settles(app.idle(), 5000)).toBe("done");
+        const task = byTitle("From a real PTY #pty")!;
+        expect(task).toBeDefined();
+        expect(bucketOf(task)).toBe(2);
+        expect(task.description).toBe("Written by sh in 18 68"); // the 70 x 20 box at 100 x 30
+        expect(task.tags).toEqual(["pty"]);
+        const f = await frame();
+        expect(f).toContain("Added to Q2 · 📅 Schedule");
+        expect(f).not.toContain("New task ·");
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+});
+
 describe("triage (S12) on the user's fixture", () => {
   const fixture = readFileSync(join(import.meta.dir, "../../fixtures/import/user-tasks.md"), "utf8");
   let inbox: { id: number; title: string; description: string | null }[];
@@ -628,20 +1097,21 @@ describe("triage (S12) on the user's fixture", () => {
     expect(repo.list({ bucket: "inbox" })).toHaveLength(8);
   });
 
-  test("e edits the current task with the editor and stays on its card", async () => {
+  test("e edits the current task in the floating editor (S22) and stays on its card", async () => {
     const first = inbox[0]!;
-    await start(120, 30, {
-      runEditor: async (path) => {
-        await Bun.write(path, "# Organise subitems in Delivra #delivra\n\nGroup them by epic\n");
-        return 0;
-      },
+    let title = "";
+    const { launch, ptys } = fakeLauncher(async (pty) => {
+      title = (await frame()).split("\n").find((l) => l.includes("Edit ·")) ?? "";
+      await Bun.write(pty.path, "# Organise subitems in Delivra #delivra\n\nGroup them by epic\n");
+      pty.exit(0);
     });
-    setup.renderer.suspend = async () => {};
-    setup.renderer.resume = async () => {};
+    await start(120, 30, { launchEditorPty: launch });
     await keys("i");
     setup.mockInput.pressKey("e");
     await app.idle();
     const f = await frame();
+    expect(ptys).toHaveLength(1);
+    expect(title).toContain(`Edit · ${first.title}`);
     const task = repo.get(first.id)!;
     expect(task.title).toBe("Organise subitems in Delivra #delivra");
     expect(task.description).toBe("Group them by epic");
@@ -928,7 +1398,7 @@ describe("search (S19) on the user's fixture", () => {
     setup.mockInput.pressEnter();
     await frame();
     expect(app.state.focus).toBe("inbox");
-    let f = await keys("a");
+    let f = await keys("A");
     expect(f).toContain("Add to 📥 Inbox:");
     await type("Ask cloudbeds for keys");
     setup.mockInput.pressEnter();
@@ -1223,7 +1693,7 @@ describe("presets and settings (S20, S21)", () => {
 
   test("the add prompt names the quadrant with the preset's label", async () => {
     await start(100, 30, { preset: "priority" });
-    expect(await keys("a")).toContain("Add to Q1 · 🔴 Urgent & Important:");
+    expect(await keys("A")).toContain("Add to Q1 · 🔴 Urgent & Important:");
   });
 
   test("narrow panes still fall back to Q1 (n) with long labels", async () => {
@@ -1543,10 +2013,10 @@ describe("Inbox strip always visible (S24) on the user's fixture", () => {
     expect(app.state.focus).toBe("inbox");
   });
 
-  test("a with the strip focused adds to the Inbox and selects the new task; a in a quadrant still adds there", async () => {
+  test("A with the strip focused adds to the Inbox and selects the new task; A in a quadrant still adds there", async () => {
     await start(120, 30);
     await enterStrip();
-    let f = await keys("a");
+    let f = await keys("A");
     expect(f).toContain("Add to 📥 Inbox:");
     await setup.mockInput.typeText("Book the dentist #health");
     setup.mockInput.pressEnter();
@@ -1561,7 +2031,7 @@ describe("Inbox strip always visible (S24) on the user's fixture", () => {
     expect(app.state.selected.inbox).toBe(8);
     // From Q4 it goes to Q4: 8 k walk up the strip, the 9th leaves it for Q3.
     for (let i = 0; i < 9; i++) setup.mockInput.pressKey("k");
-    await keys("l", "a");
+    await keys("l", "A");
     expect(app.state.focus).toBe(4);
     await setup.mockInput.typeText("Clean the desk");
     setup.mockInput.pressEnter();
@@ -1569,15 +2039,9 @@ describe("Inbox strip always visible (S24) on the user's fixture", () => {
     expect(bucketOf(byTitle("Clean the desk")!)).toBe(4);
   });
 
-  test("e edits the selected Inbox task, which stays in the Inbox", async () => {
-    await start(120, 30, {
-      runEditor: async (path) => {
-        await Bun.write(path, "# Organise subitems in Delivra\n\nGroup them by epic\n");
-        return 0;
-      },
-    });
-    setup.renderer.suspend = async () => {};
-    setup.renderer.resume = async () => {};
+  test("e edits the selected Inbox task in the floating editor, and it stays in the Inbox", async () => {
+    const { launch } = fakeLauncher(writes("# Organise subitems in Delivra\n\nGroup them by epic\n"));
+    await start(120, 30, { launchEditorPty: launch });
     await enterStrip();
     setup.mockInput.pressKey("e");
     await app.idle();

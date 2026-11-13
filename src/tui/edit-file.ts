@@ -1,4 +1,5 @@
-// The Markdown file a task is edited in with $EDITOR (S11). Pure: no
+// The Markdown file a task is edited in with $EDITOR (S11), and the one a new
+// task is written in (S22, `a`). Pure: no
 // @opentui and no bun:sqlite; app.ts writes the file, runs the editor and
 // saves through the repository.
 //
@@ -57,6 +58,42 @@ export function parseTaskFile(text: string): ParseResult {
 }
 
 const textTags = (title: string, description: string | null): string[] => parseTags(`${title}\n${description ?? ""}`);
+
+/** The file `a` opens (S22): the edit format with an empty title and an empty `due:` line. */
+export const NEW_TASK_FILE = "# \ndue: \n\n";
+
+export type NewTaskResult =
+  | { ok: true; value: EditedTask & { tags: string[] } }
+  | { ok: false; cancelled: true }
+  | { ok: false; cancelled: false; error: string };
+
+/**
+ * Reads a new task's file back (S22). A blank file or an empty `#` title
+ * (the template left as it was) cancels; any other file that does not parse
+ * is an error. Tags are the `#tags` of the title and the description.
+ */
+export function parseNewTask(text: string): NewTaskResult {
+  const lines = text.replace(/\r\n?/g, "\n").split("\n");
+  const index = lines.findIndex((line) => line.trim() !== "");
+  // `o` on the template leaves the marker empty and puts the title on the next
+  // line: drop the empty marker when a title (not the `due:` line) follows it
+  // directly. After a blank line it is a description, and there is no title.
+  if (index >= 0 && /^#\s*$/.test(lines[index]!.trim())) {
+    const next = lines[index + 1];
+    if (next !== undefined && next.trim() !== "" && !/^due:/i.test(next.trim())) lines.splice(index, 1);
+  }
+  const first = lines[index];
+  if (first === undefined || /^#\s*$/.test(first.trim())) return { ok: false, cancelled: true };
+  // A first line without the `# ` marker is still the title: nvim's `i` types
+  // before the marker ("Buy milk# "), `cc` replaces it, or the title starts
+  // with a tag ("#urgent fix"). Only the template's exact "# " leftover at the
+  // end is removed; any other `#` belongs to the title.
+  if (!/^#\s/.test(first.trimStart())) lines[index] = `# ${first.replace(/# $/, "").trim()}`;
+  const parsed = parseTaskFile(lines.join("\n"));
+  if (!parsed.ok) return { ok: false, cancelled: false, error: parsed.error };
+  const { title, description } = parsed.value;
+  return { ok: true, value: { ...parsed.value, tags: textTags(title, description) } };
+}
 
 /**
  * The task's tags after an edit: tags that did not come from its old title or
