@@ -836,3 +836,27 @@ describe("done panel as a pane (S27)", () => {
     expect(reduce(s, { type: "toggleBullets" }, withDone).bullets).toBe(true);
   });
 });
+
+describe("preview panel keys (S25)", () => {
+  test("preview is on by default and can be given", () => {
+    expect(initialState().preview).toBe(true);
+    expect(initialState("classic", { preview: false }).preview).toBe(false);
+  });
+
+  test("p toggles the preview; ctrl+d / ctrl+u scroll it", () => {
+    const s = initialState();
+    expect(keyToAction(s, key("p"))).toEqual({ type: "togglePreview" });
+    expect(keyToAction(s, key("d", { ctrl: true, sequence: "\u0004" }))).toEqual({ type: "scrollPreview", dir: 1 });
+    expect(keyToAction(s, key("u", { ctrl: true, sequence: "\u0015" }))).toEqual({ type: "scrollPreview", dir: -1 });
+    const off = reduce(s, { type: "togglePreview" }, panes([1]));
+    expect(off.preview).toBe(false);
+    expect(reduce(off, { type: "togglePreview" }, panes([1])).preview).toBe(true);
+  });
+
+  test("scrolling never moves the focus or the selection", () => {
+    const s = state({ focus: 2, selected: { 1: 0, 2: 1, 3: 0, 4: 0 } });
+    const next = reduce(s, { type: "scrollPreview", dir: 1 }, panes([1], [2, 3]));
+    expect(next.focus).toBe(2);
+    expect(next.selected).toEqual(s.selected);
+  });
+});

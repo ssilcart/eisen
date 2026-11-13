@@ -14,7 +14,9 @@
 // theme.ts). A right sidebar (S26, layout.ts) holds the done panel (S27): a
 // sixth pane entered with `l` from Q2/Q4, toggled with `.`; done tasks never
 // show in the quadrants or the strip, except in a search while the panel is
-// off screen (S19). Rows start with a bullet in the pane's colour (S28).
+// off screen (S19). Above it the preview panel (S25, preview.ts) shows the
+// selected task, toggled with `p` and scrolled with ctrl+d / ctrl+u; it is
+// never focused. Rows start with a bullet in the pane's colour (S28).
 // The view toggles are saved through `saveView` (S29).
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -71,6 +73,7 @@ import {
   type ViewState,
 } from "./state.ts";
 import { buildKeymap, keysOf, type Keymap } from "./keymap.ts";
+import { previewInfo, previewLines, type PreviewInfo, type PreviewLineKind } from "./preview.ts";
 import { settingsHeight, settingsLines, settingsWidth, type SettingsLine } from "./settings.ts";
 import { BUCKET_COLOR, COLOR, DONE_COLOR, paneStyle } from "./theme.ts";
 import { cardLines, triageHints, type CardLineKind } from "./triage-card.ts";
@@ -117,8 +120,7 @@ export interface AppOptions {
   /**
    * The view toggles to start with (S29). A missing field is off here (so
    * embedders and tests opt in); `startTui` passes the saved settings, whose
-   * defaults are done panel off and bullets on. `preview` is read by the
-   * preview panel (S25), not yet.
+   * defaults are preview on, done panel off and bullets on.
    */
   view?: Partial<ViewSettings>;
   /**
@@ -171,6 +173,7 @@ function statusHints(keymap: Keymap): string {
     ...one("search", "search"),
     ...item([firstKey(keymap, "order_down"), firstKey(keymap, "order_up")].filter(Boolean).join("/"), "order"),
     ...one("toggle_done_panel", "done panel"),
+    ...one("toggle_preview", "preview"),
     ...one("settings", "settings"),
     ...one("help", "help"),
     ...one("quit", "quit"),
@@ -204,6 +207,8 @@ function helpRows(preset: PresetId, keymap: Keymap): [string, string][] {
     [all("delete"), "Delete (y/n)"],
     [[all("order_down"), all("order_up")].filter(Boolean).join(" / "), "Reorder inside the quadrant or the Inbox"],
     [all("toggle_done_panel"), "Show / hide the done panel (l from Q2/Q4 enters it)"],
+    [all("toggle_preview"), "Show / hide the preview of the selected task"],
+    [[all("preview_down"), all("preview_up")].filter(Boolean).join(" / "), "Scroll the preview down / up"],
     [all("toggle_bullets"), "Show / hide the bullets"],
     [all("edit"), "Edit in $EDITOR (a floating box; quit it to save)"],
     [all("triage"), `Triage the Inbox: ${triage}`],
@@ -328,6 +333,7 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
   let destroyed = false;
 
   let state = initialState(options.preset, {
+    preview: options.view?.preview ?? false,
     donePanel: options.view?.donePanel ?? false,
     bullets: options.view?.bullets ?? false,
   });
@@ -351,6 +357,11 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
   let doneCount = 0;
   /** The sidebar as last sized; null while it is hidden (S26). */
   let sidebar: Sidebar | null = null;
+  /**
+   * The preview (S25): the task it shows, how far its description is
+   * scrolled (back to 0 when the task changes) and the rows it got.
+   */
+  let preview = { id: null as number | null, scroll: 0, bodyRows: 0, maxScroll: 0 };
   /** Set while a non-blank query filters: matches and totals per pane. */
   let filter: { matches: number; total: Record<Focus, number> } | null = null;
   let currentDay = today();
@@ -428,6 +439,20 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
   );
   const doneText = new TextRenderable(renderer, { id: "eisen-done-list", content: "", wrapMode: "none", fg: COLOR.text });
   doneBox.add(doneText);
+  // S25: the preview panel, above the done panel; never focused.
+  const previewBox = new BoxRenderable(renderer, {
+    id: "eisen-preview",
+    border: true,
+    borderStyle: "rounded",
+    borderColor: COLOR.border,
+    titleColor: COLOR.title,
+    flexShrink: 0,
+    overflow: "hidden",
+    visible: false,
+  });
+  const previewText = new TextRenderable(renderer, { id: "eisen-preview-text", content: "", wrapMode: "none", fg: COLOR.text });
+  previewBox.add(previewText);
+  side.add(previewBox);
   side.add(doneBox);
   const status = new TextRenderable(renderer, {
     id: "eisen-status",
@@ -510,8 +535,7 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
 
   /** The sidebar for view state `s` at the current size, or null while hidden (S26). */
   function sidebarFor(s: ViewState): Sidebar | null {
-    // The preview panel (S25) is not built yet: only the done panel takes room.
-    return sidebarLayout(renderer.width, renderer.height, { preview: false, done: s.donePanel });
+    return sidebarLayout(renderer.width, renderer.height, { preview: s.preview, done: s.donePanel });
   }
 
   /**
@@ -624,6 +648,9 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     side.visible = sidebar !== null;
     side.width = sidebar?.width ?? 0;
     side.height = above;
+    previewBox.visible = (sidebar?.preview ?? 0) > 0;
+    previewBox.width = sidebar?.width ?? 0;
+    previewBox.height = sidebar?.preview ?? 0;
     doneBox.visible = (sidebar?.done ?? 0) > 0;
     doneBox.border = (sidebar?.done ?? 0) > 1;
     doneBox.width = sidebar?.width ?? 0;
@@ -753,6 +780,7 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
       const inner = { width: Math.max(0, leftWidth - 2), height: Math.max(0, stripRows - 2) };
       drawList(stripBox, stripText, strip, "inbox", inner, stripTitle(state.preset, stripCount, leftWidth));
     }
+    drawPreview();
     drawDonePanel();
     status.content = statusContent(renderer.width);
     drawCard();
@@ -774,6 +802,35 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     boldTitles.delete(stripBox);
     const title = fg(style.title)(` ${labelFor(state.preset, "inbox")} (${count})`);
     stripText.content = line(renderer.width, [style.bold ? bold(title) : title]);
+  }
+
+  /**
+   * The preview panel (S25): the selected task (the triage card's while
+   * triaging), its description from `preview.scroll` on, which goes back to
+   * the top whenever the task changes.
+   */
+  function drawPreview(): void {
+    const rowsOfPanel = sidebar?.preview ?? 0;
+    if (rowsOfPanel === 0 || !sidebar) return;
+    const id = currentId(state, items());
+    if (id !== preview.id) preview = { ...preview, id, scroll: 0 };
+    const task = taskById(id) ?? null;
+    const info = task ? previewInfo(task, state.preset, currentDay, within) : null;
+    const inner = { width: Math.max(0, sidebar.width - 2), height: Math.max(0, rowsOfPanel - 2) };
+    const model = previewLines(task, inner.width, inner.height, preview.scroll, info);
+    preview = { ...preview, scroll: model.scroll, bodyRows: model.bodyRows, maxScroll: model.maxScroll };
+    const title = " Preview ";
+    previewBox.title = Bun.stringWidth(title) + 4 <= sidebar.width ? title : undefined;
+    const shown = Math.min(model.bodyRows, model.total - model.scroll);
+    previewBox.bottomTitle =
+      model.total > model.bodyRows && shown > 0 ? ` ${model.scroll + 1}-${model.scroll + shown} of ${model.total} ` : undefined;
+    previewBox.bottomTitleAlignment = "right";
+    const chunks: TextChunk[] = [];
+    model.lines.forEach((l, i) => {
+      if (i > 0) chunks.push(plain("\n"));
+      chunks.push(previewChunk(l.kind, fit(l.text, inner.width), info));
+    });
+    previewText.content = new StyledText(chunks);
   }
 
   /** The done panel (S27): a bordered list, or its title line alone when collapsed (S26). */
@@ -1046,6 +1103,19 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
           message = `Bullets ${next.bullets ? "on" : "off"}`;
           saveView({ bullets: next.bullets });
           break;
+        case "togglePreview": {
+          // S29: the session keeps the new value even when it cannot be saved.
+          message = `Preview ${next.preview ? "on" : "off"}`;
+          if (next.preview && sidebarFor(next) === null) message += ` · ${SIDEBAR_HIDDEN}`;
+          saveView({ preview: next.preview });
+          break;
+        }
+        case "scrollPreview": {
+          // Half the description's rows per key, within what it has (S25).
+          const step = Math.max(1, Math.floor(preview.bodyRows / 2));
+          preview = { ...preview, scroll: Math.max(0, Math.min(preview.maxScroll, preview.scroll + action.dir * step)) };
+          break;
+        }
         case "saveSettings": {
           // S21: the reducer applied the choice; keep it only if it is saved.
           const name = getPreset(next.preset).name;
@@ -1301,9 +1371,9 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     draw();
   }
 
-  /** Some sidebar panel is on (only the done panel until the preview, S25, exists). */
+  /** Some sidebar panel is on (S25, S27). */
   function sidebarWanted(s: ViewState): boolean {
-    return s.donePanel;
+    return s.preview || s.donePanel;
   }
 
   renderer.keyInput.on("keypress", onKey);
@@ -1361,6 +1431,28 @@ const CARD_STYLE: Record<CardLineKind, (text: string) => TextChunk> = {
   hint: (text) => fg(COLOR.focus)(text),
   blank: (text) => plain(text),
 };
+
+/** A preview line (S25), styled by kind; the label in its bucket's colour. */
+function previewChunk(kind: PreviewLineKind, text: string, info: PreviewInfo | null): TextChunk {
+  switch (kind) {
+    case "title":
+      return fg(COLOR.text)(bold(text));
+    case "label":
+      return fg(info?.bucket === "done" ? DONE_COLOR : BUCKET_COLOR[info?.bucket ?? "inbox"])(bold(text));
+    case "due":
+      return fg(info?.escalated ? COLOR.escalated : COLOR.due)(text);
+    case "tags":
+      return fg(COLOR.focus)(text);
+    case "text":
+      return fg(COLOR.text)(text);
+    case "footer":
+      return dim(fg(COLOR.muted)(text));
+    case "empty":
+      return fg(COLOR.muted)(text);
+    case "blank":
+      return plain(text);
+  }
+}
 
 /** Settings lines (S21): the cursor's preset stands out, the others are muted. */
 function settingsChunk(l: SettingsLine): TextChunk {

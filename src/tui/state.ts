@@ -13,16 +13,18 @@ export type Mode = "normal" | "add" | "confirmDelete" | "help" | "triage" | "sea
  */
 export type Focus = Quadrant | "inbox" | "done";
 
-/** The view toggles kept in the state (S27, S28); persisted by the controller (S29). */
+/** The view toggles kept in the state (S25, S27, S28); persisted by the controller (S29). */
 export interface ViewToggles {
+  /** The preview panel in the sidebar (S25). */
+  preview: boolean;
   /** The completed-tasks panel in the sidebar (S27). */
   donePanel: boolean;
   /** `•` at the start of open rows (S28). */
   bullets: boolean;
 }
 
-/** S29 defaults: done panel off, bullets on. */
-export const DEFAULT_TOGGLES: Readonly<ViewToggles> = { donePanel: false, bullets: true };
+/** S29 defaults: preview on, done panel off, bullets on. */
+export const DEFAULT_TOGGLES: Readonly<ViewToggles> = { preview: true, donePanel: false, bullets: true };
 
 export const DONE_ORDER_MESSAGE = "Done tasks are ordered by completion";
 
@@ -62,6 +64,8 @@ export interface ViewState {
    */
   besideDone: 2 | 4;
   mode: Mode;
+  /** The preview panel is on (S25); it shows only while the sidebar fits (S26). */
+  preview: boolean;
   /** The done panel is on (S27); it shows only while the sidebar fits (S26). */
   donePanel: boolean;
   /** Bullets in the rows' mark column (S28). */
@@ -116,6 +120,10 @@ export type Action =
   | { type: "toggleDonePanel" }
   /** Bullets on/off (S28, no default key); the controller saves it. */
   | { type: "toggleBullets" }
+  /** `p`: the preview panel on/off (S25); the controller saves it. */
+  | { type: "togglePreview" }
+  /** `ctrl+d` / `ctrl+u`: scroll the preview's description (S25); the controller does it. */
+  | { type: "scrollPreview"; dir: -1 | 1 }
   | { type: "help" }
   | { type: "cancel" }
   | { type: "quit" }
@@ -146,6 +154,7 @@ export function initialState(preset: PresetId = DEFAULT_PRESET, toggles: Partial
     aboveStrip: 3,
     besideDone: 2,
     mode: "normal",
+    preview: toggles.preview ?? DEFAULT_TOGGLES.preview,
     donePanel: toggles.donePanel ?? DEFAULT_TOGGLES.donePanel,
     bullets: toggles.bullets ?? DEFAULT_TOGGLES.bullets,
     input: "",
@@ -167,7 +176,7 @@ const NOOP: Action = { type: "noop" };
 
 /**
  * What each keymap action does in the matrix (S30). Actions whose feature
- * comes later (preview, `:`) are bound but do nothing yet.
+ * comes later (`:`) are bound but do nothing yet.
  */
 const NORMAL_ACTIONS: Readonly<Record<string, Action>> = {
   move_left: { type: "navigate", dir: "left" },
@@ -188,10 +197,10 @@ const NORMAL_ACTIONS: Readonly<Record<string, Action>> = {
   search: { type: "search" },
   triage: { type: "triage" },
   toggle_done_panel: { type: "toggleDonePanel" },
-  toggle_preview: NOOP,
+  toggle_preview: { type: "togglePreview" },
   toggle_bullets: { type: "toggleBullets" },
-  preview_down: NOOP,
-  preview_up: NOOP,
+  preview_down: { type: "scrollPreview", dir: 1 },
+  preview_up: { type: "scrollPreview", dir: -1 },
   command_line: NOOP,
   settings: { type: "openSettings" },
   help: { type: "help" },
@@ -330,6 +339,8 @@ export function reduce(
       return { ...s, donePanel: !s.donePanel };
     case "toggleBullets":
       return { ...s, bullets: !s.bullets };
+    case "togglePreview":
+      return { ...s, preview: !s.preview };
     case "help":
       return { ...s, mode: "help" };
     case "quit":
@@ -375,6 +386,7 @@ export function reduce(
     case "toggleDone":
     case "edit":
     case "newTask":
+    case "scrollPreview":
       return s;
   }
 }

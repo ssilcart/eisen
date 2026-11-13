@@ -1732,7 +1732,8 @@ describe("presets and settings (S20, S21)", () => {
   });
 
   test("startTui saves the preset picked in the settings to the config file", async () => {
-    setup = await createTestRenderer({ width: 100, height: 30, exitOnCtrlC: false });
+    // 120 columns: startTui turns the preview on (S25), and at 100 the sidebar leaves Q1 too narrow for this title.
+    setup = await createTestRenderer({ width: 120, height: 30, exitOnCtrlC: false });
     const run = startTui(repo, { today: () => TODAY }, { createRenderer: async () => setup.renderer, env: configEnv });
     await Bun.sleep(20);
     await keys(",", "j");
@@ -2542,5 +2543,258 @@ describe("bullets (S28)", () => {
     f = await keys("b");
     expect(f).toContain("• Call the bank");
     expect(saved).toEqual([{ bullets: false }, { bullets: true }]);
+  });
+});
+
+describe("preview panel (S25, S26)", () => {
+  let saved: Record<string, unknown>[];
+
+  beforeEach(() => {
+    saved = [];
+    repo.update(byTitle("Pay rent")!.id, { description: "Transfer to the landlord\nbefore the 5th", tags: ["home"] });
+    repo.update(byTitle("Call the bank")!.id, { description: "Ask about the card fee" });
+  });
+
+  function open(width = 140, height = 40, over: AppOptions = {}) {
+    return start(width, height, { view: { preview: true }, saveView: (patch) => void saved.push(patch), ...over });
+  }
+
+  // Column of the preview panel's left border.
+  function panelCol(f: string): number {
+    return where(f, "Preview").col - 2;
+  }
+
+  // The text of the preview panel only (each row from its left border on).
+  function panel(f: string): string {
+    const col = panelCol(f);
+    return grid(f)
+      .split("\n")
+      .map((line) => line.slice(col))
+      .join("\n");
+  }
+
+  test("at 140×40 a right sidebar shows the selected task: title, bucket, tags, description, footer", async () => {
+    const f = await open();
+    expect(f).toContain("Preview");
+    expect(where(f, "Preview").row).toBe(where(f, "Q1 · ✅ Do").row);
+    expect(panelCol(f)).toBeGreaterThan(where(f, "Q2 · 📅 Schedule").col);
+    const p = panel(f);
+    expect(p).toContain("Pay rent");
+    expect(p).toContain("Q1 · ✅ Do");
+    expect(p).toContain("#home");
+    expect(p).toContain("Transfer to the landlord");
+    expect(p).toContain("before the 5th");
+    expect(p).toMatch(/created \d{4}-\d{2}-\d{2} · updated \d{4}-\d{2}-\d{2}/);
+    // The bucket label is drawn in the quadrant's colour.
+    const label = setup
+      .captureSpans()
+      .lines.flatMap((l) => l.spans)
+      .filter((s) => s.text.includes("Q1 · ✅ Do"))
+      .at(-1)!;
+    expect(hexOf(label.fg)).toBe(BUCKET_COLOR[1].toLowerCase());
+  });
+
+  test("follows j, the Inbox strip and a search match; an escalated due date gets !", async () => {
+    await open();
+    let p = panel(await keys("j"));
+    expect(p).toContain("Ask about the card fee");
+    expect(p).not.toContain("Transfer to the landlord");
+    p = panel(await keys("j"));
+    expect(p).toContain("Renew passport");
+    expect(p).toContain("due: 2026-11-13 !");
+    await keys("j", "j"); // Q3, then the Inbox strip
+    expect(app.state.focus).toBe("inbox");
+    expect(panel(await frame())).toContain("📥 Inbox");
+    await keys("/");
+    await setup.mockInput.typeText("trip");
+    p = panel(await frame());
+    expect(p).toContain("Plan the trip");
+    expect(p).toContain("Q2 · 📅 Schedule");
+  });
+
+  test("updates after an edit in the editor", async () => {
+    const { launch } = fakeLauncher(writes("# Pay rent\n\nNew landlord, new account\n"));
+    await open(140, 40, { launchEditorPty: launch });
+    setup.mockInput.pressKey("e");
+    await app.idle();
+    const p = panel(await frame());
+    expect(p).toContain("New landlord, new account");
+    expect(p).not.toContain("Transfer to the landlord");
+  });
+
+  test("updates after x and after 1–4: it shows the task now selected", async () => {
+    await open();
+    let p = panel(await keys("x"));
+    expect(byTitle("Pay rent")!.status).toBe("done");
+    expect(p).toContain("Call the bank");
+    expect(p).not.toContain("Transfer to the landlord");
+    // From the strip, 1 sends "Unsorted idea" to Q1; the strip selects the next one.
+    await keys("j", "j", "j");
+    expect(app.state.focus).toBe("inbox");
+    p = panel(await frame());
+    expect(p).toContain("Unsorted idea");
+    p = panel(await keys("1"));
+    expect(p).toContain("Another idea");
+    expect(p).not.toContain("Unsorted idea");
+  });
+
+  test("a task in the done panel shows ✓ Done · its completion date", async () => {
+    repo.toggleDone(byTitle("Pay rent")!.id);
+    await open(140, 40, { view: { preview: true, donePanel: true } });
+    await keys("l", "l");
+    expect(app.state.focus).toBe("done");
+    const p = panel(await frame());
+    expect(p).toContain("Transfer to the landlord");
+    expect(p).toMatch(/✓ Done · \d{4}-\d{2}-\d{2}/);
+  });
+
+  test("an empty pane shows No task selected", async () => {
+    repo.toggleDone(byTitle("Watch TV")!.id);
+    await open();
+    const p = panel(await keys("l", "j"));
+    expect(app.state.focus).toBe(4);
+    expect(p).toContain("No task selected");
+  });
+
+  test("p hides it and saves {preview: false}; p again brings it back", async () => {
+    let f = await open();
+    f = await keys("p");
+    expect(grid(f)).not.toContain("Preview");
+    expect(f).not.toContain("Transfer to the landlord");
+    expect(statusOf(f)).toContain("Preview off");
+    f = await keys("p");
+    expect(f).toContain("Transfer to the landlord");
+    expect(saved).toEqual([{ preview: false }, { preview: true }]);
+    for (const patch of saved) expect(Object.values(patch)).not.toContain(undefined);
+  });
+
+  test("a save error shows in the status line and the session keeps the new value", async () => {
+    await open(140, 40, {
+      saveView: () => {
+        throw new Error("EACCES: permission denied");
+      },
+    });
+    const f = await keys("p");
+    expect(statusOf(f)).toContain("EACCES: permission denied");
+    expect(grid(f)).not.toContain("Preview");
+    expect(app.state.preview).toBe(false);
+  });
+
+  test("ctrl+d / ctrl+u scroll a 40-line description; a new selection goes back to the top", async () => {
+    const description = Array.from({ length: 40 }, (_, i) => `step ${String(i + 1).padStart(2, "0")}`).join("\n");
+    repo.update(byTitle("Pay rent")!.id, { description });
+    let p = panel(await open());
+    expect(p).toContain("step 01");
+    expect(p).not.toContain("step 40");
+    setup.mockInput.pressKey("d", { ctrl: true });
+    p = panel(await frame());
+    expect(p).not.toContain("step 01");
+    expect(p).toContain("Pay rent"); // the header stays
+    for (let i = 0; i < 10; i++) setup.mockInput.pressKey("d", { ctrl: true });
+    p = panel(await frame());
+    expect(p).toContain("step 40");
+    setup.mockInput.pressKey("u", { ctrl: true });
+    p = panel(await frame());
+    expect(p).not.toContain("step 40");
+    // The keys never moved the selection.
+    expect(app.state.focus).toBe(1);
+    expect(app.state.selected[1]).toBe(0);
+    p = panel(await keys("j", "k"));
+    expect(p).toContain("step 01");
+    // The next task is long too, so only the reset (not the clamp) brings it to the top.
+    const other = Array.from({ length: 40 }, (_, i) => `line ${String(i + 1).padStart(2, "0")}`).join("\n");
+    for (const t of repo.list({ status: "all" })) if (t.title !== "Pay rent") repo.update(t.id, { description: other });
+    p = panel(await open());
+    for (let i = 0; i < 10; i++) setup.mockInput.pressKey("d", { ctrl: true });
+    p = panel(await frame());
+    expect(p).toContain("step 40");
+    p = panel(await keys("j"));
+    expect(p).toContain("line 01");
+  });
+
+  test("stacked with the done panel: preview on top, done panel below, both in the sidebar", async () => {
+    repo.toggleDone(byTitle("Watch TV")!.id);
+    const f = await open(140, 40, { view: { preview: true, donePanel: true } });
+    const preview = where(f, "Preview");
+    const done = where(f, "✓ Done (1)");
+    expect(preview.row).toBe(0);
+    expect(done.row).toBeGreaterThan(preview.row + 5);
+    // The preview's bottom border sits right above the done panel's top one, at the right edge.
+    const rowsOf = f.split("\n");
+    expect(rowsOf[done.row - 1]!.trimEnd().endsWith("╯")).toBe(true);
+    expect(rowsOf[done.row]!.trimEnd().endsWith("╮")).toBe(true);
+    expect(panel(f)).toContain("Transfer to the landlord");
+    expect(where(f, "Watch TV").row).toBe(done.row + 1);
+  });
+
+  test("under 100 columns the sidebar hides with a message; p still toggles and saves", async () => {
+    let f = await open(90, 30);
+    expect(f).not.toContain("Preview");
+    expect(statusOf(f)).toContain("Sidebar hidden: needs 100 columns");
+    await keys("p");
+    expect(app.state.preview).toBe(false);
+    expect(saved).toEqual([{ preview: false }]);
+    setup.resize(140, 40);
+    f = await frame();
+    expect(grid(f)).not.toContain("Preview");
+    f = await keys("p");
+    expect(f).toContain("Transfer to the landlord");
+  });
+
+  test("the preview is not focusable: l from Q2 stays in Q2 without the done panel", async () => {
+    await open();
+    await keys("l", "l");
+    expect(app.state.focus).toBe(2);
+  });
+
+  test("the help lists the toggle and the scroll keys", async () => {
+    await open();
+    const f = await keys("?");
+    expect(f).toContain("Show / hide the preview");
+    expect(f).toMatch(/ctrl\+d \/ ctrl\+u\s+Scroll the preview/);
+  });
+
+  test("off (the default here): no sidebar", async () => {
+    const f = await start(140, 40);
+    expect(f).not.toContain("Preview");
+    expect(f).not.toContain("Transfer to the landlord");
+  });
+
+  describe("startTui (S29)", () => {
+    let dir: string;
+    let env: Record<string, string>;
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), "eisen-preview-"));
+      env = { EISEN_CONFIG: join(dir, "config.json") };
+    });
+    afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+    test("on by default; p writes preview: false to the config file, other keys kept", async () => {
+      writeFileSync(env.EISEN_CONFIG!, '{"preset": "classic", "extra": 1}');
+      setup = await createTestRenderer({ width: 140, height: 40, exitOnCtrlC: false });
+      const run = startTui(repo, { today: () => TODAY }, { createRenderer: async () => setup.renderer, env });
+      await Bun.sleep(20);
+      let f = await frame();
+      expect(f).toContain("Transfer to the landlord");
+      f = await keys("p");
+      expect(f).not.toContain("Transfer to the landlord");
+      setup.mockInput.pressKey("q");
+      await run;
+      expect(JSON.parse(readFileSync(env.EISEN_CONFIG!, "utf8"))).toEqual({
+        preset: "classic",
+        view: { preview: false },
+        extra: 1,
+      });
+    });
+
+    test("reads view.preview false from the config", async () => {
+      writeFileSync(env.EISEN_CONFIG!, '{"view": {"preview": false}}');
+      setup = await createTestRenderer({ width: 140, height: 40, exitOnCtrlC: false });
+      const run = startTui(repo, { today: () => TODAY }, { createRenderer: async () => setup.renderer, env });
+      await Bun.sleep(20);
+      expect(await frame()).not.toContain("Transfer to the landlord");
+      setup.mockInput.pressKey("q");
+      await run;
+    });
   });
 });
