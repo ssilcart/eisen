@@ -16,6 +16,12 @@ Homebrew (macOS, Linux):
 brew install ssilcart/tap/eisen
 ```
 
+Prebuilt binaries (macOS on Apple silicon, Linux x86-64) are attached to each
+[GitHub release](https://github.com/ssilcart/eisen/releases), with a
+`SHA256SUMS` file. They are not signed with an Apple Developer ID: if macOS
+refuses a binary downloaded with a browser, run
+`xattr -d com.apple.quarantine eisen` (Homebrew does not need this).
+
 From source (needs [Bun](https://bun.sh) 1.3.14 or newer):
 
 ```sh
@@ -124,7 +130,38 @@ eisen ls --search "#rainer" --inbox --json
 bun install
 bun test
 bun run typecheck
+bun run build        # standalone binary for this machine in dist/eisen
 ```
+
+## Release
+
+Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`: it checks that
+the tag matches `package.json`, runs the type check and the tests, compiles
+`eisen` for `darwin-arm64` and `linux-x64` with `bun build --compile`,
+smoke-tests both binaries (`scripts/smoke-binary.sh`: `--version`, `add`,
+`ls`, and the TUI opened in a pseudo-terminal and quit), and publishes a GitHub
+release with `eisen-X.Y.Z-<platform>.tar.gz`, `SHA256SUMS` and the rendered
+Homebrew formula `eisen.rb`.
+
+1. Set `"version": "X.Y.Z"` in `package.json` and commit it.
+2. `git tag vX.Y.Z && git push origin vX.Y.Z`. A tag such as
+   `v0.2.0-rc.1` (with the same version in `package.json`) makes a
+   pre-release, useful to test the workflow.
+3. When the release is out, copy its `eisen.rb` asset to `Formula/eisen.rb`
+   in [`ssilcart/homebrew-tap`](https://github.com/ssilcart/homebrew-tap) and
+   push it; `brew install ssilcart/tap/eisen` then installs the new version.
+
+The formula comes from `packaging/homebrew/eisen.rb.tmpl`; to render it by
+hand from a release's checksums:
+
+```sh
+bun scripts/render-formula.ts --version X.Y.Z --sums SHA256SUMS > eisen.rb
+```
+
+The compiled binary embeds OpenTUI's native library for its platform. To
+cross-compile on one machine, first install every platform's package with
+`bun install --os='*' --cpu='*'`, then
+`bun build --compile --target=bun-linux-x64 src/main.ts --outfile dist/eisen-linux-x64`.
 
 ## License
 

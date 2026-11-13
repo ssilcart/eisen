@@ -1,5 +1,9 @@
 node_modules/
 dist/
+build/
+unpacked/
+# left in the working directory by `bun build --compile --target=…`
+*.bun-build
 *.db
 *.db-wal
 *.db-shm

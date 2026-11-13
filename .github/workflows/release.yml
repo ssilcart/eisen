@@ -1,0 +1,121 @@
+name: release
+
+# Cut a release: bump "version" in package.json, commit, tag vX.Y.Z, push the tag.
+# A tag with a pre-release suffix (v0.1.0-rc.1) needs the same version in
+# package.json and makes a GitHub pre-release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Check the tag matches package.json
+        id: version
+        run: |
+          version="$(jq -r .version package.json)"
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match package.json version ${version} (expected v${version})"
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      # --os/--cpu '*' installs every platform's @opentui/core-<os>-<arch>
+      # package, so each cross-compiled binary can embed its native library
+      # (without it `--target=bun-darwin-arm64` fails to resolve on Linux).
+      - run: bun install --frozen-lockfile --os='*' --cpu='*'
+      - run: bun run typecheck
+      - run: bun test
+
+      - name: Build and package the binaries
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p dist
+          for platform in darwin-arm64 linux-x64; do
+            stage="build/${platform}"
+            mkdir -p "$stage"
+            bun build --compile --target="bun-${platform}" src/main.ts --outfile "${stage}/eisen"
+            cp LICENSE README.md "$stage/"
+            tar -C "$stage" -czf "dist/eisen-${VERSION}-${platform}.tar.gz" eisen LICENSE README.md
+          done
+          (cd dist && sha256sum eisen-*.tar.gz > SHA256SUMS)
+          cat dist/SHA256SUMS
+          ls -l build/*/eisen dist/
+
+      - name: Smoke-test the linux-x64 binary from its archive
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p unpacked
+          tar -xzf "dist/eisen-${VERSION}-linux-x64.tar.gz" -C unpacked
+          scripts/smoke-binary.sh unpacked/eisen "$VERSION"
+
+      - name: Render the Homebrew formula
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: bun scripts/render-formula.ts --version "$VERSION" --sums dist/SHA256SUMS > dist/eisen.rb
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: dist/
+          if-no-files-found: error
+
+  smoke-macos:
+    needs: build
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release
+          path: dist
+      - name: Smoke-test the darwin-arm64 binary from its archive
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          [ "$(uname -m)" = arm64 ] || { echo "::error::runner is $(uname -m), expected arm64"; exit 1; }
+          mkdir -p unpacked
+          tar -xzf "dist/eisen-${VERSION}-darwin-arm64.tar.gz" -C unpacked
+          scripts/smoke-binary.sh unpacked/eisen "$VERSION"
+
+  release:
+    needs: [build, smoke-macos]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release
+          path: dist
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          (cd dist && sha256sum -c SHA256SUMS)
+          prerelease=()
+          case "$VERSION" in *-*) prerelease=(--prerelease) ;; esac
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "eisen ${VERSION}" \
+            --generate-notes \
+            "${prerelease[@]}" \
+            dist/eisen-*.tar.gz dist/SHA256SUMS dist/eisen.rb
