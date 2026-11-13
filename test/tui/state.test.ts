@@ -1,0 +1,282 @@
+import { describe, expect, test } from "bun:test";
+import {
+  clamp,
+  follow,
+  initialState,
+  keyToAction,
+  reduce,
+  selectedId,
+  type Action,
+  type Key,
+  type PaneItems,
+  type ViewState,
+} from "../../src/tui/state.ts";
+
+function key(name: string, extra: Partial<Key> = {}): Key {
+  return { name, sequence: extra.sequence ?? name, shift: false, ctrl: false, ...extra };
+}
+const upper = (ch: string): Key => key(ch.toLowerCase(), { shift: true, sequence: ch });
+
+function items(...ids: number[]) {
+  return ids.map((id) => ({ id }));
+}
+function panes(q1: number[], q2: number[] = [], q3: number[] = [], q4: number[] = []): PaneItems {
+  return { 1: items(...q1), 2: items(...q2), 3: items(...q3), 4: items(...q4) };
+}
+function state(over: Partial<ViewState> = {}): ViewState {
+  return { ...initialState(), ...over };
+}
+function press(s: ViewState, k: Key, p: PaneItems): ViewState {
+  return reduce(s, keyToAction(s, k), p);
+}
+
+describe("keyToAction in normal mode (S10)", () => {
+  const s = initialState();
+  const cases: [string, Key, Action][] = [
+    ["h", key("h"), { type: "navigate", dir: "left" }],
+    ["l", key("l"), { type: "navigate", dir: "right" }],
+    ["j", key("j"), { type: "navigate", dir: "down" }],
+    ["k", key("k"), { type: "navigate", dir: "up" }],
+    ["left", key("left", { sequence: "\u001b[D" }), { type: "navigate", dir: "left" }],
+    ["right", key("right", { sequence: "\u001b[C" }), { type: "navigate", dir: "right" }],
+    ["down", key("down", { sequence: "\u001b[B" }), { type: "navigate", dir: "down" }],
+    ["up", key("up", { sequence: "\u001b[A" }), { type: "navigate", dir: "up" }],
+    ["1", key("1"), { type: "moveTo", quadrant: 1 }],
+    ["2", key("2"), { type: "moveTo", quadrant: 2 }],
+    ["3", key("3"), { type: "moveTo", quadrant: 3 }],
+    ["4", key("4"), { type: "moveTo", quadrant: 4 }],
+    ["a", key("a"), { type: "startAdd" }],
+    ["x", key("x"), { type: "toggleDone" }],
+    ["d", key("d"), { type: "requestDelete" }],
+    ["J", upper("J"), { type: "reorder", dir: 1 }],
+    ["K", upper("K"), { type: "reorder", dir: -1 }],
+    [".", key("."), { type: "toggleShowDone" }],
+    ["?", key("?"), { type: "help" }],
+    ["q", key("q"), { type: "quit" }],
+    ["ctrl+c", key("c", { ctrl: true, sequence: "\u0003" }), { type: "quit" }],
+    ["e", key("e"), { type: "edit" }],
+    ["i", key("i"), { type: "triage" }],
+    ["/", key("/"), { type: "search" }],
+    ["escape", key("escape", { sequence: "\u001b" }), { type: "cancel" }],
+    ["unbound", key("z"), { type: "noop" }],
+  ];
+  for (const [label, k, action] of cases) {
+    test(`${label} → ${action.type}`, () => {
+      expect(keyToAction(s, k)).toEqual(action);
+    });
+  }
+
+  test("J and K are recognised by the sequence too", () => {
+    expect(keyToAction(s, key("J"))).toEqual({ type: "reorder", dir: 1 });
+    expect(keyToAction(s, key("K"))).toEqual({ type: "reorder", dir: -1 });
+  });
+
+  test("a shifted letter is not its lowercase action", () => {
+    expect(keyToAction(s, upper("X"))).toEqual({ type: "noop" });
+    expect(keyToAction(s, upper("Q"))).toEqual({ type: "noop" });
+  });
+});
+
+describe("keyToAction in the other modes", () => {
+  test("add mode: printable keys type, Backspace erases, Enter submits, Esc cancels", () => {
+    const s = state({ mode: "add" });
+    expect(keyToAction(s, key("q"))).toEqual({ type: "inputChar", text: "q" });
+    expect(keyToAction(s, upper("J"))).toEqual({ type: "inputChar", text: "J" });
+    expect(keyToAction(s, key("space", { sequence: " " }))).toEqual({ type: "inputChar", text: " " });
+    expect(keyToAction(s, key("#", { sequence: "#" }))).toEqual({ type: "inputChar", text: "#" });
+    expect(keyToAction(s, key("ñ", { sequence: "ñ" }))).toEqual({ type: "inputChar", text: "ñ" });
+    expect(keyToAction(s, key("backspace", { sequence: "\u007f" }))).toEqual({ type: "inputBackspace" });
+    expect(keyToAction(s, key("return", { sequence: "\r" }))).toEqual({ type: "submitAdd" });
+    expect(keyToAction(s, key("escape", { sequence: "\u001b" }))).toEqual({ type: "cancel" });
+    expect(keyToAction(s, key("up", { sequence: "\u001b[A" }))).toEqual({ type: "noop" });
+    expect(keyToAction(s, key("w", { ctrl: true, sequence: "\u0017" }))).toEqual({ type: "noop" });
+    expect(keyToAction(s, key("c", { ctrl: true, sequence: "\u0003" }))).toEqual({ type: "quit" });
+  });
+
+  test("confirmDelete mode: y confirms, n and Esc cancel, anything else is ignored", () => {
+    const s = state({ mode: "confirmDelete" });
+    expect(keyToAction(s, key("y"))).toEqual({ type: "confirmDelete" });
+    expect(keyToAction(s, key("n"))).toEqual({ type: "cancel" });
+    expect(keyToAction(s, key("escape", { sequence: "\u001b" }))).toEqual({ type: "cancel" });
+    expect(keyToAction(s, key("d"))).toEqual({ type: "noop" });
+    expect(keyToAction(s, key("q"))).toEqual({ type: "noop" });
+  });
+
+  test("help mode: ?, q and Esc close it, other keys do nothing", () => {
+    const s = state({ mode: "help" });
+    expect(keyToAction(s, key("?"))).toEqual({ type: "cancel" });
+    expect(keyToAction(s, key("q"))).toEqual({ type: "cancel" });
+    expect(keyToAction(s, key("escape", { sequence: "\u001b" }))).toEqual({ type: "cancel" });
+    expect(keyToAction(s, key("x"))).toEqual({ type: "noop" });
+    expect(keyToAction(s, key("1"))).toEqual({ type: "noop" });
+  });
+});
+
+describe("reduce: navigation", () => {
+  const p = panes([1, 2, 3], [4], [5, 6], []);
+
+  test("h/l move between left and right panes in the same row", () => {
+    let s = state();
+    s = press(s, key("l"), p);
+    expect(s.focus).toBe(2);
+    s = press(s, key("l"), p);
+    expect(s.focus).toBe(2);
+    s = press(s, key("h"), p);
+    expect(s.focus).toBe(1);
+    s = press(s, key("h"), p);
+    expect(s.focus).toBe(1);
+    s = press(state({ focus: 3 }), key("l"), p);
+    expect(s.focus).toBe(4);
+    s = press(s, key("h"), p);
+    expect(s.focus).toBe(3);
+  });
+
+  test("h/l keep each pane's own selection, clamped", () => {
+    const s = press(state({ focus: 1, selected: { 1: 2, 2: 5, 3: 1, 4: 0 } }), key("l"), p);
+    expect(s.focus).toBe(2);
+    expect(s.selected[2]).toBe(0);
+    expect(s.selected[1]).toBe(2);
+  });
+
+  test("j/k move the selection inside the pane", () => {
+    let s = state();
+    s = press(s, key("j"), p);
+    expect(s.selected[1]).toBe(1);
+    s = press(s, key("down", { sequence: "\u001b[B" }), p);
+    expect(s.selected[1]).toBe(2);
+    s = press(s, key("k"), p);
+    expect(s.selected[1]).toBe(1);
+    s = press(s, key("up", { sequence: "\u001b[A" }), p);
+    expect(s.selected[1]).toBe(0);
+  });
+
+  test("j at the bottom edge crosses to the pane below, at its first task", () => {
+    const s = press(state({ focus: 1, selected: { 1: 2, 2: 0, 3: 1, 4: 0 } }), key("j"), p);
+    expect(s.focus).toBe(3);
+    expect(s.selected[3]).toBe(0);
+  });
+
+  test("k at the top edge crosses to the pane above, at its last task", () => {
+    const s = press(state({ focus: 3, selected: { 1: 0, 2: 0, 3: 0, 4: 0 } }), key("k"), p);
+    expect(s.focus).toBe(1);
+    expect(s.selected[1]).toBe(2);
+  });
+
+  test("an empty pane crosses at once; the outer edges stay put", () => {
+    let s = press(state({ focus: 4 }), key("k"), p);
+    expect(s.focus).toBe(2);
+    s = press(state({ focus: 4 }), key("j"), p);
+    expect(s.focus).toBe(4);
+    s = press(state({ focus: 1 }), key("k"), p);
+    expect(s.focus).toBe(1);
+    expect(s.selected[1]).toBe(0);
+    s = press(state({ focus: 3, selected: { 1: 0, 2: 0, 3: 1, 4: 0 } }), key("j"), p);
+    expect(s.focus).toBe(3);
+    expect(s.selected[3]).toBe(1);
+  });
+
+  test("navigation clears the status message", () => {
+    const s = press(state({ status: "hello" }), key("j"), p);
+    expect(s.status).toBeNull();
+  });
+});
+
+describe("reduce: modes", () => {
+  const p = panes([1, 2], [], [], []);
+
+  test("a opens the add input; typing, Backspace and Esc", () => {
+    let s = press(state(), key("a"), p);
+    expect(s.mode).toBe("add");
+    expect(s.input).toBe("");
+    for (const ch of "Pay #rent") s = press(s, key(ch === " " ? "space" : ch, { sequence: ch }), p);
+    expect(s.input).toBe("Pay #rent");
+    s = press(s, key("backspace", { sequence: "\u007f" }), p);
+    expect(s.input).toBe("Pay #ren");
+    s = press(s, key("escape", { sequence: "\u001b" }), p);
+    expect(s.mode).toBe("normal");
+    expect(s.input).toBe("");
+  });
+
+  test("Backspace removes a whole character, not half a surrogate pair", () => {
+    const s = reduce(state({ mode: "add", input: "ok 🔥" }), { type: "inputBackspace" }, p);
+    expect(s.input).toBe("ok ");
+  });
+
+  test("Enter in add mode returns to normal and clears the input", () => {
+    const s = press(state({ mode: "add", input: "Call mom" }), key("return", { sequence: "\r" }), p);
+    expect(s.mode).toBe("normal");
+    expect(s.input).toBe("");
+  });
+
+  test("d asks for confirmation; n and Esc cancel; y confirms", () => {
+    let s = press(state(), key("d"), p);
+    expect(s.mode).toBe("confirmDelete");
+    expect(press(s, key("n"), p).mode).toBe("normal");
+    expect(press(s, key("escape", { sequence: "\u001b" }), p).mode).toBe("normal");
+    s = press(s, key("y"), p);
+    expect(s.mode).toBe("normal");
+  });
+
+  test("d on an empty pane does not ask and says why", () => {
+    const s = press(state({ focus: 2 }), key("d"), p);
+    expect(s.mode).toBe("normal");
+    expect(s.status).toBe("Nothing selected");
+  });
+
+  test("? opens help, Esc closes it", () => {
+    let s = press(state(), key("?"), p);
+    expect(s.mode).toBe("help");
+    s = press(s, key("escape", { sequence: "\u001b" }), p);
+    expect(s.mode).toBe("normal");
+  });
+
+  test(". toggles showDone", () => {
+    let s = press(state(), key("."), p);
+    expect(s.showDone).toBe(true);
+    s = press(s, key("."), p);
+    expect(s.showDone).toBe(false);
+  });
+
+  test("e, i and / are hooks that say coming soon for now", () => {
+    expect(press(state(), key("e"), p).status).toMatch(/coming soon/);
+    expect(press(state(), key("i"), p).status).toMatch(/coming soon/);
+    expect(press(state(), key("/"), p).status).toMatch(/coming soon/);
+  });
+
+  test("q sets quit", () => {
+    expect(press(state(), key("q"), p).quit).toBe(true);
+  });
+
+  test("effect actions leave the view where it is", () => {
+    const s = state({ selected: { 1: 1, 2: 0, 3: 0, 4: 0 } });
+    for (const action of [
+      { type: "moveTo", quadrant: 3 },
+      { type: "toggleDone" },
+      { type: "reorder", dir: 1 },
+    ] as const) {
+      const next = reduce(s, action, p);
+      expect(next.focus).toBe(1);
+      expect(next.selected[1]).toBe(1);
+      expect(next.mode).toBe("normal");
+    }
+  });
+});
+
+describe("selection helpers", () => {
+  test("clamp keeps every pane's selection inside its list", () => {
+    const s = clamp(state({ selected: { 1: 5, 2: 3, 3: -1, 4: 0 } }), panes([1, 2], [], [3], []));
+    expect(s.selected).toEqual({ 1: 1, 2: 0, 3: 0, 4: 0 });
+  });
+
+  test("selectedId returns the focused pane's task, or null", () => {
+    const p = panes([1, 2], [], [], []);
+    expect(selectedId(state({ selected: { 1: 1, 2: 0, 3: 0, 4: 0 } }), p)).toBe(2);
+    expect(selectedId(state({ focus: 2 }), p)).toBeNull();
+  });
+
+  test("follow selects the task where it now is in the focused pane, else clamps", () => {
+    const p = panes([7, 8, 9]);
+    expect(follow(state({ selected: { 1: 0, 2: 0, 3: 0, 4: 0 } }), p, 9).selected[1]).toBe(2);
+    expect(follow(state({ selected: { 1: 5, 2: 0, 3: 0, 4: 0 } }), p, 42).selected[1]).toBe(2);
+  });
+});
