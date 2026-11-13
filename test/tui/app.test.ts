@@ -2163,3 +2163,91 @@ describe("Inbox strip always visible (S24) on the user's fixture", () => {
     expect(await settles(app.done)).toBe("done");
   });
 });
+
+describe("rebindable keys (S30)", () => {
+  let dir: string;
+  let configEnv: Record<string, string>;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "eisen-app-keys-"));
+    configEnv = { EISEN_CONFIG: join(dir, "config.json") };
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  // The help row that holds `text`.
+  function helpRow(f: string, text: string): string {
+    return f.split("\n").find((line) => line.includes(text)) ?? "";
+  }
+
+  test("toggle_done on space: space marks done, x does nothing, help and hints show space", async () => {
+    await start(140, 30, { keys: { toggle_done: ["space"] } });
+    let f = await keys("x");
+    expect(byTitle("Pay rent")!.status).toBe("open");
+    f = await keys(" ");
+    expect(byTitle("Pay rent")!.status).toBe("done");
+    f = await keys("j", "k");
+    expect(statusOf(f)).toContain("space done");
+    expect(statusOf(f)).not.toContain("x done");
+    f = await keys("?");
+    expect(helpRow(f, "Toggle done")).toContain("space");
+    expect(helpRow(f, "Toggle done")).not.toMatch(/\bx\b/);
+  });
+
+  test("triage keys come from the keymap, and the card's hints show them", async () => {
+    await start(140, 30, { keys: { "triage.skip": ["n"], "triage.send_q2": ["w"] } });
+    const f = await keys("i");
+    expect(f).toContain("n skip");
+    expect(f).toContain("w 📅 Schedule");
+    expect(f).not.toContain("s skip");
+    await keys("s");
+    expect(app.state.triage?.index).toBe(0);
+    await keys("w");
+    expect(app.state.triage?.sorted).toBe(1);
+    await keys("n");
+    expect(app.state.triage).toBeNull();
+  });
+
+  test("bad overrides are ignored and warned in the status line: the first one plus (+N more)", async () => {
+    const f = await start(140, 30, { keys: { fly: ["f"], toggle_done: ["d"], quit: [] } });
+    expect(statusOf(f)).toContain("Config: keys.fly is not an action, ignored (+2 more)");
+    await keys("q");
+    expect(app.state.quit).toBe(true);
+  });
+
+  test("a single warning shows without a count; the config warning comes first", async () => {
+    const f = await start(140, 30, { warning: "Config: invalid JSON, using defaults", keys: { fly: ["f"] } });
+    expect(statusOf(f)).toContain("Config: invalid JSON, using defaults (+1 more)");
+    app.destroy();
+    await setup.dispose();
+    const g = await start(140, 30, { keys: { fly: ["f"] } });
+    expect(statusOf(g)).toContain("Config: keys.fly is not an action, ignored");
+    expect(statusOf(g)).not.toContain("more)");
+  });
+
+  test("startTui reads the key overrides from the config file", async () => {
+    writeFileSync(configEnv.EISEN_CONFIG!, '{"keys": {"toggle_done": ["space"], "__proto__": ["x"]}}');
+    setup = await createTestRenderer({ width: 140, height: 30, exitOnCtrlC: false });
+    const run = startTui(repo, { today: () => TODAY }, { createRenderer: async () => setup.renderer, env: configEnv });
+    await Bun.sleep(20);
+    expect(statusOf(await frame())).toContain("Config: keys.__proto__ is not an action, ignored");
+    await keys("x");
+    expect(byTitle("Pay rent")!.status).toBe("open");
+    await keys(" ");
+    expect(byTitle("Pay rent")!.status).toBe("done");
+    setup.mockInput.pressKey("q");
+    await run;
+  });
+
+  test("startTui warns about a keys section that is not an object", async () => {
+    writeFileSync(configEnv.EISEN_CONFIG!, '{"keys": ["x"]}');
+    setup = await createTestRenderer({ width: 140, height: 30, exitOnCtrlC: false });
+    const run = startTui(repo, { today: () => TODAY }, { createRenderer: async () => setup.renderer, env: configEnv });
+    await Bun.sleep(20);
+    expect(statusOf(await frame())).toContain("Config: keys is not an object");
+    setup.mockInput.pressKey("q");
+    await run;
+  });
+});

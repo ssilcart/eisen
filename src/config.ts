@@ -225,7 +225,10 @@ function parseSettings(value: Record<string, unknown>): { settings: Settings; wa
   const keys = section("keys");
   if (keys) {
     for (const [action, list] of Object.entries(keys)) {
-      if (Array.isArray(list) && list.every((k) => typeof k === "string")) settings.keys[action] = [...list];
+      // defineProperty: a plain assignment to "__proto__" would replace the
+      // object's prototype instead of storing an override (L29a).
+      if (Array.isArray(list) && list.every((k) => typeof k === "string"))
+        Object.defineProperty(settings.keys, action, { value: [...list], enumerable: true, writable: true, configurable: true });
       else warn(`keys.${action} is not a list of keys, ignored`);
     }
   }
@@ -259,7 +262,7 @@ export function saveSettings(env: Env, patch: SettingsPatch): Settings {
       const keys: Record<string, unknown> = { ...(isObject(current.keys) ? current.keys : {}) };
       for (const [action, list] of Object.entries(patch.keys)) {
         if (list === null) delete keys[action];
-        else keys[action] = [...list];
+        else Object.defineProperty(keys, action, { value: [...list], enumerable: true, writable: true, configurable: true });
       }
       out.keys = keys;
     }

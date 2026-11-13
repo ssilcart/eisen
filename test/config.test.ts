@@ -204,6 +204,13 @@ describe("loadSettings (S29)", () => {
     ]);
   });
 
+  test("a __proto__ keys entry stays an own property and never becomes the prototype (L29a)", () => {
+    const result = loadSettings({ EISEN_CONFIG: write('{"keys": {"__proto__": ["x"], "quit": ["q"]}}') });
+    expect(Object.hasOwn(result.settings.keys, "__proto__")).toBe(true);
+    expect(Object.keys(result.settings.keys)).toEqual(["__proto__", "quit"]);
+    expect(Object.getPrototypeOf(result.settings.keys)).toBe(Object.prototype);
+  });
+
   test("an unreadable file gives the defaults and one warning", () => {
     const result = loadSettings({ EISEN_CONFIG: write("{nope") });
     expect(result.settings).toEqual(DEFAULT_SETTINGS);

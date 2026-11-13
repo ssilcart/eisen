@@ -34,7 +34,7 @@ import {
 import { displayBucket, isEscalated, localToday, DEFAULT_URGENT_WITHIN_DAYS } from "../domain/escalation.ts";
 import { prepareSearch, search, type SearchIndex } from "../domain/search.ts";
 import { parseTags } from "../domain/tags.ts";
-import { loadConfig, saveConfig } from "../config.ts";
+import { loadConfig, loadSettings, saveConfig } from "../config.ts";
 import { getPreset, headingFor, labelFor, type PresetId } from "../domain/presets.ts";
 import { QUADRANTS, bucketOf, type Quadrant, type Task } from "../domain/task.ts";
 import type { TaskRepository } from "../store/repository.ts";
@@ -56,6 +56,7 @@ import {
   type PaneItems,
   type ViewState,
 } from "./state.ts";
+import { buildKeymap, keysOf, type Keymap } from "./keymap.ts";
 import { settingsHeight, settingsLines, settingsWidth, type SettingsLine } from "./settings.ts";
 import { BUCKET_COLOR, COLOR, paneStyle } from "./theme.ts";
 import { cardLines, triageHints, type CardLineKind } from "./triage-card.ts";
@@ -87,6 +88,13 @@ export interface AppOptions {
   preset?: PresetId;
   /** Shown in the status line at start, e.g. a config file that could not be used (S21). */
   warning?: string;
+  /** More start-up warnings, after `warning` (e.g. a bad `keys` section, S29). */
+  warnings?: readonly string[];
+  /**
+   * Key overrides by action name (the config's `keys`, S30): each list
+   * replaces that action's keys. Bad ones are ignored with a warning.
+   */
+  keys?: Readonly<Record<string, unknown>>;
   /**
    * Persists the preset picked in the settings (S21); throwing keeps the
    * previous preset and shows the error. Default: applied for this session only.
@@ -106,32 +114,82 @@ export interface MatrixApp {
   destroy(): void;
 }
 
-const HINTS =
-  "h/j/k/l move · 1-4 send · a new · A quick add · e edit · x done · d delete · / search · J/K order · . done · , settings · ? help · q quit";
-
-/** The help's rows; `1`–`4` name the quadrants with the active preset (S20). */
-function helpRows(preset: PresetId): [string, string][] {
-  return [
-    ["h j k l / arrows", "Move between quadrants, the Inbox strip and tasks"],
-    ...QUADRANTS.map((q): [string, string] => [String(q), `Send to ${labelFor(preset, q)}`]),
-    ...HELP_REST,
-  ];
+/** The first key of a matrix (or triage) action, "" when it has none (S30). */
+function firstKey(keymap: Keymap, id: string, scope: "normal" | "triage" = "normal"): string {
+  return keysOf(keymap, scope, id)[0] ?? "";
 }
 
-const HELP_REST: [string, string][] = [
-  ["a", "New task in $EDITOR, here or in the Inbox from its strip"],
-  ["A", "Quick add: type a title here (#tags work)"],
-  ["x", "Toggle done"],
-  ["d", "Delete (y/n)"],
-  ["J / K", "Reorder inside the quadrant or the Inbox"],
-  [".", "Show / hide done tasks"],
-  ["e", "Edit in $EDITOR (a floating box; quit it to save)"],
-  ["i", "Triage the Inbox: 1-4 sort, s skip, Esc exit"],
-  ["/", "Search every task: type to filter, Enter keep, Esc clear"],
-  [",", "Settings: quadrant names"],
-  ["?", "Help"],
-  ["q", "Quit"],
-];
+const MOVES = ["move_left", "move_down", "move_up", "move_right"] as const;
+
+/** `1-4` when the four send keys are 1..4, else their first keys joined by `sep`. */
+function sendKeys(keymap: Keymap, scope: "normal" | "triage", sep: string): string {
+  const keys = QUADRANTS.map((q) => firstKey(keymap, `send_q${q}`, scope));
+  return keys.join("") === "1234" ? "1-4" : keys.filter(Boolean).join(sep);
+}
+
+/** The status line's key hints, from the keymap (S30); unbound actions are left out. */
+function statusHints(keymap: Keymap): string {
+  const item = (keys: string, label: string) => (keys ? [`${keys} ${label}`] : []);
+  const one = (id: string, label: string) => item(firstKey(keymap, id), label);
+  return [
+    ...item(MOVES.map((id) => firstKey(keymap, id)).filter(Boolean).join("/"), "move"),
+    ...item(sendKeys(keymap, "normal", "/"), "send"),
+    ...one("new_task", "new"),
+    ...one("quick_add", "quick add"),
+    ...one("edit", "edit"),
+    ...one("toggle_done", "done"),
+    ...one("delete", "delete"),
+    ...one("search", "search"),
+    ...item([firstKey(keymap, "order_down"), firstKey(keymap, "order_up")].filter(Boolean).join("/"), "order"),
+    ...one("toggle_done_panel", "done"),
+    ...one("settings", "settings"),
+    ...one("help", "help"),
+    ...one("quit", "quit"),
+  ].join(" · ");
+}
+
+/** `h j k l / arrows`: the first key of each move, then the others. */
+function moveKeys(keymap: Keymap): string {
+  const lists = MOVES.map((id) => keysOf(keymap, "normal", id));
+  const first = lists.map((keys) => keys[0]).filter((k) => k !== undefined);
+  const rest = lists.flatMap((keys) => keys.slice(1));
+  const others = rest.join(" ") === "left down up right" ? "arrows" : rest.join(" ");
+  return [first.join(" "), others].filter(Boolean).join(" / ");
+}
+
+/**
+ * The help's rows with the keys from the keymap (S30); `1`–`4` name the
+ * quadrants with the active preset (S20). Actions without a key are left out.
+ */
+function helpRows(preset: PresetId, keymap: Keymap): [string, string][] {
+  const all = (id: string) => keysOf(keymap, "normal", id).join(" / ");
+  const triageSkip = firstKey(keymap, "skip", "triage");
+  const triageSend = sendKeys(keymap, "triage", "/");
+  const triage = [triageSend && `${triageSend} sort`, triageSkip && `${triageSkip} skip`, "Esc exit"].filter(Boolean).join(", ");
+  const rows: [string, string][] = [
+    [moveKeys(keymap), "Move between quadrants, the Inbox strip and tasks"],
+    ...QUADRANTS.map((q): [string, string] => [all(`send_q${q}`), `Send to ${labelFor(preset, q)}`]),
+    [all("new_task"), "New task in $EDITOR, here or in the Inbox from its strip"],
+    [all("quick_add"), "Quick add: type a title here (#tags work)"],
+    [all("toggle_done"), "Toggle done"],
+    [all("delete"), "Delete (y/n)"],
+    [[all("order_down"), all("order_up")].filter(Boolean).join(" / "), "Reorder inside the quadrant or the Inbox"],
+    [all("toggle_done_panel"), "Show / hide done tasks"],
+    [all("edit"), "Edit in $EDITOR (a floating box; quit it to save)"],
+    [all("triage"), `Triage the Inbox: ${triage}`],
+    [all("search"), "Search every task: type to filter, Enter keep, Esc clear"],
+    [all("settings"), "Settings: quadrant names"],
+    [all("help"), "Help"],
+    [all("quit"), "Quit"],
+  ];
+  return rows.filter(([keys]) => keys !== "");
+}
+
+/** The first start-up warning, plus `(+N more)` when there are several. */
+function startWarning(warnings: readonly string[]): string | null {
+  if (warnings.length === 0) return null;
+  return warnings.length === 1 ? warnings[0]! : `${warnings[0]} (+${warnings.length - 1} more)`;
+}
 
 const plain = (text: string): TextChunk => ({ __isChunk: true, text });
 
@@ -208,6 +266,9 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
   let destroyed = false;
 
   let state = initialState(options.preset);
+  // S30: the keys of the matrix and triage actions; bad overrides are warned at start.
+  const { keymap, warnings: keyWarnings } = buildKeymap(options.keys);
+  const hints = statusHints(keymap);
   /** Every task, open and done, as last read from the repository. */
   let all: Task[] = [];
   /** Folded fields of `all` for search (S19), built on the first query after a read. */
@@ -444,7 +505,7 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     stripBox.width = width;
     stripBox.height = stripRows;
     status.width = width;
-    const rowsOfHelp = helpRows(state.preset);
+    const rowsOfHelp = helpRows(state.preset, keymap);
     const helpWidth = Math.min(helpContentWidth(rowsOfHelp) + 4, Math.max(0, width - 4));
     const helpHeight = Math.min(rowsOfHelp.length + 2, Math.max(0, height - 2));
     help.width = helpWidth;
@@ -528,7 +589,7 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
       return;
     }
     const chunks: TextChunk[] = [];
-    cardLines(task, inner.width, inner.height, triageHints(state.preset)).forEach((l, i) => {
+    cardLines(task, inner.width, inner.height, triageHints(state.preset, keymap)).forEach((l, i) => {
       if (i > 0) chunks.push(plain("\n"));
       chunks.push(CARD_STYLE[l.kind](l.text));
     });
@@ -557,7 +618,7 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     status.content = statusContent(renderer.width);
     drawCard();
     help.visible = state.mode === "help";
-    if (help.visible) helpText.content = helpContent(helpRows(state.preset));
+    if (help.visible) helpText.content = helpContent(helpRows(state.preset, keymap));
     drawSettings();
     renderer.requestRender();
   }
@@ -633,6 +694,12 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     return `${filter.matches} ${filter.matches === 1 ? "match" : "matches"}`;
   }
 
+  /** `Triage 2/8 · ? help`, with the triage help key (S30). */
+  function triageStatus(where: string): string {
+    const key = firstKey(keymap, "help", "triage");
+    return key ? `${where} · ${key} help` : where;
+  }
+
   function statusContent(width: number): StyledText {
     if (floating) {
       return line(width, [
@@ -676,7 +743,7 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
         const where = t ? `Triage ${t.index + 1}/${t.queue.length}` : "Triage";
         return line(width, [
           plain(" "),
-          state.status ? fg(COLOR.due)(state.status) : fg(COLOR.muted)(`${where} · ? help`),
+          state.status ? fg(COLOR.due)(state.status) : fg(COLOR.muted)(triageStatus(where)),
         ]);
       }
       case "help":
@@ -684,7 +751,9 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
       case "normal": {
         // S24: the Inbox count lives in the strip's title, not here.
         const result = matchesText();
-        const hint = result === null ? fg(COLOR.muted)(HINTS) : fg(COLOR.due)(`${result} · / edit · Esc clear · ${HINTS}`);
+        const searchKey = firstKey(keymap, "search");
+        const edit = searchKey ? ` · ${searchKey} edit` : "";
+        const hint = result === null ? fg(COLOR.muted)(hints) : fg(COLOR.due)(`${result}${edit} · Esc clear · ${hints}`);
         return line(width, [plain(" "), state.status ? fg(COLOR.due)(state.status) : hint]);
       }
     }
@@ -1007,7 +1076,7 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
       key.preventDefault();
       return;
     }
-    const action = keyToAction(state, key);
+    const action = keyToAction(state, key, keymap);
     if (action.type === "noop") return;
     key.preventDefault();
     dispatch(action);
@@ -1021,9 +1090,11 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
   renderer.keyInput.on("keypress", onKey);
   renderer.on("resize", onResize);
   load();
-  state = offerTriage(state, inboxCount);
-  // S21: a config file that could not be used says so, next to the triage offer.
-  if (options.warning) state = { ...state, status: state.status ? `${options.warning} · ${state.status}` : options.warning };
+  state = offerTriage(state, inboxCount, keymap);
+  // S21, S29, S30: a config file or key that could not be used says so, next
+  // to the triage offer: the first warning, plus how many more.
+  const warning = startWarning([...(options.warning ? [options.warning] : []), ...(options.warnings ?? []), ...keyWarnings]);
+  if (warning) state = { ...state, status: state.status ? `${warning} · ${state.status}` : warning };
   layout();
   draw();
 
@@ -1154,9 +1225,14 @@ export async function startTui(repo: TaskRepository, options: AppOptions = {}, d
     deps.createRenderer ?? (() => createCliRenderer({ exitOnCtrlC: false, screenMode: "alternate-screen" }));
   const env = deps.env ?? process.env;
   const { config, warning } = loadConfig(env);
+  // S30: the key overrides come from the v2 settings; their section's own
+  // warnings are added (the file-level ones are loadConfig's, said once).
+  const loaded = loadSettings(env);
   options = {
     preset: config.preset,
     warning,
+    warnings: loaded.warnings.filter((w) => w.startsWith("Config: keys")),
+    keys: loaded.settings.keys,
     savePreset: (preset) => void saveConfig(env, { preset }),
     // $EDITOR and EISEN_EDITOR_MODE (S22) come from the same environment.
     env,

@@ -2,11 +2,25 @@
 // box, in priority order. app.ts styles them by kind.
 import { DEFAULT_PRESET, labelFor, type PresetId } from "../domain/presets.ts";
 import { QUADRANTS } from "../domain/task.ts";
+import { DEFAULT_KEYMAP, keysOf, type Keymap } from "./keymap.ts";
 import { fit, wrap } from "./layout.ts";
 
-/** The S12 keys, with the quadrants named by `preset` (S20). */
-export function triageHints(preset: PresetId): string {
-  return [...QUADRANTS.map((q) => `${q} ${labelFor(preset, q)}`), "s skip", "e edit", "d delete", "Esc exit"].join(" · ");
+/**
+ * The S12 keys from `keymap` (S30), with the quadrants named by `preset`
+ * (S20); an action without a key is left out. Esc always exits.
+ */
+export function triageHints(preset: PresetId, keymap: Keymap = DEFAULT_KEYMAP): string {
+  const item = (id: string, label: string): string[] => {
+    const key = keysOf(keymap, "triage", id)[0];
+    return key === undefined ? [] : [`${key} ${label}`];
+  };
+  return [
+    ...QUADRANTS.flatMap((q) => item(`send_q${q}`, labelFor(preset, q))),
+    ...item("skip", "skip"),
+    ...item("edit", "edit"),
+    ...item("delete", "delete"),
+    "Esc exit",
+  ].join(" · ");
 }
 
 export const TRIAGE_HINTS = triageHints(DEFAULT_PRESET);

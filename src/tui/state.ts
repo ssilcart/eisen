@@ -3,6 +3,7 @@
 // app.ts runs the repository effects and reloads the panes.
 import { DEFAULT_PRESET, PRESET_IDS, type PresetId } from "../domain/presets.ts";
 import type { Quadrant } from "../domain/task.ts";
+import { DEFAULT_KEYMAP, actionFor, keysOf, type Keymap } from "./keymap.ts";
 
 export type Mode = "normal" | "add" | "confirmDelete" | "help" | "triage" | "search" | "settings";
 
@@ -130,23 +131,64 @@ export function searchActive(state: ViewState): boolean {
 
 const NOOP: Action = { type: "noop" };
 
-const ARROWS: Record<string, Direction> = {
-  h: "left",
-  l: "right",
-  j: "down",
-  k: "up",
-  left: "left",
-  right: "right",
-  down: "down",
-  up: "up",
+/**
+ * What each keymap action does in the matrix (S30). Actions whose feature
+ * comes later (preview, bullets, `:`) are bound but do nothing yet; `.` still
+ * shows/hides done tasks until the done panel replaces it (S27).
+ */
+const NORMAL_ACTIONS: Readonly<Record<string, Action>> = {
+  move_left: { type: "navigate", dir: "left" },
+  move_down: { type: "navigate", dir: "down" },
+  move_up: { type: "navigate", dir: "up" },
+  move_right: { type: "navigate", dir: "right" },
+  send_q1: { type: "moveTo", quadrant: 1 },
+  send_q2: { type: "moveTo", quadrant: 2 },
+  send_q3: { type: "moveTo", quadrant: 3 },
+  send_q4: { type: "moveTo", quadrant: 4 },
+  new_task: { type: "newTask" },
+  quick_add: { type: "startAdd" },
+  edit: { type: "edit" },
+  toggle_done: { type: "toggleDone" },
+  delete: { type: "requestDelete" },
+  order_down: { type: "reorder", dir: 1 },
+  order_up: { type: "reorder", dir: -1 },
+  search: { type: "search" },
+  triage: { type: "triage" },
+  toggle_done_panel: { type: "toggleShowDone" },
+  toggle_preview: NOOP,
+  toggle_bullets: NOOP,
+  preview_down: NOOP,
+  preview_up: NOOP,
+  command_line: NOOP,
+  settings: { type: "openSettings" },
+  help: { type: "help" },
+  quit: { type: "quit" },
 };
+
+/** What each keymap action does on the triage card (S12). */
+const TRIAGE_ACTIONS: Readonly<Record<string, Action>> = {
+  send_q1: { type: "moveTo", quadrant: 1 },
+  send_q2: { type: "moveTo", quadrant: 2 },
+  send_q3: { type: "moveTo", quadrant: 3 },
+  send_q4: { type: "moveTo", quadrant: 4 },
+  skip: { type: "skip" },
+  edit: { type: "edit" },
+  delete: { type: "requestDelete" },
+  help: { type: "help" },
+  exit_triage: { type: "exitTriage" },
+};
+
+function mapped(table: Readonly<Record<string, Action>>, id: string | null): Action {
+  return id !== null && Object.hasOwn(table, id) ? table[id]! : NOOP;
+}
 
 function isCtrlC(key: Key): boolean {
   return key.ctrl && key.name === "c";
 }
 
-function isShifted(key: Key, letter: string): boolean {
-  return key.sequence === letter.toUpperCase() || (key.name === letter && key.shift);
+/** Esc without ctrl/alt (those were never bound and stay inert). */
+function isBareEscape(key: Key): boolean {
+  return key.name === "escape" && !key.ctrl && !key.meta;
 }
 
 /** A key that types text: one printable character (or a printable sequence). */
@@ -156,7 +198,12 @@ function printable(key: Key): string | null {
   return key.sequence;
 }
 
-export function keyToAction(state: ViewState, key: Key): Action {
+/**
+ * The action for `key` in the current mode. Normal and triage keys come from
+ * `keymap` (S30); Esc, Enter, Backspace and Ctrl+C are fixed, and the
+ * text-input modes keep their own keys.
+ */
+export function keyToAction(state: ViewState, key: Key, keymap: Keymap = DEFAULT_KEYMAP): Action {
   if (isCtrlC(key)) return { type: "quit" };
   switch (state.mode) {
     case "add":
@@ -169,13 +216,13 @@ export function keyToAction(state: ViewState, key: Key): Action {
       if (key.name === "escape" || key.name === "?" || (key.name === "q" && !key.shift)) return { type: "cancel" };
       return NOOP;
     case "triage":
-      return triageKey(key);
+      return triageKey(key, keymap);
     case "search":
       return searchKey(key);
     case "settings":
       return settingsKey(key);
     case "normal":
-      return normalKey(key, searchActive(state));
+      return normalKey(key, searchActive(state), keymap);
   }
 }
 
@@ -199,31 +246,9 @@ function settingsKey(key: Key): Action {
   return NOOP;
 }
 
-function triageKey(key: Key): Action {
-  if (key.ctrl || key.meta) return NOOP;
-  switch (key.name) {
-    case "1":
-    case "2":
-    case "3":
-    case "4":
-      return { type: "moveTo", quadrant: Number(key.name) as Quadrant };
-    case "?":
-      return { type: "help" };
-    case "escape":
-      return { type: "exitTriage" };
-  }
-  if (key.shift) return NOOP;
-  switch (key.name) {
-    case "s":
-      return { type: "skip" };
-    case "e":
-      return { type: "edit" };
-    case "d":
-      return { type: "requestDelete" };
-    case "q":
-      return { type: "exitTriage" };
-  }
-  return NOOP;
+function triageKey(key: Key, keymap: Keymap): Action {
+  if (isBareEscape(key)) return { type: "exitTriage" };
+  return mapped(TRIAGE_ACTIONS, actionFor(keymap, "triage", key));
 }
 
 function addKey(key: Key): Action {
@@ -234,46 +259,9 @@ function addKey(key: Key): Action {
   return text === null ? NOOP : { type: "inputChar", text };
 }
 
-function normalKey(key: Key, searching: boolean): Action {
-  if (key.ctrl || key.meta) return NOOP;
-  if (isShifted(key, "j")) return { type: "reorder", dir: 1 };
-  if (isShifted(key, "k")) return { type: "reorder", dir: -1 };
-  if (isShifted(key, "a")) return { type: "startAdd" };
-  if (key.name === "escape") return searching ? { type: "clearSearch" } : { type: "cancel" };
-  // Symbols arrive with name = the character.
-  switch (key.name) {
-    case "?":
-      return { type: "help" };
-    case ".":
-      return { type: "toggleShowDone" };
-    case "/":
-      return { type: "search" };
-    case ",":
-      return { type: "openSettings" };
-    case "1":
-    case "2":
-    case "3":
-    case "4":
-      return { type: "moveTo", quadrant: Number(key.name) as Quadrant };
-  }
-  if (key.shift) return NOOP;
-  const dir = ARROWS[key.name];
-  if (dir) return { type: "navigate", dir };
-  switch (key.name) {
-    case "a":
-      return { type: "newTask" };
-    case "x":
-      return { type: "toggleDone" };
-    case "d":
-      return { type: "requestDelete" };
-    case "e":
-      return { type: "edit" };
-    case "i":
-      return { type: "triage" };
-    case "q":
-      return { type: "quit" };
-  }
-  return NOOP;
+function normalKey(key: Key, searching: boolean, keymap: Keymap): Action {
+  if (isBareEscape(key)) return searching ? { type: "clearSearch" } : { type: "cancel" };
+  return mapped(NORMAL_ACTIONS, actionFor(keymap, "normal", key));
 }
 
 /**
@@ -486,6 +474,7 @@ export function syncTriage(state: ViewState, inbox: readonly { id: number }[]): 
 }
 
 /** S12: on start, a non-empty Inbox is offered in the status line, not forced. */
-export function offerTriage(state: ViewState, inboxCount: number): ViewState {
-  return inboxCount > 0 ? { ...state, status: "press i to triage" } : state;
+export function offerTriage(state: ViewState, inboxCount: number, keymap: Keymap = DEFAULT_KEYMAP): ViewState {
+  const key = keysOf(keymap, "normal", "triage")[0];
+  return inboxCount > 0 && key !== undefined ? { ...state, status: `press ${key} to triage` } : state;
 }
