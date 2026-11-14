@@ -15,6 +15,12 @@ export const COLOR = {
   selectBg: "#3b4261",
   statusBg: "#1f2335",
   panel: "#16161e",
+  /**
+   * The rule between the matrix and the sidebar: the focus blue at 65% over
+   * the panel (blend(focus, panel, 0.65)). Bluer and brighter than the grey
+   * pane borders, dimmer than a focused pane's full colour.
+   */
+  divider: "#5771ab",
 } as const;
 
 export const BUCKET_COLOR: Readonly<Record<Bucket, string>> = {
@@ -27,6 +33,14 @@ export const BUCKET_COLOR: Readonly<Record<Bucket, string>> = {
 
 /** The done panel's own colour (S27): its border and title while focused. */
 export const DONE_COLOR = COLOR.ok;
+
+/** How much of its colour the sidebar rule keeps over the panel. */
+const DIVIDER_TINT = 0.65;
+
+/** The sidebar rule's colour: the done panel's, dimmed, while the sidebar has focus. */
+export function dividerColor(sidebarFocused: boolean): string {
+  return sidebarFocused ? blend(DONE_COLOR, COLOR.panel, DIVIDER_TINT) : COLOR.divider;
+}
 
 /** How much of the pane's colour tints the selected row's background. */
 const SELECT_TINT = 0.35;

@@ -106,7 +106,8 @@ import {
   type SettingsLine,
   type SettingsValues,
 } from "./settings.ts";
-import { BUCKET_COLOR, COLOR, DONE_COLOR, paneStyle } from "./theme.ts";
+import { seeThrough } from "./see-through.ts";
+import { BUCKET_COLOR, COLOR, DONE_COLOR, dividerColor, paneStyle } from "./theme.ts";
 import { cardLines, triageHints, type CardLineKind } from "./triage-card.ts";
 
 export type { EditorPty, LaunchEditorPty } from "./editor-pty.ts";
@@ -209,6 +210,10 @@ function firstKey(keymap: Keymap, id: string, scope: "normal" | "triage" = "norm
 }
 
 const MOVES = ["move_left", "move_down", "move_up", "move_right"] as const;
+
+/** The rule between the matrix and the sidebar: one column of a heavy line, taken from the matrix. */
+const DIVIDER_WIDTH = 1;
+const DIVIDER_GLYPH = "┃";
 
 /** `1-4` when the four send keys are 1..4, else their first keys joined by `sep`. */
 function sendKeys(keymap: Keymap, scope: "normal" | "triage", sep: string): string {
@@ -455,6 +460,16 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
   const main = new BoxRenderable(renderer, { id: "eisen-main", flexDirection: "row", flexShrink: 0 });
   const left = new BoxRenderable(renderer, { id: "eisen-left", flexDirection: "column", flexShrink: 0 });
   const side = new BoxRenderable(renderer, { id: "eisen-sidebar", flexDirection: "column", flexShrink: 0, visible: false });
+  // A heavy 1-column rule between the two, shown with the sidebar; its column comes off the matrix.
+  const divider = new TextRenderable(renderer, {
+    id: "eisen-divider",
+    content: "",
+    wrapMode: "none",
+    width: DIVIDER_WIDTH,
+    flexShrink: 0,
+    fg: COLOR.divider,
+    visible: false,
+  });
   const rows = [0, 1].map(
     (i) => new BoxRenderable(renderer, { id: `eisen-row-${i}`, flexDirection: "row", flexShrink: 0 }),
   );
@@ -598,6 +613,7 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
   for (const row of rows) left.add(row);
   left.add(stripBox);
   main.add(left);
+  main.add(divider);
   main.add(side);
   container.add(main);
   container.add(status);
@@ -709,11 +725,11 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
   // ── Drawing ──────────────────────────────────────────────────────────────
   /**
    * Grid sizes, the Inbox strip's height (1: a title line without a border;
-   * S24) and the width left of the sidebar (S26).
+   * S24) and the width left of the sidebar (S26) and of its rule.
    */
   function sizes() {
     const stripRows = stripHeight(renderer.height);
-    const leftWidth = Math.max(0, renderer.width - (sidebar?.width ?? 0));
+    const leftWidth = Math.max(0, renderer.width - (sidebar ? sidebar.width + DIVIDER_WIDTH : 0));
     return { g: gridSizes(leftWidth, renderer.height, stripRows), stripRows, leftWidth };
   }
 
@@ -729,6 +745,10 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     side.visible = sidebar !== null;
     side.width = sidebar?.width ?? 0;
     side.height = above;
+    divider.visible = sidebar !== null;
+    divider.height = above;
+    divider.content = sidebar ? Array.from({ length: above }, () => DIVIDER_GLYPH).join("\n") : "";
+    divider.fg = dividerColor(state.focus === "done");
     previewBox.visible = (sidebar?.preview ?? 0) > 0;
     previewBox.width = sidebar?.width ?? 0;
     previewBox.height = sidebar?.preview ?? 0;
@@ -1580,23 +1600,28 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     // Keys and the box's replies to terminal queries go to the editor once it runs.
     let toEditor: ((data: Uint8Array) => void) | null = null;
     try {
-      box = new BoxRenderable(renderer, {
-        id: "eisen-editor",
-        position: "absolute",
-        zIndex: 20,
-        border: true,
-        borderStyle: "rounded",
-        borderColor: color,
-        titleColor: color,
-        backgroundColor: COLOR.panel,
-        overflow: "hidden",
-      });
+      // The terminal's own background shows in the box (a translucent one
+      // too), and the editor's default background stays default: no opaque
+      // block over the matrix.
+      box = seeThrough(
+        new BoxRenderable(renderer, {
+          id: "eisen-editor",
+          position: "absolute",
+          zIndex: 20,
+          border: true,
+          borderStyle: "rounded",
+          borderColor: color,
+          titleColor: color,
+          overflow: "hidden",
+        }),
+      );
       term = new EmbeddedTerminalRenderable(renderer, {
         id: "eisen-editor-terminal",
         cols,
         rows,
         width: cols,
         height: rows,
+        transparentBackground: true,
         onData: (data) => toEditor?.(data),
       });
       box.add(term);

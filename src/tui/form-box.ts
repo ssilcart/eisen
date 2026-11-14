@@ -9,7 +9,8 @@
 import { BoxRenderable, TextRenderable, TextareaRenderable, bold, fg, StyledText, type CliRenderer, type KeyEvent } from "@opentui/core";
 import { checkForm, formChanged, nextField, oneLine, type FormCheck, type FormField, type FormValues } from "./edit-form.ts";
 import { fit, type Rect } from "./layout.ts";
-import { COLOR, blend } from "./theme.ts";
+import { seeThrough } from "./see-through.ts";
+import { COLOR } from "./theme.ts";
 
 /** What a closed form gives: the task to save, or null when cancelled. */
 export type FormResult = Extract<FormCheck, { ok: true }>["value"] | null;
@@ -41,6 +42,8 @@ export const FORM_HINT = "Tab next field · Enter next / newline · Ctrl+S save 
 export const DISCARD_QUESTION = "Discard changes? Esc again";
 
 const LABEL_WIDTH = 7;
+/** Before the focused field's label; the others get a space, so labels never move. */
+const FOCUS_MARK = "▍";
 const ENTER = new Set(["return", "linefeed", "kpenter"]);
 
 export interface FormOptions {
@@ -59,22 +62,23 @@ export function createFormBox(renderer: CliRenderer, options: FormOptions): Form
   let field: FormField = "title";
   let message: FormMessage | null = null;
 
-  const box = new BoxRenderable(renderer, {
-    id: "eisen-form",
-    position: "absolute",
-    zIndex: 20,
-    border: true,
-    borderStyle: "rounded",
-    borderColor: color,
-    titleColor: color,
-    backgroundColor: COLOR.panel,
-    flexDirection: "column",
-    paddingLeft: 1,
-    paddingRight: 1,
-    overflow: "hidden",
-  });
-  const fieldBg = COLOR.statusBg;
-  const focusedBg = blend(color, COLOR.panel, 0.18);
+  // The terminal's own background shows in the box and its fields (a
+  // translucent one too); the focused field is marked by its label instead.
+  const box = seeThrough(
+    new BoxRenderable(renderer, {
+      id: "eisen-form",
+      position: "absolute",
+      zIndex: 20,
+      border: true,
+      borderStyle: "rounded",
+      borderColor: color,
+      titleColor: color,
+      flexDirection: "column",
+      paddingLeft: 1,
+      paddingRight: 1,
+      overflow: "hidden",
+    }),
+  );
   const area = (id: FormField, value: string, multiLine: boolean, placeholder?: string) =>
     new TextareaRenderable(renderer, {
       id: `eisen-form-${id}`,
@@ -83,8 +87,8 @@ export function createFormBox(renderer: CliRenderer, options: FormOptions): Form
       placeholderColor: COLOR.muted,
       textColor: COLOR.text,
       focusedTextColor: COLOR.text,
-      backgroundColor: fieldBg,
-      focusedBackgroundColor: focusedBg,
+      backgroundColor: "transparent",
+      focusedBackgroundColor: "transparent",
       cursorColor: color,
       wrapMode: multiLine ? "word" : "none",
       flexGrow: 1,
@@ -130,9 +134,11 @@ export function createFormBox(renderer: CliRenderer, options: FormOptions): Form
   function paint(): void {
     const names: Record<FormField, string> = { title: "Title", due: "Due", description: "Description" };
     for (const id of ["title", "due", "description"] as const) {
+      // The focused field: a bar before its label, both in the box's colour, bold.
       const focused = id === field;
-      const style = focused ? fg(color) : fg(COLOR.muted);
-      labels[id].content = new StyledText([focused ? bold(style(names[id])) : style(names[id])]);
+      labels[id].content = new StyledText([
+        focused ? bold(fg(color)(`${FOCUS_MARK}${names[id]}`)) : fg(COLOR.muted)(` ${names[id]}`),
+      ]);
     }
     const text = message?.text ?? FORM_HINT;
     const style = message?.kind === "error" ? fg(COLOR.escalated) : message ? fg(COLOR.due) : fg(COLOR.muted);
