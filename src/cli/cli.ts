@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { basename } from "node:path";
 import { parseArgs } from "node:util";
-import { displayBucket, isEscalated, localToday } from "../domain/escalation.ts";
+import { isEscalated, localToday } from "../domain/escalation.ts";
 import { loadConfig } from "../config.ts";
 import { headingFor, type PresetId } from "../domain/presets.ts";
 import { bucketOf, isValidDate, QUADRANTS, type Bucket, type Quadrant, type Task } from "../domain/task.ts";
@@ -55,7 +55,7 @@ Adds a task. Without a quadrant it goes to the Inbox. #words in the title become
 `,
   ls: `Usage: eisen ls [--q1|--q2|--q3|--q4|--inbox] [--search "<query>"] [--all] [--json]
 
-Lists open tasks grouped by where they are shown (due-soon tasks escalate, marked "!").
+Lists open tasks grouped by quadrant (due-soon tasks are marked "!").
   --q1..--q4, --inbox  Only that quadrant or the Inbox
   --search "<query>"   Only tasks matching every word of the query in the title,
                        description or tags, best first; done tasks included (marked ✓).
@@ -176,7 +176,7 @@ const COMMANDS: Record<"add" | "ls" | "import" | "export", (args: string[], io: 
     const rows = tasks
       .filter((task) => matches === null || matches.has(task.id))
       .map((task) => {
-        const row = { ...task, bucket: bucketOf(task), shownIn: displayBucket(task, today), escalated: isEscalated(task, today) };
+        const row = { ...task, bucket: bucketOf(task), shownIn: bucketOf(task), escalated: isEscalated(task, today) };
         const match = matches?.get(task.id);
         return match ? { ...row, score: match.score, matched: match.fields } : row;
       })

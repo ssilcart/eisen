@@ -1,9 +1,9 @@
 // Pure line model of the preview panel (S25): what the selected task's
 // panel shows in its inner box, and how far its description is scrolled.
 // app.ts styles the lines by kind; Markdown is shown as plain text.
-import { DEFAULT_URGENT_WITHIN_DAYS, displayBucket, isEscalated } from "../domain/escalation.ts";
+import { DEFAULT_URGENT_WITHIN_DAYS, isEscalated } from "../domain/escalation.ts";
 import { headingFor, labelFor, type PresetId } from "../domain/presets.ts";
-import type { Bucket, Task } from "../domain/task.ts";
+import { bucketOf, type Bucket, type Task } from "../domain/task.ts";
 import { fit, wrap } from "./layout.ts";
 
 /** How the selected task is labelled: its displayed bucket, or done (S25). */
@@ -48,7 +48,7 @@ export function localDate(iso: string): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 
-/** The bucket label of `task` (S25) with `preset`'s names, escalated as on screen (S7). */
+/** The bucket label of `task` (S25) with `preset`'s names; a due-soon task keeps its quadrant, marked (S7). */
 export function previewInfo(
   task: Task,
   preset: PresetId,
@@ -59,7 +59,7 @@ export function previewInfo(
     const day = task.completedAt ? ` · ${localDate(task.completedAt)}` : "";
     return { label: `✓ Done${day}`, bucket: "done", escalated: false };
   }
-  const bucket = displayBucket(task, today, withinDays);
+  const bucket = bucketOf(task);
   const label = bucket === "inbox" ? labelFor(preset, "inbox") : headingFor(preset, bucket);
   return { label, bucket, escalated: isEscalated(task, today, withinDays) };
 }

@@ -221,9 +221,9 @@ beforeEach(() => {
   repo.create({ title: "Pay rent", quadrant: 1 });
   repo.create({ title: "Call the bank", quadrant: 1 });
   repo.create({ title: "Plan the trip", quadrant: 2 });
-  repo.create({ title: "Renew passport", quadrant: 2, dueDate: "2026-11-13" }); // escalated to Q1 (S7)
+  repo.create({ title: "Renew passport", quadrant: 1, dueDate: "2026-11-13" }); // urgent already: no ! (S7)
   repo.create({ title: "Reply to email", quadrant: 3 });
-  repo.create({ title: "Watch TV", quadrant: 4 });
+  repo.create({ title: "Watch TV", quadrant: 4, dueDate: "2026-11-13" }); // due soon: ! but stays in Q4 (S7)
   repo.create({ title: "Unsorted idea" });
   repo.create({ title: "Another idea" });
 });
@@ -258,12 +258,16 @@ describe("matrix view (S9)", () => {
     expect(where(f, "Another idea").row).toBeGreaterThan(strip.row);
   });
 
-  test("an escalated task sits in Q1 with a ! mark and its due date", async () => {
+  test("an escalated task stays in its own quadrant with a ! mark and its due date", async () => {
     const f = await start();
-    const row = f.split("\n").find((line) => line.includes("Renew passport"))!;
+    const row = f.split("\n").find((line) => line.includes("Watch TV"))!;
     expect(row).toContain("!");
     expect(row).toContain("2026-11-13");
-    expect(where(f, "Renew passport").col).toBeLessThan(where(f, "Q2 · 📅 Schedule").col);
+    expect(f).toContain("Q4 · 🧹 Delete (1)");
+    expect(where(f, "Watch TV").col).toBeGreaterThanOrEqual(where(f, "Q4 · 🧹 Delete").col);
+    expect(where(f, "Watch TV").row).toBeGreaterThan(where(f, "Q4 · 🧹 Delete").row);
+    // An urgent task with a due date is not escalated: no !.
+    expect(f.split("\n").find((line) => line.includes("Renew passport"))!).not.toContain("!");
   });
 
   test("long titles are truncated to the pane width", async () => {
@@ -3039,10 +3043,10 @@ describe("divider between the matrix and the sidebar", () => {
 describe("bullets (S28)", () => {
   test("open rows start with • in the pane's colour, escalated ones with !, in the quadrants and the strip", async () => {
     const f = await start(120, 30, { view: { bullets: true } });
-    for (const title of ["Pay rent", "Call the bank", "Plan the trip", "Reply to email", "Watch TV", "Unsorted idea", "Another idea"]) {
+    for (const title of ["Pay rent", "Call the bank", "Renew passport", "Plan the trip", "Reply to email", "Unsorted idea", "Another idea"]) {
       expect(f.split("\n").find((line) => line.includes(title))!).toContain(`• ${title}`);
     }
-    expect(f.split("\n").find((line) => line.includes("Renew passport"))!).toContain("! Renew passport");
+    expect(f.split("\n").find((line) => line.includes("Watch TV"))!).toContain("! Watch TV");
     expect(markOf("Call the bank").text).toBe("• ");
     expect(hexOf(markOf("Call the bank").fg)).toBe(BUCKET_COLOR[1].toLowerCase());
     expect(hexOf(markOf("Plan the trip").fg)).toBe(BUCKET_COLOR[2].toLowerCase());
@@ -3130,7 +3134,8 @@ describe("preview panel (S25, S26)", () => {
     expect(p).not.toContain("Transfer to the landlord");
     p = panel(await keys("j"));
     expect(p).toContain("Renew passport");
-    expect(p).toContain("due: 2026-11-13 !");
+    expect(p).toContain("due: 2026-11-13");
+    expect(p).not.toContain("due: 2026-11-13 !"); // already urgent: not escalated
     await keys("j", "j"); // Q3, then the Inbox strip
     expect(app.state.focus).toBe("inbox");
     expect(panel(await frame())).toContain("📥 Inbox");
@@ -3139,6 +3144,12 @@ describe("preview panel (S25, S26)", () => {
     p = panel(await frame());
     expect(p).toContain("Plan the trip");
     expect(p).toContain("Q2 · 📅 Schedule");
+    for (let i = 0; i < 4; i++) setup.mockInput.pressBackspace();
+    await setup.mockInput.typeText("tv");
+    p = panel(await frame());
+    expect(p).toContain("Watch TV");
+    expect(p).toContain("Q4 · 🧹 Delete"); // due soon: keeps its quadrant
+    expect(p).toContain("due: 2026-11-13 !");
   });
 
   test("updates after an edit in the editor", async () => {
@@ -3731,7 +3742,7 @@ describe("editor modes (S32)", () => {
   test("form: e can clear the due date and adds the description's #tags", async () => {
     const id = byTitle("Renew passport")!.id;
     await start(100, 30, FORM);
-    // Renew passport is escalated into Q1 (S7), under Pay rent and Call the bank.
+    // Renew passport is in Q1, under Pay rent and Call the bank.
     await keys("j", "j");
     let f = await keys("e");
     expect(f).toContain("Edit · Renew passport");

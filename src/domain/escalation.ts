@@ -1,4 +1,4 @@
-import { bucketOf, quadrantOf, type Bucket, type Task } from "./task.ts";
+import { bucketOf, type Task } from "./task.ts";
 
 export const DEFAULT_URGENT_WITHIN_DAYS = 2;
 
@@ -18,16 +18,11 @@ export function localToday(now: Date = new Date()): string {
 
 /**
  * S7: an open, triaged, not-urgent task due within `withinDays` (overdue
- * included) is shown as urgent. The stored flag does not change.
+ * included) is marked as due soon (`!`, red due date). It stays in its own
+ * quadrant and the stored flag does not change.
  */
 export function isEscalated(task: Task, today: string, withinDays = DEFAULT_URGENT_WITHIN_DAYS): boolean {
   if (task.status !== "open" || task.dueDate === null) return false;
   if (bucketOf(task) === "inbox" || task.urgent) return false;
   return daysBetween(today, task.dueDate) <= withinDays;
-}
-
-/** Where the task is shown: its quadrant, with escalation applied. */
-export function displayBucket(task: Task, today: string, withinDays = DEFAULT_URGENT_WITHIN_DAYS): Bucket {
-  if (isEscalated(task, today, withinDays)) return quadrantOf(task.important, true);
-  return bucketOf(task);
 }
