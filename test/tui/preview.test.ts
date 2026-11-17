@@ -34,10 +34,10 @@ describe("previewInfo (S25)", () => {
     expect(info(done)).toMatchObject({ label: `✓ Done · ${localDate(done.completedAt!)}`, bucket: "done" });
   });
 
-  test("an escalated task (S7) is labelled with its displayed quadrant and marked", () => {
+  test("an escalated task (S7) is labelled with its own quadrant and marked", () => {
     const t = task({ important: true, urgent: false, dueDate: "2026-11-13" });
-    expect(info(t)).toMatchObject({ label: "Q1 · ✅ Do", bucket: 1, escalated: true });
-    expect(previewInfo(t, "focus", TODAY).label).toBe("Q1 · 🔥 Urgent");
+    expect(info(t)).toMatchObject({ label: "Q2 · 📅 Schedule", bucket: 2, escalated: true });
+    expect(previewInfo(t, "focus", TODAY).label).toBe("Q2 · ⭐ Important");
   });
 });
 

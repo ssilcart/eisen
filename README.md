@@ -86,7 +86,8 @@ quadrant (it leaves the strip and the count drops), `x`, `d`, `e`, `J`/`K`
 (order inside the Inbox), and `a` adds a new task to the Inbox.
 
 Each task row starts with a mark: a bullet `•` in the pane's colour for an
-open task, `!` for one whose due date made it urgent, `✓` for a done one.
+open task, `!` for one that is not urgent but is due within 2 days (overdue
+included; it stays in its own quadrant), `✓` for a done one.
 `:bullets off` (or Settings › General › Bullets) leaves open rows without the
 bullet; `!` and `✓` stay.
 
@@ -106,8 +107,8 @@ terminal is wide enough again. The toggles keep working and are still saved.
 **Preview** (`p` or `:preview`, on by default). It follows the selection, in
 the quadrants, the Inbox strip, the done panel and search results, and shows
 the selected task: its title, its quadrant (or `📥 Inbox`, or
-`✓ Done · {date}`) in its colour, `due: YYYY-MM-DD` (with `!` when the date
-made it urgent), its `#tags`, the description as plain text, and
+`✓ Done · {date}`) in its colour, `due: YYYY-MM-DD` (with `!` when it is due
+soon), its `#tags`, the description as plain text, and
 `created … · updated …` at the bottom. It refreshes after `e`, `x` and
 `1`–`4`, and says `No task selected` on an empty pane. It never takes the
 focus: `ctrl+d` / `ctrl+u` scroll a long description by half a panel, and

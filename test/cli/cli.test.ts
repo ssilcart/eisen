@@ -104,12 +104,12 @@ describe("ls", () => {
     expect(r.stderr).toContain("invalid JSON");
   });
 
-  test("escalated tasks are listed where they are shown, with a mark", () => {
+  test("escalated tasks stay in their quadrant, with a mark", () => {
     run("add", "soon", "--q2", "--due", "2026-11-13");
-    expect(run("ls", "--q2", "--json").stdout).toBe("[]\n");
-    const [task] = JSON.parse(run("ls", "--q1", "--json").stdout);
-    expect(task).toMatchObject({ title: "soon", bucket: 2, shownIn: 1, escalated: true });
-    expect(run("ls").stdout).toContain("  1  soon  due 2026-11-13 !");
+    expect(run("ls", "--q1", "--json").stdout).toBe("[]\n");
+    const [task] = JSON.parse(run("ls", "--q2", "--json").stdout);
+    expect(task).toMatchObject({ title: "soon", bucket: 2, shownIn: 2, escalated: true });
+    expect(run("ls").stdout).toStartWith("Q2 · 📅 Schedule\n  1  soon  due 2026-11-13 !");
   });
 
   test("two filters is a usage error", () => {

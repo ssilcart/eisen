@@ -43,7 +43,7 @@ import {
   type KeyEvent,
   type TextChunk,
 } from "@opentui/core";
-import { displayBucket, isEscalated, localToday, DEFAULT_URGENT_WITHIN_DAYS } from "../domain/escalation.ts";
+import { isEscalated, localToday, DEFAULT_URGENT_WITHIN_DAYS } from "../domain/escalation.ts";
 import { prepareSearch, search, type SearchIndex } from "../domain/search.ts";
 import { parseTags } from "../domain/tags.ts";
 import {
@@ -656,7 +656,7 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     const nextDone: Task[] = [];
     let dones = 0;
     for (const task of all) {
-      const bucket = displayBucket(task, currentDay, within);
+      const bucket = bucketOf(task);
       const open = task.status === "open";
       if (!open) dones++;
       if (open && bucket === "inbox") nextInbox.push(task);
@@ -1472,7 +1472,7 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
       if (target.kind === "edit" && !task) throw new Error(`Task ${target.id} not found`);
       path = join(tmpdir(), `eisen-${task ? task.id : "new"}-${crypto.randomUUID().slice(0, 8)}.md`);
       writeFileSync(path, task ? serializeTask(task) : NEW_TASK_FILE, { flag: "wx", mode: 0o600 });
-      const bucket = task ? displayBucket(task, currentDay, within) : (newIn ?? "inbox");
+      const bucket = task ? bucketOf(task) : (newIn ?? "inbox");
       const title = task ? `Edit · ${task.title}` : `New task · ${labelFor(state.preset, bucket)}`;
       const code = await runInEditor(path, title, BUCKET_COLOR[bucket]);
       if (destroyed) return;
@@ -1506,7 +1506,7 @@ export function createMatrixApp(renderer: CliRenderer, repo: TaskRepository, opt
     try {
       const task = target.kind === "edit" ? repo.get(target.id) : null;
       if (target.kind === "edit" && !task) throw new Error(`Task ${target.id} not found`);
-      const bucket = task ? displayBucket(task, currentDay, within) : (newIn ?? "inbox");
+      const bucket = task ? bucketOf(task) : (newIn ?? "inbox");
       const title = task ? `Edit · ${task.title}` : `New task · ${labelFor(state.preset, bucket)}`;
       const result = await runForm(title, BUCKET_COLOR[bucket], task);
       if (destroyed) return;

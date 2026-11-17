@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { bucketOf, flagsFor, quadrantOf, type Task } from "../../src/domain/task.ts";
-import { displayBucket, isEscalated } from "../../src/domain/escalation.ts";
+import { isEscalated } from "../../src/domain/escalation.ts";
 import { parseTags, slug } from "../../src/domain/tags.ts";
 
 function task(overrides: Partial<Task> = {}): Task {
@@ -59,20 +59,21 @@ describe("due-date escalation (S7)", () => {
     expect(isEscalated(task({ dueDate }), today)).toBe(expected);
   });
 
-  test("Q2 task due tomorrow is shown in Q1, stored flag unchanged", () => {
+  test("Q2 task due tomorrow stays in Q2, marked, stored flag unchanged", () => {
     const t = task({ important: true, urgent: false, dueDate: "2026-11-13" });
-    expect(displayBucket(t, today)).toBe(1);
+    expect(isEscalated(t, today)).toBe(true);
+    expect(bucketOf(t)).toBe(2);
     expect(t.urgent).toBe(false);
   });
 
-  test("Q4 task overdue is shown in Q3", () => {
-    expect(displayBucket(task({ important: false, urgent: false, dueDate: "2026-11-01" }), today)).toBe(3);
+  test("the module no longer moves tasks to another quadrant", async () => {
+    const mod: Record<string, unknown> = await import("../../src/domain/escalation.ts");
+    expect(mod.displayBucket).toBeUndefined();
   });
 
-  test("Inbox task is not escalated out of the Inbox", () => {
+  test("Inbox task is not escalated", () => {
     const t = task({ important: null, urgent: null, dueDate: "2026-11-12" });
     expect(isEscalated(t, today)).toBe(false);
-    expect(displayBucket(t, today)).toBe("inbox");
   });
 
   test("already urgent or done tasks are not marked as escalated", () => {
